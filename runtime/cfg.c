@@ -294,6 +294,12 @@ static const char *raw_get(const char *name) {
 
 const char *cfg_get(const char *name) {
     const char *v = raw_get(name);
+    // A launcher session supplies a default, below saved settings and environment overrides.
+    // Keep it out of the file so desktop launches and explicit window-mode choices still work.
+    if (!v && !rt_game_version && !strcmp(name, PREFIX "FULLSCREEN")) {
+        const char *launcher = getenv("RECOMPLAUNCHER"), *mode = getenv("RECOMPLAUNCHER_MODE");
+        if (launcher && !strcmp(launcher, "1") && mode && !strcmp(mode, "bigpicture")) return "1";
+    }
     if (v || strncmp(name, PREFIX, PREFIX_LEN) || !profile_of()) return v;
     for (size_t i = 0; i < sizeof DECK / sizeof *DECK; i++)
         if (!strcasecmp(DECK[i].key, name + PREFIX_LEN)) return DECK[i].value;

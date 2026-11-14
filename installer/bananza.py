@@ -622,7 +622,9 @@ class Prepare(Step):
     def run(self, ctx):
         for name in ('dkb.ini', 'dkb.ini.tmp', 'totk.ini'):
             ensure_plain(ctx.dest / name)
-        ini.write(ctx.dest, ctx.state['lang'], ctx.layout.ini_example, 'dkb.ini', fallback='totk.ini')
+        # Headless launcher setup leaves language choices made in the launcher or game intact.
+        if not (getattr(ctx.options, 'preserve_language', False) and (ctx.dest / 'dkb.ini').is_file()):
+            ini.write(ctx.dest, ctx.state['lang'], ctx.layout.ini_example, 'dkb.ini', fallback='totk.ini')
         run_tool(ctx, self.id, [ctx.dest / ('dkb' + EXE), '--selftest'])
         return {'selftest': True}
 
@@ -656,8 +658,8 @@ def write_owner(path, value):
             raise InstallError('dkb.temp_unrelated', path=str(path.parent)) from None
 
 
-def main(options):
-    rep = Reporter()
+def main(options, reporter=None):
+    rep = reporter if reporter is not None else Reporter()
     locks = []
     started = time.monotonic()
     try:

@@ -1,5 +1,8 @@
 # Installer
 
+For the Windows release's headless Easy Setup, settings and save backup integration,
+see [RecompLauncher](recomplauncher.md).
+
 ## Bananza base 1.0.0
 
 The folder installer accepts an already dumped base 1.0.0 ExeFS (`main`, `sdk`, `rtld`, `main.npdm`) and either a

@@ -415,6 +415,8 @@ def build_sources(out):
         text = shader_list.history(MAIN_ROOT / 'refs' / 'MacNativeGames', MNG_COMMIT)
         (out / 'data' / 'shader_list.tsv').write_text(text, encoding='utf-8', newline='\n')
     copy_tree(ROOT / 'installer', out / 'installer', lambda r: '__pycache__' in r or r.startswith('launcher/'))
+    if GAME == 'dkb':
+        shutil.copy2(ROOT / 'recomplauncher.json', out / 'recomplauncher.json')
     shutil.copy2(ROOT / 'totk.ini.example', out / ('dkb.ini.example' if GAME == 'dkb' else 'totk.ini.example'))
     shutil.copy2(ROOT / 'THIRD_PARTY_NOTICES.md', out / 'THIRD_PARTY_NOTICES.md')
     (out / 'VERSION').write_text(version() + '\n', encoding='utf-8')

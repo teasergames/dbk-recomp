@@ -1,0 +1,163 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "DKB Recomp",
+  "repo": "teasergames/dbk-recomp",
+  "inputs": [
+    {
+      "id": "exefs",
+      "label": "Bananza base 1.0.0 ExeFS folder (main, sdk, rtld, main.npdm)",
+      "formats": [{"type": "folder"}]
+    },
+    {
+      "id": "romfs",
+      "label": "Bananza base 1.0.0 RomFS folder (loose files or romfs.bin and index.json)",
+      "formats": [{"type": "folder"}]
+    }
+  ],
+  "prepare": {
+    "program": ["python/python.exe"],
+    "args": ["-B", "-m", "installer.recomplauncher", "--root", "{install}", "--exefs", "{input:exefs}", "--romfs", "{input:romfs}"],
+    "label": "Build Bananza and prepare shaders from your dump",
+    "timeout": 14400
+  },
+  "start": {
+    "program": ["game/dkb.exe"],
+    "args": ["--exefs", "{install}/game/exefs", "--romfs", "{install}/game/romfs", "--profile", "{install}/game/profile"]
+  },
+  "config": [{"format": "ini", "file": [{"path": "{install}/game/dkb.ini"}]}],
+  "saves": ["{install}/game/profile", "{install}/game/dkb.ini"],
+  "folders": {
+    "saves": [{"path": "{install}/game/profile"}],
+    "logs": [{"path": "{install}/game/logs"}],
+    "shaders": [{"path": "{install}/game/shader-cache"}]
+  },
+  "actions": [{"id": "open_saves", "label": "Open saves", "open": "saves"}, {"id": "open_logs", "label": "Open logs", "open": "logs"}],
+  "looks": {"graphics": "vulkan"},
+  "settings": [
+    {
+      "id": "fullscreen", "label": "Window mode", "group": "Display",
+      "help": "Automatic uses full screen in Big Picture and the game's default otherwise.",
+      "choices": [{"label": "Automatic", "set": {"display/fullscreen": ""}}, {"label": "Windowed", "set": {"display/fullscreen": "0"}}, {"label": "Full screen", "set": {"display/fullscreen": "1"}}],
+      "defaults": {"display/fullscreen": ""}
+    },
+    {
+      "id": "window_size", "label": "Window size", "group": "Display",
+      "when": {"display/fullscreen": "0"},
+      "choices": [{"label": "1280 × 720", "set": {"display/window_size": "1280x720"}}, {"label": "1920 × 1080", "set": {"display/window_size": "1920x1080"}}, {"label": "2560 × 1440", "set": {"display/window_size": "2560x1440"}}],
+      "defaults": {"display/window_size": "1920x1080"}
+    },
+    {
+      "id": "output_res", "label": "Game resolution", "group": "Display",
+      "help": "Restart to apply. Higher resolutions need more GPU memory.",
+      "choices": [{"label": "1280 × 720", "set": {"display/output_res": "1280x720"}}, {"label": "1920 × 1080", "set": {"display/output_res": "1920x1080"}}, {"label": "2880 × 1620 (native)", "set": {"display/output_res": "2880x1620"}}, {"label": "3840 × 2160", "set": {"display/output_res": "3840x2160"}}],
+      "defaults": {"display/output_res": "2880x1620"}
+    },
+    {
+      "id": "render_scale", "label": "3D render scale", "group": "Display",
+      "help": "Restart to apply. The game option uses Bananza's own scene scale.",
+      "choices": [{"label": "Game", "set": {"display/render_scale": "game"}}, {"label": "50%", "set": {"display/render_scale": "50"}}, {"label": "75%", "set": {"display/render_scale": "75"}}, {"label": "100%", "set": {"display/render_scale": "100"}}, {"label": "150%", "set": {"display/render_scale": "150"}}],
+      "defaults": {"display/render_scale": "game"}
+    },
+    {
+      "id": "present", "label": "Presentation", "group": "Display",
+      "choices": [{"label": "Mailbox", "set": {"display/vk_present": "mailbox"}}, {"label": "V-Sync", "set": {"display/vk_present": "fifo"}}, {"label": "Immediate (tearing)", "set": {"display/vk_present": "immediate"}}],
+      "defaults": {"display/vk_present": "mailbox"}
+    },
+    {
+      "id": "upscaler", "label": "Upscaling", "group": "Display",
+      "choices": [{"label": "FSR 1", "set": {"display/upscaler": "fsr"}}, {"label": "Bilinear", "set": {"display/upscaler": "bilinear"}}],
+      "defaults": {"display/upscaler": "fsr"}
+    },
+    {
+      "id": "sharpness", "label": "FSR sharpness", "group": "Display",
+      "when": {"display/upscaler": "fsr"},
+      "slider": {"key": "display/sharpness", "min": 0, "max": 100, "step": 5},
+      "defaults": {"display/sharpness": "80"}
+    },
+    {
+      "id": "aspect", "label": "Picture shape", "group": "Display",
+      "choices": [{"label": "Keep aspect ratio", "set": {"display/aspect": "fit"}}, {"label": "Stretch", "set": {"display/aspect": "stretch"}}],
+      "defaults": {"display/aspect": "fit"}
+    },
+    {
+      "id": "perf_overlay", "label": "Performance overlay", "group": "Display",
+      "choices": [{"label": "Off", "set": {"display/perf_overlay": "off"}}, {"label": "FPS", "set": {"display/perf_overlay": "fps"}}, {"label": "Full", "set": {"display/perf_overlay": "full"}}],
+      "defaults": {"display/perf_overlay": "off"}
+    },
+    {
+      "id": "language", "label": "Game language", "group": "Game",
+      "help": "Restart to apply. Automatic follows the system language; available text depends on your dump.",
+      "choices": [
+        {"label": "Automatic", "set": {"language/lang": ""}},
+        {"label": "English (US)", "set": {"language/lang": "en-US"}},
+        {"label": "English (UK)", "set": {"language/lang": "en-GB"}},
+        {"label": "Português (Brasil)", "set": {"language/lang": "pt-BR"}},
+        {"label": "Português", "set": {"language/lang": "pt"}},
+        {"label": "Français", "set": {"language/lang": "fr"}},
+        {"label": "Français (Canada)", "set": {"language/lang": "fr-CA"}},
+        {"label": "Deutsch", "set": {"language/lang": "de"}},
+        {"label": "Italiano", "set": {"language/lang": "it"}},
+        {"label": "Español", "set": {"language/lang": "es"}},
+        {"label": "Español (Latinoamérica)", "set": {"language/lang": "es-419"}},
+        {"label": "Nederlands", "set": {"language/lang": "nl"}},
+        {"label": "日本語", "set": {"language/lang": "ja"}},
+        {"label": "Русский", "set": {"language/lang": "ru"}},
+        {"label": "한국어", "set": {"language/lang": "ko"}},
+        {"label": "简体中文", "set": {"language/lang": "zh-Hans"}},
+        {"label": "繁體中文", "set": {"language/lang": "zh-Hant"}}
+      ],
+      "defaults": {"language/lang": "en-US"}
+    },
+    {
+      "id": "realtime", "label": "Experimental game timing", "group": "Game", "advanced": true,
+      "help": "Restart to apply. Experimental timing patches are required for the frame limit to control game speed.",
+      "choices": [{"label": "Off (default)", "set": {"frame rate/realtime": "0"}}, {"label": "On", "set": {"frame rate/realtime": "1"}}],
+      "defaults": {"frame rate/realtime": "0"}
+    },
+    {
+      "id": "fps_limit", "label": "Frame limit", "group": "Game", "advanced": true,
+      "help": "Experimental timing must be on; with it off, Bananza uses its own timing.",
+      "when": {"frame rate/realtime": "1"},
+      "choices": [{"label": "30", "set": {"frame rate/fps_limit": "30"}}, {"label": "40", "set": {"frame rate/fps_limit": "40"}}, {"label": "60", "set": {"frame rate/fps_limit": "60"}}, {"label": "90", "set": {"frame rate/fps_limit": "90"}}, {"label": "120", "set": {"frame rate/fps_limit": "120"}}, {"label": "Display refresh rate", "set": {"frame rate/fps_limit": "display"}}],
+      "defaults": {"frame rate/fps_limit": "60"}
+    },
+    {
+      "id": "volume", "label": "Volume", "group": "Audio",
+      "slider": {"key": "audio/volume", "min": 0, "max": 100, "step": 5},
+      "defaults": {"audio/volume": "100"}
+    },
+    {
+      "id": "pad_layout", "label": "Button layout", "group": "Controls",
+      "help": "Automatic follows the controller's button labels. Game prompts retain Nintendo letters.",
+      "choices": [{"label": "Automatic", "set": {"input/pad_layout": "auto"}}, {"label": "Nintendo positions", "set": {"input/pad_layout": "nintendo"}}, {"label": "Xbox / PlayStation labels", "set": {"input/pad_layout": "xbox"}}],
+      "defaults": {"input/pad_layout": "auto"}
+    },
+    {
+      "id": "stick_deadzone", "label": "Stick dead zone", "group": "Controls",
+      "slider": {"key": "input/stick_deadzone", "min": 0, "max": 50, "step": 1},
+      "defaults": {"input/stick_deadzone": "8"}
+    },
+    {
+      "id": "rumble_strength", "label": "Vibration strength", "group": "Controls",
+      "slider": {"key": "input/rumble_strength", "min": 0, "max": 300, "step": 10},
+      "defaults": {"input/rumble_strength": "130"}
+    },
+    {
+      "id": "motion", "label": "Motion controls", "group": "Controls",
+      "choices": [{"label": "Off", "set": {"input/motion": "0"}}, {"label": "On", "set": {"input/motion": "1"}}],
+      "defaults": {"input/motion": "1"}
+    },
+    {
+      "id": "mouse_camera", "label": "Mouse camera", "group": "Controls",
+      "choices": [{"label": "Off", "set": {"input/mouse_camera": "0"}}, {"label": "On", "set": {"input/mouse_camera": "1"}}],
+      "defaults": {"input/mouse_camera": "0"}
+    },
+    {
+      "id": "mouse_sens", "label": "Mouse sensitivity", "group": "Controls",
+      "when": {"input/mouse_camera": "1"},
+      "slider": {"key": "input/mouse_sens", "min": 0, "max": 10, "step": 0.1, "format": "%.1f"},
+      "defaults": {"input/mouse_sens": "1"}
+    }
+  ]
+}

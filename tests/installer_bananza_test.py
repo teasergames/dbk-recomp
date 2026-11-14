@@ -86,7 +86,7 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
                                        package=self.root, toolchain=None, deps=None, ninja=None, dll_dir=None,
                                        translator=translator, dotnet=None)
 
-    def run_install(self, fail=None):
+    def run_install(self, fail=None, reporter=None):
         original = b.run_tool
         def tool(ctx, step, command, env=None, cwd=None, name=None):
             self.calls.append((step, list(map(str, command))))
@@ -102,7 +102,7 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         output = io.StringIO()
         with patch.object(b.layouts, 'find', return_value=self.layout), patch.object(b.Check, 'host'), \
                 patch.object(b, 'run_tool', side_effect=tool), contextlib.redirect_stdout(output):
-            code = b.main(self.options)
+            code = b.main(self.options, reporter=reporter)
         return code, [json.loads(line) for line in output.getvalue().splitlines()]
 
     def test_invalid_base_writes_nothing(self):
@@ -154,6 +154,47 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.assertEqual(self.calls, [])
         self.assertEqual({e['step'] for e in events if e['type']=='step' and e['state']=='skipped'},
                          {'dkb_data','dkb_translator','lift','compile','dkb_shaders','dkb_verify'})
+
+    def test_launcher_progress_uses_real_setup_and_resume(self):
+        from installer.recomplauncher import LauncherReporter
+        output = io.StringIO()
+        self.assertEqual(self.run_install(reporter=LauncherReporter(output))[0], 0)
+        self.assertTrue((self.dest / ('dkb' + b.EXE)).is_file())
+        lines = output.getvalue().splitlines()
+        fractions = [float(line.split(' ', 2)[1]) for line in lines]
+        self.assertTrue(all(line.startswith('progress ') for line in lines))
+        self.assertEqual(fractions, sorted(fractions))
+        self.assertEqual(fractions[-1], 1.0)
+        self.calls.clear()
+        self.assertEqual(self.run_install(reporter=LauncherReporter(io.StringIO()))[0], 0)
+        self.assertEqual(self.calls, [])
+
+    def test_launcher_failure_and_cancellation_keep_resume_state(self):
+        from installer.recomplauncher import LauncherReporter
+        for error, code in ((b.InstallError('dkb.tool_failed', step='lift', code=7, log='test.log'), 1),
+                            (KeyboardInterrupt(), 3)):
+            with self.subTest(code=code):
+                output = io.StringIO()
+                def fail(ctx, step, command):
+                    if step == 'lift':
+                        raise error
+                self.assertEqual(self.run_install(fail, LauncherReporter(output))[0], code)
+                self.assertNotIn('lift', b.statefile.load(self.dest, b.STATE)['steps'])
+                self.assertFalse(any(line.startswith('progress 1.0000 ') for line in output.getvalue().splitlines()))
+        self.assertEqual(self.run_install()[0], 0)
+
+    def test_launcher_reprepare_preserves_language_and_settings(self):
+        self.options.preserve_language = True
+        self.assertEqual(self.run_install()[0], 0)
+        for language in ('pt-BR', ''):
+            with self.subTest(language=language):
+                text = f'[language]\nlang = {language}\n[display]\nfullscreen = 1\n# keep me\n'
+                (self.dest / 'dkb.ini').write_text(text)
+                state = b.statefile.load(self.dest, b.STATE)
+                del state['steps']['dkb_verify']
+                b.statefile.save(self.dest, state, b.STATE)
+                self.assertEqual(self.run_install()[0], 0)
+                self.assertEqual((self.dest / 'dkb.ini').read_text(), text)
 
     def test_library_warm_failure_does_not_fail_the_step(self):
         def crash(ctx, step, command):
