@@ -22,7 +22,8 @@ SHA-256 is in the superblock. `tools/extract_nup.py` reads it (an independent re
   the default, the ExeFS of the newest update package (the base's when the update has none) and the base RomFS with
   the update's RomFS laid over it, a file of the update replacing the one at the same path and folders merging
   (`NupContainer::MergeShadowDirs`). A standalone update package without a base gives its own trees.
-  `--nup-package base` installs 1.0.0 from a container that also holds an update. Add-on content is ignored.
+  `--nup-package base` installs 1.0.0 from a container that also holds an update. Add-on content packages are
+  installed beside the game (see "Add-on content" below) unless `--no-dlc` is given.
 - Preflight reads only the table of contents: the target by the recorded SHA-256 of `main`, every pinned ExeFS hash
   against its record, and the RomFS file list (path, size, SHA-256) in the form a loose folder gives, so the identity
   of the data step is the same as for the same files in a folder. An update that is neither target stops with
@@ -51,7 +52,28 @@ the installer checks this checkout's existing toolchain layout. It never install
 ```
 python -m installer --game bananza --nup "<dump>/game.nup" --dest "<install folder>" --package "<tools>" --jobs 6
 python -m installer --game bananza --exefs "<dump>/base/exefs" --romfs "<dump>/base/romfs" --dest "<install folder>" --package "<tools>" --jobs 6
+python -m installer --game bananza --exefs "<dump>/updates/458752/exefs" --romfs "<merged 3.2.0 romfs>" --dlc "<dump>/dlc" --dest "<install folder>" --package "<tools>"
 ```
+
+### Add-on content
+
+`runtime/aoc_romfs.c` reads add-on content (DLC) from `aoc-<index>/romfs.bin` and `aoc-<index>/aoc-index.bin` beside
+the executable, `<index>` being 0 to 31: the low 12 bits of the add-on's title id. Bananza's only add-on,
+`040074A01BF13001`, is index 1. The installer writes these folders in its `dkb_addons` step:
+
+- From a `.nup`, every add-on content package of the same program (title id = base id with the low 12 bits cleared,
+  plus 0x1000, plus the index), the newest version of each index, packed straight from the container by
+  `extract_nup.py --pack-addons`. A package of another program is refused.
+- From folders, each `--dlc` path (repeatable): a RomFS folder, or a dump folder holding `<title id>/<version>/romfs`
+  folders up to three levels down. The index comes from the nearest 16-digit title id in the path, which must be a
+  Bananza add-on (`dkb.dlc_invalid` otherwise, which catches the base or update folder picked by mistake); a RomFS
+  folder without one is index 1. Two folders for one index stop with `dkb.dlc_duplicate`. `--dlc` with a `.nup` stops
+  with `dkb.nup_and_dlc`, since the container brings its own.
+
+Each pack is checked against the preflight snapshot like the game's RomFS, and `aoc-index.bin` (TOTKRFS1, the
+format of `tools/romfs_index.py`) is written by the installer. A resume without `--dlc` keeps the recorded add-ons;
+`--no-dlc` removes the `aoc-*` folders the installer wrote and is remembered. The add-ons' shaders are not in the
+shader census of step 7, so they are translated in play the first time they are drawn.
 
 The shader translator is reused when its `.id` matches the current translator sources. Pass `--translator
 <path>/totk_xlate.exe` to choose a prebuilt translator, keeping `totk_xlate.id` beside it. Otherwise the installer
@@ -65,7 +87,7 @@ The native window uses the same CLI, steps and cancellation mechanism:
 python -m installer.gui --package "<tools>"
 ```
 
-Its pickers select a `.nup` file or the ExeFS and RomFS folders, the optional tool package, language and destination.
+Its pickers select a `.nup` file or the ExeFS and RomFS folders, an optional add-on content folder, the optional tool package, language and destination.
 The window always installs the newest supported content of a `.nup`; `--nup-package base` is a command-line option. The individual tool overrides,
 including `--translator` and `--dotnet`, also work on this command. `--game totk` selects the inherited TotK window.
 
@@ -78,23 +100,25 @@ The Bananza steps are:
    and every file against the initial content snapshot, then copy verified files into the destination. A prepacked
    input's checksum and bounds are checked too. This verifies packing integrity; a loose dump has no NCA hash tree
    to authenticate its original contents.
-3. Prepare the matching shader translator.
-4. Generate `main,sdk` into the temporary folder with the target's patch table: `recomp/patches-dkb100.txt`, whose
+3. Pack the add-on content into `aoc-<index>/` (see "Add-on content"); with none, the step only removes `aoc-*`
+   folders an earlier run wrote.
+4. Prepare the matching shader translator.
+5. Generate `main,sdk` into the temporary folder with the target's patch table: `recomp/patches-dkb100.txt`, whose
    missing applied patches stop the build, or the deliberately empty `recomp/patches-dkb458752.txt`. `subsdk0` is not
    generated.
-5. Build the target (`dkb100` or `dkb458752`) from the current runtime sources with `tools/build_game.py`, without `--runtime-lib`, then copy the
+6. Build the target (`dkb100` or `dkb458752`) from the current runtime sources with `tools/build_game.py`, without `--runtime-lib`, then copy the
    executable, runtime libraries and RomFS index into place. The default worker limit is six; `--jobs` changes it.
-6. Translate the game's shaders: `tools/dkb_shader_census.py` lists the shader stages in the packed RomFS into
+7. Translate the game's shaders: `tools/dkb_shader_census.py` lists the shader stages in the packed RomFS into
    `seed-nvn2.bin`, `dkb.exe --translate-shaders` lowers and translates them into the shader cache beside the executable
    (a few minutes, about 3 GB), and the pack is deleted. Without this step the first visit to each area waits for its
    shaders. Then `dkb.exe --warm-shaders` builds the driver's pipeline libraries; if that fails or the driver crashes
    (seen in `nvgpucomp64.dll` on NVIDIA 621.01) the installer warns and goes on, records `libraries: false` and does not
    retry, since the libraries only speed up the first draws. A translation failure fails the step.
-7. Write the selected language while preserving existing settings, run the installed executable's `--selftest`, and
+8. Write the selected language while preserving existing settings, run the installed executable's `--selftest`, and
    remove only owned staging/build directories. Logs remain in the temporary folder. Setup does not start the game.
 
 The portable output contains `dkb.exe`, its runtime DLLs, `totk_xlate.exe` and `.id`, `exefs/`, packed `romfs/`,
-`romfs-index.bin`, `totk.ini`, `dkb-install.json` and the `shader-cache/` folder of step 6. The inherited `totk.ini` name is
+`romfs-index.bin`, `totk.ini`, `dkb-install.json`, the `aoc-<index>/` folders of step 3 and the `shader-cache/` folder of step 7. The inherited `totk.ini` name is
 intentional: the runtime reads it. Saves and further shader caches are created beside the executable when it runs. Source dumps stay untouched.
 
 Only an empty destination or a Bananza install with matching ownership metadata is accepted. Temporary work has its

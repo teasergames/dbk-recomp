@@ -26,7 +26,7 @@ from .events import render
 TEXT = Path(__file__).resolve().parent / 'text'
 UI_LANGUAGES = ('en', 'ru')
 STEP_ORDER = ('check', 'extract', 'lift', 'compile', 'prepare', 'cleanup')
-DKB_STEP_ORDER = ('check', 'dkb_data', 'dkb_translator', 'lift', 'compile', 'dkb_shaders', 'dkb_verify', 'cleanup')
+DKB_STEP_ORDER = ('check', 'dkb_data', 'dkb_addons', 'dkb_translator', 'lift', 'compile', 'dkb_shaders', 'dkb_verify', 'cleanup')
 # message parameter -> catalog id prefix of the names that replace its raw values
 PARAM_NAMES = {'lang': 'lang.', 'known': 'lang.', 'step': 'step.', 'input': 'param.input.'}
 LANG_RU = 0x19   # primary language id of Russian in a Windows LANGID
@@ -125,6 +125,7 @@ class Form:
     romfs: str = ''
     package: str = ''
     nup: str = ''
+    dlc: str = ''
 
     def installed_state(self):
         """The recorded state of the install folder (totk-install.json), or None. Never raises."""
@@ -158,6 +159,11 @@ class Form:
                     found.append('dkb.need_' + name)
                 elif value and not Path(value).is_dir():
                     found.append('dkb.need_' + name)
+            dlc = self.dlc.strip()
+            if dlc and not Path(dlc).is_dir():
+                found.append('dkb.need_dlc')
+            if dlc and nup:   # a .nup brings its own add-on content
+                found.append('dkb.nup_and_dlc')
             if self.package.strip() and not Path(self.package.strip()).is_dir():
                 found.append('dkb.need_package')
             return found
@@ -183,8 +189,8 @@ class Form:
                   ('--lang', self.lang), ('--dest', self.dest))
         if self.game == 'bananza':
             cmd += ['--game', 'bananza']
-            fields = (('--nup', self.nup), ('--exefs', self.exefs), ('--romfs', self.romfs), ('--package', self.package),
-                      ('--lang', self.lang), ('--dest', self.dest))
+            fields = (('--nup', self.nup), ('--exefs', self.exefs), ('--romfs', self.romfs), ('--dlc', self.dlc),
+                      ('--package', self.package), ('--lang', self.lang), ('--dest', self.dest))
         for flag, value in fields:
             if value.strip():
                 cmd += [flag, value.strip()]

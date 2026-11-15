@@ -175,7 +175,7 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.assertEqual(code, 0, events)
         state = b.statefile.load(self.dest, b.STATE)
         self.assertEqual(state['game'], 'dkb100')
-        self.assertEqual(set(state['steps']), {'dkb_data','dkb_translator','lift','compile','dkb_shaders','dkb_verify'})
+        self.assertEqual(set(state['steps']), {'dkb_data','dkb_addons','dkb_translator','lift','compile','dkb_shaders','dkb_verify'})
         self.assertEqual((self.dest/'exefs/main').read_bytes(), (self.exefs/'main').read_bytes())
         self.assertTrue((self.dest/('dkb'+b.EXE)).is_file())
         self.assertFalse((self.dest/'build.ninja').exists())
@@ -185,7 +185,7 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.assertEqual(code, 0, events)
         self.assertEqual(self.calls, [])
         self.assertEqual({e['step'] for e in events if e['type']=='step' and e['state']=='skipped'},
-                         {'dkb_data','dkb_translator','lift','compile','dkb_shaders','dkb_verify'})
+                         {'dkb_data','dkb_addons','dkb_translator','lift','compile','dkb_shaders','dkb_verify'})
 
     def test_launcher_progress_uses_real_setup_and_resume(self):
         from installer.recomplauncher import LauncherReporter
@@ -728,6 +728,99 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.assertEqual(Form(game='bananza', dest=str(self.dest), nup=str(path) + '.missing').problems(),
                          ['dkb.need_nup'])
         self.assertEqual(Form(game='bananza', dest=str(self.dest)).problems(), ['dkb.need_exefs', 'dkb.need_romfs'])
+
+    def dlc_dump(self, title='040074A01BF13001'):
+        """A dump folder in the <title id>/<version>/romfs shape, with one add-on RomFS."""
+        dump = Path(self.work.name) / 'dump dlc'
+        romfs = dump / title / '0' / 'romfs'
+        (romfs / 'Pack').mkdir(parents=True)
+        (romfs / 'Pack' / 'emerald.bin').write_bytes(b'synthetic add-on resource' * 9)
+        (romfs / 'extra.bin').write_bytes(bytes(range(97)))
+        return dump, romfs
+
+    def assert_addon(self, index, romfs):
+        folder = self.dest / f'aoc-{index}'
+        self.assertEqual(b.sha256(folder / 'romfs.bin'), b.sha256(self.loose_pack(romfs) / 'romfs.bin'))
+        data = (folder / 'aoc-index.bin').read_bytes()
+        magic, count, _ = b.struct.unpack_from('<8sQQ', data)
+        self.assertEqual((magic, count), (b'TOTKRFS1', len([p for p in romfs.rglob('*') if p.is_file()])))
+
+    def test_dlc_folder_is_packed_resumed_and_removed(self):
+        dump, romfs = self.dlc_dump()
+        self.options.dlc = [dump]
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        self.assert_addon(1, romfs)
+        self.assertIn('dkb_addons', b.statefile.load(self.dest, b.STATE)['steps'])
+        # Resume with the destination alone keeps the recorded add-on and runs nothing.
+        self.calls.clear()
+        self.options.dlc = None
+        self.assertEqual(self.run_install()[0], 0)
+        self.assertEqual(self.calls, [])
+        self.assertTrue((self.dest / 'aoc-1' / 'romfs.bin').is_file())
+        # --no-dlc removes it, and a later resume does not bring it back.
+        self.options.no_dlc = True
+        self.assertEqual(self.run_install()[0], 0)
+        self.assertFalse((self.dest / 'aoc-1').exists())
+        self.options.no_dlc = False
+        self.assertEqual(self.run_install()[0], 0)
+        self.assertFalse((self.dest / 'aoc-1').exists())
+
+    def test_dlc_romfs_folder_without_title_id_takes_the_bananza_index(self):
+        _, romfs = self.dlc_dump()
+        plain = Path(self.work.name) / 'emerald' / 'romfs'
+        shutil.copytree(romfs, plain)
+        self.options.dlc = [plain]
+        self.assertEqual(self.run_install()[0], 0)
+        self.assert_addon(1, plain)
+
+    def test_dlc_of_another_title_or_twice_is_refused_before_writes(self):
+        dump, _ = self.dlc_dump(title='0100000000001001')
+        self.options.dlc = [dump]
+        code, events = self.run_install()
+        self.assertEqual((code, next(e['id'] for e in events if e['type'] == 'error')), (1, 'dkb.dlc_invalid'))
+        self.assertFalse(self.dest.exists())
+        shutil.rmtree(dump)
+        dump, romfs = self.dlc_dump()
+        self.options.dlc = [dump, romfs]
+        code, events = self.run_install()
+        self.assertEqual((code, next(e['id'] for e in events if e['type'] == 'error')), (1, 'dkb.dlc_duplicate'))
+        self.options.dlc = [dump / 'missing']
+        code, events = self.run_install()
+        self.assertEqual((code, next(e['id'] for e in events if e['type'] == 'error')), (1, 'dkb.dlc_missing'))
+        self.assertFalse(self.dest.exists())
+
+    def test_nup_addon_is_packed_and_dlc_folders_are_refused_with_a_nup(self):
+        _, romfs = self.dlc_dump()
+        path = Path(self.work.name) / 'with addon.nup'
+        path.write_bytes(build_nup([(0, self.TITLE, 0, {'exefs': tree(self.exefs), 'romfs': tree(self.romfs)}),
+                                    (2, self.TITLE + 0x1001, 0, {'romfs': tree(romfs)})]))
+        self.options.exefs = self.options.romfs = None
+        self.options.nup = path
+        self.options.dlc = [romfs]
+        code, events = self.run_install()
+        self.assertEqual((code, next(e['id'] for e in events if e['type'] == 'error')), (1, 'dkb.nup_and_dlc'))
+        self.assertFalse(self.dest.exists())
+        self.options.dlc = None
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        self.assert_addon(1, romfs)
+        self.assertTrue(any('--pack-addons' in c for step, c in self.calls if step == 'dkb_addons'))
+        self.options.no_dlc = True
+        self.assertEqual(self.run_install()[0], 0)
+        self.assertFalse((self.dest / 'aoc-1').exists())
+
+    def test_form_passes_a_dlc_folder(self):
+        _, romfs = self.dlc_dump()
+        form = Form(game='bananza', exefs=str(self.exefs), romfs=str(self.romfs), dest=str(self.dest), dlc=str(romfs))
+        self.assertEqual(form.problems(), [])
+        command = form.command('python')
+        self.assertEqual(command[command.index('--dlc') + 1], str(romfs))
+        self.assertEqual(Form(game='bananza', exefs=str(self.exefs), romfs=str(self.romfs), dest=str(self.dest),
+                              dlc=str(romfs / 'missing')).problems(), ['dkb.need_dlc'])
+        path = self.write_nup()
+        self.assertEqual(Form(game='bananza', dest=str(self.dest), nup=str(path), dlc=str(romfs)).problems(),
+                         ['dkb.nup_and_dlc'])
 
     def stale_tools(self):
         """The receipt of a finished install, with tool paths of a release folder that was deleted since."""

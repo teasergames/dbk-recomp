@@ -22,6 +22,9 @@ straight from the container, without the loose copy; the Bananza installer extra
 
     python tools\\extract_nup.py <game>.nup --select latest --pack --out build\\extracted\\dkb458752
 
+--pack-addons packs each add-on content (DLC) package's RomFS the same way into <out>\\aoc-<index>\\, the index being
+the low 12 bits of its title id (addon_plan); the installer turns those into the folders runtime/aoc_romfs.c reads.
+
 
 zstd comes from `compression.zstd` (Python 3.14), the `zstandard` module, or a `zstd` program on PATH, in that order.
 Everything else is the standard library.
@@ -370,6 +373,30 @@ def install_plan(nup, select='latest'):
     return {'exefs': exefs, 'romfs': romfs, 'update': update}
 
 
+AOC_MAX = 32   # runtime/aoc_romfs.c looks for aoc-0 to aoc-31
+
+
+def addon_plan(nup):
+    """The add-on content packages to install, as [(index, package)] sorted by index. An add-on's title id is the
+    program's plus 0x1000 plus its index (Bananza's 040074A01BF13001 is index 1, the one nn::aoc lists and
+    nn::fs::MountAddOnContent mounts). With a base in the container, an add-on of another program is refused. Of two
+    packages with the same index, the newer version is taken, as an update replaces its program."""
+    base = next((p for p in nup.packages if p.kind == 0), None)
+    chosen = {}
+    for pkg in nup.packages:
+        if pkg.kind != 2 or pkg.romfs_dir == NO_DIR:
+            continue
+        index = pkg.title_id & 0xFFF
+        if base is not None and pkg.title_id - index != (base.title_id & ~0xFFF) + 0x1000:
+            raise NupError(f'add-on content {pkg.title_id:016x} belongs to another program than '
+                           f'{base.title_id:016x}')
+        if index >= AOC_MAX:
+            raise NupError(f'add-on content {pkg.title_id:016x} has index {index}, above {AOC_MAX - 1}')
+        if index not in chosen or pkg.version > chosen[index].version:
+            chosen[index] = pkg
+    return sorted(chosen.items())
+
+
 def packed_entries(entries):
     """The entries tools/dkb_pack_romfs.py would pack from the same loose tree: it skips files whose name starts with
     a dot (the .listing files dump tools leave)."""
@@ -475,6 +502,9 @@ def main(argv=None):
     ap.add_argument('--pack', action='store_true',
                     help='write the RomFS as <out>\\romfs\\romfs.bin and index.json (tools/dkb_pack_romfs.py layout) '
                          'instead of loose files')
+    ap.add_argument('--pack-addons', action='store_true',
+                    help='write each add-on content RomFS as <out>\\aoc-<index>\\romfs.bin and index.json, the input '
+                         'of the add-on content reader (runtime/aoc_romfs.c), and nothing else')
     ap.add_argument('--check-zstd', action='store_true',
                     help='exit 0 when a zstd backend is available, 1 otherwise, and do nothing else')
     ap.add_argument('--no-verify', action='store_true', help='skip the per-file SHA-256 check')
@@ -496,6 +526,17 @@ def main(argv=None):
                 print('\nGive --out <folder> to extract.')
             return 0
         zstd = Zstd()
+        if args.pack_addons:
+            plan = addon_plan(nup)
+            for index, pkg in plan:
+                print(f'add-on content [{pkg.index}] {pkg.title_id:016x} version {pkg.version}: index {index} '
+                      f'to {args.out / f"aoc-{index}"}')
+                count, total = pack_romfs(nup, zstd, merged_entries(nup, [pkg], 'romfs'), args.out / f'aoc-{index}',
+                                          not args.no_verify, args.quiet)
+                print(f'  romfs: {count} files packed, {total / 1e9:.2f} GB')
+            if not plan:
+                print('no add-on content in the container')
+            return 0
         if args.select:
             plan = install_plan(nup, args.select)
             trees = (args.only,) if args.only else ('exefs', 'romfs')

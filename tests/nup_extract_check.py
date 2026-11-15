@@ -262,6 +262,30 @@ class ExtractNupTest(unittest.TestCase):
         self.assertIn('SHA-256', err)
         self.assertEqual(list((self.dir / 'out' / 'romfs').iterdir()), [])
 
+    def test_pack_addons_takes_the_newest_version_per_index_and_refuses_other_programs(self):
+        old, new = {'romfs': {'dlc.bin': b'old add-on'}}, {'romfs': {'dlc.bin': b'new add-on', 'more': {'m.bin': b'm'}}}
+        path = self.write(build([(0, 0x0100AAAA, 0, BASE_TREES), (2, 0x0100B002, 65536, new),
+                                 (2, 0x0100B002, 0, old)]))
+        out_dir, loose = self.dir / 'out', self.dir / 'loose'
+        code, _, err = run(path, '--out', out_dir, '--pack-addons', '--quiet')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(p.name for p in out_dir.iterdir()), ['aoc-2'])
+        (loose / 'more').mkdir(parents=True)
+        (loose / 'dlc.bin').write_bytes(b'new add-on')
+        (loose / 'more' / 'm.bin').write_bytes(b'm')
+        reference = self.dir / 'reference'
+        subprocess.run([sys.executable, str(ROOT / 'tools' / 'dkb_pack_romfs.py'), '--dir', str(loose),
+                        '--out', str(reference)], check=True, capture_output=True)
+        self.assertEqual((out_dir / 'aoc-2' / 'romfs.bin').read_bytes(), (reference / 'romfs.bin').read_bytes())
+        foreign = self.write(build([(0, 0x0100AAAA, 0, BASE_TREES), (2, 0x0100C001, 0, old)]), 'foreign.nup')
+        code, _, err = run(foreign, '--out', self.dir / 'foreign', '--pack-addons', '--quiet')
+        self.assertEqual(code, 1)
+        self.assertFalse((self.dir / 'foreign' / 'aoc-1').exists())
+        code, out, err = run(self.write(build([(0, 0x0100AAAA, 0, BASE_TREES)]), 'plain.nup'), '--out',
+                             self.dir / 'none', '--pack-addons')
+        self.assertEqual(code, 0, err)
+        self.assertIn('no add-on content', out)
+
     def test_pack_needs_select_and_check_zstd_needs_no_file(self):
         path = self.write(build([(0, 0x0100AAAA, 0, BASE_TREES)]))
         with self.assertRaises(SystemExit):

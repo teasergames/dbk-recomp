@@ -10,7 +10,8 @@
 > **Lucas-blip-png** e colaboradores, baseada na release oficial
 > [`v0.3.0`](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/tag/v0.3.0), com a integração com o
 > **RecompLauncher** e a correção do original para o erro de GPU em placas AMD
-> ([`d161f88`](https://github.com/Lucas-blip-png/dkb-pc-recomp/commit/d161f88)). Todo o crédito pelo projeto é deles. Os documentos da pasta `docs/` continuam em inglês.
+> ([`d161f88`](https://github.com/Lucas-blip-png/dkb-pc-recomp/commit/d161f88)). Desde a v0.3.1 desta cópia, o
+> instalador também instala o **DLC** (conteúdo adicional), o que o original ainda não faz. Todo o crédito pelo projeto é deles. Os documentos da pasta `docs/` continuam em inglês.
 
 > [!TIP]
 > **O projeto original agora publica releases oficiais**, com pacotes para **Windows, Linux e macOS**:
@@ -39,6 +40,8 @@ Até onde se sabe, não existe outra recompilação estática pública de um jog
 2. Abra o **`DKB-Setup.exe`**.
 3. Escolha o seu dump: um arquivo **`.nup`** ou as pastas `exefs` e `romfs`. Versões aceitas: **base 1.0.0** ou a
    atualização **3.2.0** (dentro do `.nup`). Depois escolha o idioma e uma pasta de destino vazia.
+   **DLC (opcional):** o `.nup` já traz o DLC, se tiver. Com pastas, escolha também a pasta `dlc` do dump no campo
+   **Add-on content folder**.
 4. Aguarde de 20 a 30 minutos (verificação do dump, compilação e tradução dos shaders).
 5. Jogue pelo `dkb.exe` na pasta de destino.
 
@@ -171,6 +174,12 @@ Como rodar e testar: [docs/dkb-testing.md](docs/dkb-testing.md).
 compartilhado. Cada um gera o seu a partir do próprio dump; o DKB-Setup faz isso por você.
 
 **Qual versão do jogo?** Base 1.0.0 e a atualização 3.2.0 (versão de título 458752, a mais recente), por arquivo `.nup` ou por pastas ExeFS e RomFS. Outras atualizações são recusadas pelo hash. A 3.2.0 instala e inicia, mas ainda foi pouco jogada.
+
+**E o DLC?** Desde a v0.3.1 o instalador empacota o DLC (*Emerald Rush*) ao lado do jogo, nas pastas `aoc-1`: vem do
+próprio `.nup` ou da pasta escolhida em **Add-on content folder** (`--dlc` na linha de comando). Para uma instalação
+existente, abra o instalador de novo na mesma pasta de destino com o DLC escolhido; só o passo do DLC roda. Os shaders
+do DLC são traduzidos durante o jogo, então as áreas dele podem engasgar na primeira visita. Use com a
+atualização 3.2.0: a versão 1.0.0 é anterior ao DLC.
 
 **Linux e macOS?** Em prévia, só nas [releases oficiais](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases): `DKB-Setup-<versão>-linux-x86_64.tar.gz` e `DKB-Setup-<versão>-macos-arm64.zip`, com um script de instalação. Este repositório publica só o pacote de Windows.
 

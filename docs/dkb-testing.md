@@ -120,27 +120,16 @@ The settings keep TotK Recomp's `TOTK_` names, so its fixes apply without a rena
 Command-line options: `--seconds S` stops the run after S seconds of game time, and `--shot frame.png` with it saves
 that frame. A shot is for your own debugging; do not post it if it shows game content.
 
-## Add-on content (untested in game)
+## Add-on content
 
-Nothing in the game has been run with add-on content (DLC) yet: the reader (`runtime/aoc_romfs.c`) is checked on a
-synthetic pack (`tests/aoc_romfs_test.py`) and by `--probe-aoc` on a real one, and that is all. Update 3.2.0 is the
-same: the installer builds it and it boots, and nobody has played it. If you try either, say so in the report.
+The reader (`runtime/aoc_romfs.c`) looks for `aoc-<index>/` folders next to `dkb.exe` (`<index>` is 0 to 31), each
+holding `romfs.bin` and `aoc-index.bin`. The installer writes them (docs/installer.md, "Add-on content"): a `.nup`
+brings its add-on packages, and folder installs take `--dlc <dump>/dlc` (or the add-on's RomFS folder), which the
+window offers as an optional field. Bananza's add-on is index 1.
 
-The reader looks for `aoc-<index>/` folders next to `dkb.exe` (`<index>` is 0 to 31), each holding `romfs.bin` and
-`aoc-index.bin`. The installer does not write them. By hand, from the add-on content's extracted RomFS folder, with
-`<dlc>` its root and `<n>` its index:
-
-```
-.venv\Scripts\python tools\dkb_pack_romfs.py --dir <dlc> --out build/aoc-pack
-.venv\Scripts\python tools\romfs_index.py --romfs build/aoc-pack --out build/aoc-pack/index
-mkdir "<exe folder>\aoc-<n>"
-copy build\aoc-pack\romfs.bin "<exe folder>\aoc-<n>\romfs.bin"
-copy build\aoc-pack\index\romfs-index.bin "<exe folder>\aoc-<n>\aoc-index.bin"
-```
-
-`dkb_pack_romfs.py` writes `romfs.bin` and `index.json`; `romfs_index.py` turns those into the TOTKRFS1 file
-`romfs-index.bin`, which the reader wants under the name `aoc-index.bin`. Then `dkb.exe --probe-aoc` mounts the first
-pack and reads up to 64 files back whole; with `DKB_AOC_SOURCE=<dlc>` it also compares them with the folder.
+After an install, `dkb.exe --probe-aoc` mounts the first pack and reads up to 64 files back whole; with
+`DKB_AOC_SOURCE=<dlc romfs>` it also compares them with the folder. The add-on's shaders are translated in play, so
+its areas stutter the first time. Say in the report whether you played with add-on content.
 
 ## Experimental ultrawide mode
 

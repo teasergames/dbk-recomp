@@ -64,6 +64,10 @@ def main(argv=None):
                          'or base (1.0.0 even when the container also holds an update)')
     ap.add_argument('--exefs', type=Path, help='Bananza 1.0.0 or 3.2.0 ExeFS folder')
     ap.add_argument('--romfs', type=Path, help='Bananza loose RomFS folder or packed romfs.bin/index.json folder')
+    ap.add_argument('--dlc', type=Path, action='append',
+                    help='add-on content (DLC) folder: its RomFS, or a dump folder holding <title id>/<version>/romfs '
+                         'folders; repeatable. A .nup brings its own add-on content')
+    ap.add_argument('--no-dlc', action='store_true', help='install no add-on content, also none a .nup holds')
     ap.add_argument('--package', type=Path, help='tool package with llvm/, runtime/deps/ and bin/')
     ap.add_argument('--toolchain', type=Path, help='LLVM toolchain directory')
     ap.add_argument('--deps', type=Path, help='build dependency directory with include/ and lib/')
@@ -82,10 +86,10 @@ def main(argv=None):
         if found:
             Reporter().warning('warn.update_available', tag=found[0], url=found[1])
 
-    if (args.game == 'bananza' or args.nup or args.nup_package or args.exefs or args.romfs or
-            (args.game is None and (args.dest / 'dkb-install.json').is_file())):
+    if (args.game == 'bananza' or args.nup or args.nup_package or args.exefs or args.romfs or args.dlc or
+            args.no_dlc or (args.game is None and (args.dest / 'dkb-install.json').is_file())):
         if args.game == 'totk':
-            ap.error('--nup/--exefs/--romfs require --game bananza')
+            ap.error('--nup/--exefs/--romfs/--dlc require --game bananza')
         from .bananza import main as bananza_main
         return bananza_main(args)
 
