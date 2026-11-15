@@ -8,8 +8,9 @@
 > [!NOTE]
 > **Esta é uma cópia não oficial** do [DKB Recomp](https://github.com/Lucas-blip-png/dkb-pc-recomp), de
 > **Lucas-blip-png** e colaboradores, baseada na release oficial
-> [`v0.3.0`](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/tag/v0.3.0) e com a integração com o
-> **RecompLauncher**. Todo o crédito pelo projeto é deles. Os documentos da pasta `docs/` continuam em inglês.
+> [`v0.3.0`](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/tag/v0.3.0), com a integração com o
+> **RecompLauncher** e a correção do original para o erro de GPU em placas AMD
+> ([`d161f88`](https://github.com/Lucas-blip-png/dkb-pc-recomp/commit/d161f88)). Todo o crédito pelo projeto é deles. Os documentos da pasta `docs/` continuam em inglês.
 
 > [!TIP]
 > **O projeto original agora publica releases oficiais**, com pacotes para **Windows, Linux e macOS**:
