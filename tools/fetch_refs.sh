@@ -43,4 +43,9 @@ fetch SavageWindRecomp https://github.com/Revivedx/SavageWindRecomp.git 575ad88e
 fetch eglantine https://git.eden-emu.dev/Franseven/PokeDinner-a-Eglantine-Fork.git 1dd40d86df4bca1b68700091fe5ddb71a13162b2
 # Hookshot (GPL-3.0): a recompilation of the Switch 2 Ocarina of Time remake from the same lineage (TotK Recomp, Eglantine's
 # Ampere lowering), the reference for frame generation, pipeline-state lists and its AMD workarounds.
-fetch hookshot https://github.com/NotRexed/Hookshot.git fab8cb37641714bd839ae83c2a7bc582bedc4d70
+# The upstream repository went away in November 2026: skip it (and keep a local copy) when it cannot be reached.
+if GIT_TERMINAL_PROMPT=0 git ls-remote -q https://github.com/NotRexed/Hookshot.git >/dev/null 2>&1; then
+    fetch hookshot https://github.com/NotRexed/Hookshot.git fab8cb37641714bd839ae83c2a7bc582bedc4d70
+else
+    echo "hookshot: upstream unreachable, skipped"
+fi

@@ -8,10 +8,9 @@
 > [!NOTE]
 > **Esta é uma cópia não oficial** do [DKB Recomp](https://github.com/Lucas-blip-png/dkb-pc-recomp), de
 > **Lucas-blip-png** e colaboradores, baseada na release oficial
-> [`v0.3.0`](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/tag/v0.3.0), com a integração com o
-> **RecompLauncher** e a correção do original para o erro de GPU em placas AMD
-> ([`d161f88`](https://github.com/Lucas-blip-png/dkb-pc-recomp/commit/d161f88)). Desde a v0.3.1 desta cópia, o
-> instalador também instala o **DLC** (conteúdo adicional), o que o original ainda não faz. Todo o crédito pelo projeto é deles. Os documentos da pasta `docs/` continuam em inglês.
+> [`v0.4.0`](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/tag/v0.4.0). O que esta cópia acrescenta: o
+> perfil do **RecompLauncher para Windows** e a instalação do **DLC a partir das pastas do dump** (o original instala o
+> DLC só de um `.nup` ou `.nx`). Todo o crédito pelo projeto é deles. Os documentos da pasta `docs/` continuam em inglês.
 
 > [!TIP]
 > **O projeto original agora publica releases oficiais**, com pacotes para **Windows, Linux e macOS**:
@@ -38,10 +37,10 @@ Até onde se sabe, não existe outra recompilação estática pública de um jog
 1. Baixe o `DKB-Setup-<versão>-windows.zip` em [Releases](https://github.com/teasergames/dbk-recomp/releases) e
    extraia em qualquer pasta. O zip tem **só ferramentas e código-fonte**, nada do jogo.
 2. Abra o **`DKB-Setup.exe`**.
-3. Escolha o seu dump: um arquivo **`.nup`** ou as pastas `exefs` e `romfs`. Versões aceitas: **base 1.0.0** ou a
-   atualização **3.2.0** (dentro do `.nup`). Depois escolha o idioma e uma pasta de destino vazia.
-   **DLC (opcional):** o `.nup` já traz o DLC, se tiver. Com pastas, escolha também a pasta `dlc` do dump no campo
-   **Add-on content folder**.
+3. Escolha o seu dump: um arquivo **`.nup`** ou **`.nx`**, ou as pastas `exefs` e `romfs`. Versões aceitas: **base
+   1.0.0** ou a atualização **3.2.0**. Depois escolha o idioma e uma pasta de destino vazia.
+   **DLC (opcional):** o `.nup`/`.nx` já traz o DLC, se tiver. Com pastas, escolha também a pasta `dlc` do dump no
+   campo **Add-on content folder**.
 4. Aguarde de 20 a 30 minutos (verificação do dump, compilação e tradução dos shaders).
 5. Jogue pelo `dkb.exe` na pasta de destino.
 
@@ -51,7 +50,7 @@ instalador refaz só o que mudou e mantém seus saves.
 **RecompLauncher:** o pacote traz o perfil `recomplauncher.json`, então o launcher instala, configura e abre o jogo
 sozinho ([docs/recomplauncher.md](docs/recomplauncher.md)).
 
-**Requisitos:** Windows 10 ou 11, CPU com AVX2, GPU com Vulkan 1.3, 16 GB de RAM (32 GB recomendado) e cerca de 45 GB
+**Requisitos:** Windows 10 ou 11, GPU com Vulkan 1.3 (NVIDIA recomendada; AMD e Intel ainda são experimentais), 16 GB de RAM (32 GB recomendado) e cerca de 45 GB
 livres **no disco de destino e no da pasta temporária** durante a instalação. O erro `Not enough space` quase sempre é
 falta de espaço em disco ou de memória.
 
@@ -63,11 +62,11 @@ coreano e chinês. O jogo não tem polonês nem outros idiomas, então não há 
 
 ## Estado
 
-**Ainda não é jogável do começo ao fim.** O jogo inicia, passa pela tela de título até a caverna do tutorial,
-renderiza a cena 3D e responde ao controle: dá para andar e socar pelo túnel de mineração, com os vídeos de guia
-tocando, e uma partida jogada à mão chegou à seção Ingot Isle Cave-In. Ainda pode travar (na NVIDIA, dois quads de luz
-são pulados para evitar uma falha da GPU,
-[#9](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/9)), e muitos efeitos estão faltando.
+**Jogável em placas NVIDIA recentes, bem além do primeiro nível.** Jogadores relatam partidas pela camada -101, a
+subcamada 200, Glacier, Snow World (camada 500) e Tempest. Ainda pode travar: veja os problemas conhecidos na
+[release v0.4.0](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/tag/v0.4.0). Em placas AMD com o driver
+oficial do Windows, a "recorder thread" fica desligada por padrão, o que acabou com a perda de GPU para vários
+jogadores; no Linux com RADV e na Intel Arc ainda há travamentos.
 O instalador gera o jogo a partir do seu dump: [docs/installer.md](docs/installer.md).
 Progresso dia a dia: [docs/devlog.md](docs/devlog.md).
 
@@ -167,19 +166,25 @@ Como rodar e testar: [docs/dkb-testing.md](docs/dkb-testing.md).
 
 ## Perguntas frequentes
 
-**Dá para jogar?** Ainda não do começo ao fim. Chega ao tutorial e trava com frequência. Acompanhe o
+**Dá para jogar?** Em NVIDIA recente, sim, bem além do primeiro nível, mas ainda pode travar. Acompanhe o
 [roadmap](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/10) ou o [devlog](docs/devlog.md).
 
 **Vai ter download do jogo pronto?** Não. O executável é feito a partir do próprio código do jogo, então não pode ser
 compartilhado. Cada um gera o seu a partir do próprio dump; o DKB-Setup faz isso por você.
 
-**Qual versão do jogo?** Base 1.0.0 e a atualização 3.2.0 (versão de título 458752, a mais recente), por arquivo `.nup` ou por pastas ExeFS e RomFS. Outras atualizações são recusadas pelo hash. A 3.2.0 instala e inicia, mas ainda foi pouco jogada.
+**Qual versão do jogo?** Base 1.0.0 e a atualização 3.2.0 (versão de título 458752, a mais recente), por arquivo `.nup` ou `.nx`, ou por pastas ExeFS e RomFS. Outras atualizações são recusadas pelo hash.
 
-**E o DLC?** Desde a v0.3.1 o instalador empacota o DLC (*Emerald Rush*) ao lado do jogo, nas pastas `aoc-1`: vem do
-próprio `.nup` ou da pasta escolhida em **Add-on content folder** (`--dlc` na linha de comando). Para uma instalação
-existente, abra o instalador de novo na mesma pasta de destino com o DLC escolhido; só o passo do DLC roda. Os shaders
+**E o DLC?** O instalador empacota o DLC (*Emerald Rush*) ao lado do jogo, na pasta `aoc-1`. Ele vem do próprio
+`.nup`/`.nx` (recurso do original) ou, só nesta cópia, da pasta escolhida em **Add-on content folder** (`--dlc` na
+linha de comando). Para uma instalação feita por pastas, abra o instalador de novo na mesma pasta de destino com o DLC
+escolhido. Os shaders
 do DLC são traduzidos durante o jogo, então as áreas dele podem engasgar na primeira visita. Use com a
 atualização 3.2.0: a versão 1.0.0 é anterior ao DLC.
+
+**Mods?** O original carrega mods de RomFS soltos de uma pasta `mods` ao lado do `dkb.exe`.
+
+**Minha CPU não tem AVX2.** Desde a v0.4.0 o instalador compila para x86-64-v2 nesse caso; funciona, mas fica mais
+lento.
 
 **Linux e macOS?** Em prévia, só nas [releases oficiais](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases): `DKB-Setup-<versão>-linux-x86_64.tar.gz` e `DKB-Setup-<versão>-macos-arm64.zip`, com um script de instalação. Este repositório publica só o pacote de Windows.
 

@@ -27,6 +27,16 @@ site realtime main 34ec1c 1e201828 f81f0fe9 @page:x9 bd400928 f84107e9  # same c
 site realtime main 34ec68 1e201860 f81f0fe9 @page:x9 bd400920 f84107e9  # time-scale transition
 site realtime main 69fc60 1e201820 f81f0fe9 @page:x9 bd400920 f84107e9  # secondary scene clock
 
+# The player's damped velocity update (main+1241c50, 3.2.0 main+13fad60) adds its target once per whole 60 Hz frame, so
+# above 60 fps the climb velocity decays to 0 and DK stops on walls and ceilings (#201). runtime/frame_rate.c damped_sum
+# (patch page +0x260) stands in for the fmov s12, #1.0 that bounds the loop; the three movi that clear the sum on the
+# path that skips the loop become nops. patches-dkb458752.txt explains the sites. The BL assumes the patch page is at
+# main+0x2450000 (recomp/layout.py), as the mousecamera sites do.
+site realtime main 1241c78 1e2e100c 9448397a  # fmov s12, #1.0, the loop bound
+site realtime main 1241c8c 2f00e40b d503201f  # movi d11, #0 on the path that skips the loop
+site realtime main 1241c90 2f00e40a d503201f  # movi d10, #0
+site realtime main 1241c94 2f00e409 d503201f  # movi d9, #0
+
 # Optional Bananza virtual display and camera aspect. Values are supplied by
 # runtime/dkb_wide.c at page +0x100 (width), +0x104 (height), +0x108 (aspect),
 # +0x10c (aspect / 16:9), +0x110 (render-target pool bytes).
@@ -72,7 +82,7 @@ set mousecamera TOTK_MOUSE_CAMERA 0
 # Keep each original instruction, then call the host adapter in runtime/dkb_camera.c. The five
 # dispatch addresses are outside main, at patch page +0x200/+0x210/+0x220/+0x230/+0x240. These functions
 # save LR in their prologues and restore it after the sites, so the inserted BL preserves returns.
-# All seven BL immediates below assume the patch page is at main+0x2450000 (recomp/layout.py).
+# The BL immediates below assume the patch page is at main+0x2450000 (recomp/layout.py).
 site mousecamera main 41b35c f9405808 f9405808 9480d3a9   # yaw begin: x0 is the follow camera
 site mousecamera main 41b4e0 6d42a3e9 6d42a3e9 9480d34c   # yaw end: x19 is the follow camera
 site mousecamera main 7f209c d000cdb4 d000cdb4 94717861   # pitch begin: x19 is the vertical controller
@@ -80,6 +90,8 @@ site mousecamera main 7f22f8 6d42a3e9 6d42a3e9 947177ce   # pitch end: x19 is th
 
 # Let vertical mouse activity interrupt the same waiting states as stick input.
 site mousecamera main 5ef070 2d4e0660 2d4e0660 94798474   # Interp manual input check
+site mousecamera main 173535c bd407260 bd407260 94346bb9 # automatic pitch state manual input check
+site mousecamera main 173550c bd407260 bd407260 94346b4d # automatic pitch blend manual input check
 site mousecamera main 17357c0 bd407260 bd407260 94346aa0   # SnapEnd manual input check
 # AcceptRequest loads s0 from [x0, #0x70] at 1735878, before the kept mov x19, x0.
 # The comparisons at 1735884 and 1735898 consume that value against -0.15 and +0.15
@@ -104,13 +116,31 @@ site mousecamera main 173587c aa0003f3 aa0003f3 94346a71   # AcceptRequest manua
 #           +0x10 is loaded and compared or called at 410768 (only the fall-through reaches it) -> next entry.
 #   410ee0: the cell's +0x48 on the bit-31 path; 410edc already sends a null one to 41164c -> 41164c.
 #   410794: the cell's element array (+0x4f10, loaded at 410790) -> 410e54, the path of an index past the cell's count.
-# Every failed check is logged (runtime/patches.c guard_fail). Opt-out: DKB_FIX_POOL_GUARD=0. 1.0.0 only: update 3.2.0
-# (patches-dkb458752.txt) has no such guards yet.
+# Every failed check is logged (runtime/patches.c guard_fail). Opt-out: DKB_FIX_POOL_GUARD=0. Update 3.2.0
+# (patches-dkb458752.txt) carries the same guards at main+0x429480.
 set poolguard DKB_FIX_POOL_GUARD 1
 guard poolguard main 410df0 410d4c ptr x9 f9401927 st32 x29 -2c ffffffff
 guard poolguard main 41075c 410d4c vcall x9 b940028a
 guard poolguard main 410ee0 41164c ptr x20 aa1403e0
 guard poolguard main 410794 410e54 ptr x10 f875794a
+# #218 crash 2: f_7000108020 caches up to 256 ids in nodes taken from a free list (owner+0x76b38+0x18, count +0x28). When the
+# free list is empty its own code takes a null node and loads its payload at +0x10 (108510). The guard continues the
+# loop instead (108468): the id is not cached and may come back on a later pass.
+guard poolguard main 108510 108468 ptr x8 f9400909
+
+# Text box per-character transform setter main+0x84cd40 (issues 157, 206, 173). The layout animation reader
+# main+0x82fee0 calls it for each entry of an FLCT section (per-character transform) with x1 = 0 or 1; it stores
+# the float in s0 through the object's +0x150 block (at +0 or +4) and sets bit 0x4 of the u16 at +0x114. The block
+# is optional: the object's copy routine (main+0x84b530) keeps a null one null. On some players' machines (RX 9070 XT,
+# RX 580, RTX 3050; never here) the block is null when a save or the title screen loads, and the store writes address
+# 0. Why it is null there is not known. The guards skip the store and the flag (a return), so nothing later reads
+# the missing block:
+#   84cd50: str s0, [x8] after x8 = [x0+0x150], x1 == 0 -> ret at 84cd60
+#   84cd68: str s0, [x8, #4] after x8 = [x0+0x150], x1 == 1 -> ret at 84cd78
+# Every failed check is logged (runtime/patches.c guard_fail). Opt-out: DKB_FIX_FLCT_GUARD=0.
+set flctguard DKB_FIX_FLCT_GUARD 1
+guard flctguard main 84cd50 84cd60 ptr x8 bd000100
+guard flctguard main 84cd68 84cd78 ptr x8 bd000500
 
 # Recursive spin locks of main (tools/spin_waits.py): a thread that spins here with every virtual core taken starves the
 # lock owner, which needs a core to release the lock (heap and RomFS stalls, issue 126).
@@ -134,3 +164,24 @@ spin main 375968 37597c   # recursive spin lock
 spin main 3a2c08 3a2c1c   # recursive spin lock
 spin main 56976c 569780   # recursive spin lock
 spin main 5803b4 5803c8   # recursive spin lock
+
+# The game's dynamic-resolution controller (the function at main 3c12b4) steps a ratio of the virtual display
+# to the 3D scene size by frame-time load, quantises it against a table (1.375, 1.5, 1.667 ... 3.0) and stores
+# it at 3c1628. Under emulation it settles at 1.5, so the 3D scene is 2/3 of the display on each side. Load the
+# ratio from page +0x118 instead (runtime/dkb_wide.c, TOTK_SCENE_RES, 1.0 draws the scene at the full display).
+# The next instruction overwrites x9, so it is free scratch. Off by default: the game's own control runs.
+# The controller also keeps the unquantised ratio in s8, which its hold test (fcmp s8, s9 at 3c154c) and two
+# per-view scales (3c1650, 3c172c) read: load the same ratio into s8 at the join 3c1548, whose own load
+# overwrites x9 right after, so all of them see the forced ratio.
+set dkbscene DKB_SCENE 0
+site dkbscene main 3c1548 f9407a69 @page:x9 bd411928 f9407a69
+site dkbscene main 3c1624 bd400120 @page:x9 bd411920
+
+# #229: the per-record loop of f_7000a37520 (3.2.0 f_7000a55520, +0x1e000) reads two 32-bit table indices from the
+# record (+0x28, +0x2c) and loads 16 bytes from table base + index*32. A record with an index of 0xffffffff (seen with
+# the frame rate unlocked, likely a record still being written) sends the load 128 GiB past the table. The guards
+# check the address before each load and take the loop's own next-record step (a3a388, also the target of the tbz at
+# a37a20), skipping that record for the frame. Opt-out: DKB_FIX_RECORD_GUARD=0.
+set recguard DKB_FIX_RECORD_GUARD 1
+guard recguard main a37a84 a3a388 ptr x10 3dc00140
+guard recguard main a37a9c a3a388 ptr x11 3dc00160

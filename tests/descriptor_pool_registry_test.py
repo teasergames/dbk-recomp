@@ -42,6 +42,7 @@ PRELUDE = r'''
 #include "platform/platform.h"
 #define DEV_MAGIC MAGIC('D', 'E', 'V', 0)
 #define AGEN_N 4096
+#define RGEN_N 4096
 unsigned rt_trace;
 const char rt_game_target[] = "dkb458752";
 // Every TOTK_* switch reads as off, its default.
@@ -58,6 +59,11 @@ void plat_mutex_lock(PlatMutex *m) { if (m->p) rt_fatal("nonrecursive lock reent
 void plat_mutex_unlock(PlatMutex *m) { if (!m->p) rt_fatal("unlock without lock\n"); m->p = NULL; }
 void plat_mutex_lock_shared(PlatMutex *m) { plat_mutex_lock(m); }
 void plat_mutex_unlock_shared(PlatMutex *m) { plat_mutex_unlock(m); }
+int plat_mutex_trylock(PlatMutex *m) { if (m->p) return 0; m->p = (void *)1; return 1; }
+int plat_mutex_trylock_shared(PlatMutex *m) { return plat_mutex_trylock(m); }
+uint64_t kern_now_ns(void) { return 0; }
+void perf_lock_wait(int lock, uint64_t ns) { (void)lock; (void)ns; }
+const char *cfg_get(const char *key) { (void)key; return NULL; }   // TOTK_LOCK_HOLDS: off
 void plat_cond_broadcast(PlatCond *c) { (void)c; }
 void plat_cond_wait(PlatCond *c, PlatMutex *m) { (void)c; (void)m; rt_fatal("unexpected fixture wait\n"); }
 '''
@@ -132,13 +138,21 @@ int main(void) {
     shifted.addr += NVN_DESCRIPTOR_BYTES, shifted.count--;
     CHECK(vk_texture_slot_token(&wrapped, id) == token && vk_texture_slot_token(&shifted, id - 1) == token);
     CHECK(lookup(&shifted, id - 1)->addr == resident[0].pub.addr);
-    uint64_t b_token = vk_texture_slot_token(&refs[1], id);
+    // A stamped token is the same, and checked again without the lock it stays while the slot is not registered again.
+    VkSlotStamp stamp, b_stamp;
+    CHECK(vk_texture_slot_token_stamped(&refs[0], id, &stamp) == token && stamp.valid);
+    CHECK(vk_texture_slot_token_again(&stamp) == token);
+    uint64_t b_token = vk_texture_slot_token_stamped(&refs[1], id, &b_stamp);
+    CHECK(vk_texture_slot_token_again(&b_stamp) == b_token);
     register_texture(&wrapper, id, &textures[1]);
+    CHECK(!vk_texture_slot_token_again(&stamp));   // registered again: read anew under the lock
     CHECK(vk_texture_slot_token(&refs[0], id) != token && lookup(&refs[0], id)->addr == resident[1].pub.addr);
     CHECK(lookup(&refs[1], id)->addr == resident[1].pub.addr && vk_texture_slot_token(&refs[1], id) == b_token);
     uint64_t alias_token = vk_texture_slot_token(&refs[0], id);
     dpool_ref short_table = refs[0]; short_table.count = id;
     CHECK(!lookup(&short_table, id) && !vk_texture_slot_token(&refs[0], -1));
+    VkSlotStamp none;
+    CHECK(!vk_texture_slot_token_stamped(&refs[0], -1, &none) && !none.valid && !vk_texture_slot_token_again(&none));
     dpool_ref unmapped = {(uintptr_t)pixels[0], (uint32_t)count, 0}; CHECK(!lookup(&unmapped, id));
 
     // The actual SetPool API captures a value: finalizing/reinitializing the wrapper cannot redirect the recording.
@@ -166,10 +180,11 @@ int main(void) {
     CHECK(!host_key.storage && !imported[0].used && !alias.used && !alias.stouched);
     CHECK(pidx_remove(&pool_index, &imported[0], NULL));
     vk_texture_descriptors_retire(imported[0].lo, imported[0].size, 0);
-    CHECK(lookup(&refs[0], id) && vk_texture_slot_token(&refs[0], id) == alias_token);
+    VkSlotStamp alias_stamp;
+    CHECK(lookup(&refs[0], id) && vk_texture_slot_token_stamped(&refs[0], id, &alias_stamp) == alias_token);
     CHECK(pidx_remove(&pool_index, &alias, NULL));
     vk_texture_descriptors_retire(alias.lo, alias.size, 0);
-    CHECK(!lookup(&refs[0], id));
+    CHECK(!lookup(&refs[0], id) && !vk_texture_slot_token_again(&alias_stamp));   // retired: no token without the lock
     provide(&imported[0]); CHECK(!lookup(&refs[0], id)); // reused host range cannot inherit the retired registration
 
     // Physical and two virtual aliases reach the same descriptor bytes. Remapping one alias selects the other backing.
@@ -216,6 +231,17 @@ int main(void) {
     key = (VkDescKey){7, 9}; CHECK(!vk_mem_descriptor_key(UINT64_MAX - 15, 32, &key) && !key.storage && !key.offset);
     CHECK(!vk_mem_descriptor_key(physical[0].lo, 0, &key));
     CHECK(!dependencies && !tex_lock.depth && !pool_lock.p);
+    uint32_t in_buckets = 0;   // the retire index (desc_buckets) holds every slot, each in the bucket of its key
+    for (uint32_t i = 0; i < desc_buckets.cap; i++) {
+        const DescBucket *b = desc_buckets.vals[i];
+        for (uint32_t j = 0; b && j < b->n; j++) {
+            uint64_t want = desc_bucket_id(&b->v[j]->key);
+            CHECK(!memcmp(desc_buckets.keys + (size_t)i * desc_buckets.klen, &want, sizeof want) && b->v[j]->bpos == j &&
+                  nvn_hm_get(&descriptors, &b->v[j]->key) == b->v[j]);
+            in_buckets++;
+        }
+    }
+    CHECK(in_buckets == descriptors.n);
     printf("descriptor registry/resolver: %u checks passed (index %d, handle %#llx; CPU only)\n",
         checks, id, (unsigned long long)handle);
     for (uint32_t i = 0; i < descriptors.cap; i++) free(descriptors.vals[i]);
@@ -232,26 +258,35 @@ def source():
               'platform/common.c')}
     core, obj, cmd, tex, memory, replay, common = files.values()
     parts = [PRELUDE, statement(memory, 'enum { POOL_IMPORT'), typedef(memory, 'VPage'), typedef(memory, 'PoolRec')]
-    parts += [typedef(tex, name) for name in ('TexKey', 'Tex', 'TexSlot', 'SampSlot', 'DescSlot')]
+    parts += [typedef(tex, name) for name in ('TexKey', 'Tex', 'TexSlot', 'SampSlot', 'DescSlot', 'DescBucket')]
     parts += [statement(tex, 'enum { DESC_TEXTURE')]
     for text, names in ((tex, ('static PlatRMutex tex_lock', 'static PlatOnce tex_once', 'static nvn_hmap by_key',
-            'static nvn_hmap by_addr', 'static nvn_hmap descriptors', 'static uint32_t slots_gen',
-            'static uint32_t samp_gen', 'static uint32_t reg_serial', 'static uint32_t agen[AGEN_N]',
-            'static uint32_t submit_epoch', 'static volatile int32_t tex_ready')),
+            'static nvn_hmap by_addr', 'static nvn_hmap descriptors', 'enum { DESC_BUCKET_SHIFT',
+            'static nvn_hmap desc_buckets', 'static uint32_t slots_gen',
+            'static uint32_t samp_gen', 'static uint32_t reg_serial', 'static uint32_t agen[AGEN_N]', 'static uint32_t rgen[RGEN_N]',
+            'static uint32_t submit_epoch', 'static volatile int32_t tex_ready', 'static int tex_frozen')),
             (memory, ('static PlatMutex pool_lock', 'static pidx pool_index')),
             (common, ('static PlatMutex once_lock', 'static PlatCond once_done'))):
         parts += [statement(text, name) for name in names]
     parts += [r'''
 static Tex *entry_of(const tex_t *t) { (void)t; dependencies++; rt_fatal("unexpected image creation\n"); }
 static int make_fresh_snap(Tex *t) { (void)t; dependencies++; rt_fatal("unexpected upload\n"); }
+void plat_yield(void) {}   // lock_unfrozen: no pass end is held back here, so never reached
 ''']
-    for text, starts in ((common, ('void plat_rmutex_lock(', 'void plat_rmutex_unlock(', 'void plat_once(')),
+    parts += ['#define HOLD_SITES 16\n#define lock() lock_at(0)', typedef(tex, 'HoldSite')] + [statement(tex, name) for name in (
+        'static int holds_on', 'static _Thread_local uint64_t hold_t0', 'static _Thread_local void *hold_ra',
+        'static PlatMutex holds_lock', 'static HoldSite holds')]
+    for text, starts in ((common, ('void plat_rmutex_lock(', 'int plat_rmutex_trylock(', 'void plat_rmutex_unlock(', 'uint32_t plat_rmutex_release(', 'void plat_rmutex_retake(', 'void plat_once(')),
             (core, ('void nvn_called(',)),
-            (tex, ('static void tex_init(', 'static void lock(', 'static void unlock(', 'static void log_limited(',
-                'static uint32_t agen_idx(', 'static void make_key(', 'static int same_but_swizzle(')),
-            (memory, ('int vk_mem_descriptor_key(',)),
-            (tex, ('static int descriptor_key(', 'static DescSlot *descriptor_slot(', 'static void descriptor_registered(',
-                'void vk_texture_register(', 'static Tex *slot_resolve(', 'uint64_t vk_texture_slot_token(',
+            (tex, ('static void tex_init(', 'static void hold_note(', 'static void lock_at(', 'static void unlock(', 'static void lock_unfrozen(',
+                'static void log_limited(',
+                'static uint32_t agen_idx(', 'static void make_key(', 'static int same_but_swizzle(',
+                'static uint32_t rgen_idx(', 'static void rgen_bump(')),
+            (memory, ('static void pool_lock_shared(', 'int vk_mem_descriptor_key(',)),
+            (tex, ('static uint64_t desc_bucket_id(', 'static void desc_bucket_add(', 'static void desc_bucket_del(',
+                'static int descriptor_key(', 'static DescSlot *descriptor_slot(', 'static void descriptor_registered(',
+                'void vk_texture_register(', 'static Tex *slot_resolve(', 'uint64_t vk_texture_slot_token(', 'uint64_t vk_texture_slot_token_stamped(',
+                'uint64_t vk_texture_slot_token_again(',
                 'const VkTexImage *vk_texture_by_id_locked(', 'void vk_sampler_register(', 'int vk_sampler_params(',
                 'void vk_texture_descriptors_retire('))):
         parts += [function(text, start) for start in starts]

@@ -78,12 +78,18 @@ Useful settings, as environment variables (`set NAME=value` in the same Command 
 | `TOTK_GPU=null` | Run without a picture (no Vulkan). Useful to tell CPU and OS bugs from graphics bugs. |
 | `TOTK_XLATE_PROCS=<n>` | Shader translator processes at run time (default 2). Lower it if RAM runs out. |
 | `TOTK_TRACE=perf` | Log the frame time, what holds frames back and the GPU time every 60 frames. For stalls and low frame rates. |
-| `DKB_REPLAY_THREADS=N` | Experimental, off by default (`docs/parallel-replay.md`). A render pass whose targets took at least 256 draws the last time is recorded in slices of 1024 draws, each into a secondary command buffer that the pass executes in order (`vk_exec.c` `par_start`, `par_flush`). `N` threads record the slices: the submitting thread and `N-1` workers (`1`: the submitting thread alone, to compare). Try `4`. The log says `vk: passes of 256 or more draws are recorded in slices ...` at the first sliced pass, `vk: N replay slice workers started`, and `a sliced pass needed a pass or barrier change inside a slice` when a pass cannot be sliced (it is then left alone). With `N` above 1 the command buffer parts default to at least 300 us (`TOTK_SPLIT_US`, else 1000), so the GPU starts sooner on the sliced passes. |
+| `DKB_REPLAY_THREADS=N` (or `TOTK_REPLAY_THREADS`, also in the Advanced tab) | Unset, 6 when the process may run on 12 or more logical processors, 4 on 8 to 11 (not on AMD, where it was not measured) and off below that (in the Hilltop Layer of Surf Hills on 16, 6 threads gave 45 to 47 fps against 42 with 4), and the command buffer split then defaults to parts of 300 us (`vk_exec.c` `par_threads`; in the layer -101 scene 4 threads gave 57 fps against 53, `docs/dkb-lowend.md`); `0` turns it off (`docs/parallel-replay.md`). A render pass whose targets took at least 256 draws the last time is recorded in slices of 48 to 1024 draws (smaller towards the pass's expected end), each into a secondary command buffer that the pass executes in order (`vk_exec.c` `par_start`, `par_flush`). `N` threads record the slices: the submitting thread and `N-1` workers (`1`: the submitting thread alone, to compare). Try `8` on 16 logical processors. With it set, the helper threads of `TOTK_REPLAY_PAR` take no run. Works with `upscaler = dlss`: the scene DLSS needs is noted from the collected draws. While `TOTK_DUMP` is armed, passes are not sliced. The log says `vk: passes of 256 or more draws are recorded in slices ...` at the first sliced pass, `vk: N replay slice workers started`, and `a sliced pass needed a pass or barrier change inside a slice` when a pass cannot be sliced (it is then left alone). With `N` above 1 the command buffer parts default to at least 300 us (`TOTK_SPLIT_US`, else 1000), so the GPU starts sooner on the sliced passes. |
+| `DKB_PAR_DEFER=0` (or `TOTK_PAR_DEFER`) | On by default; `0` makes the end of a sliced pass wait for its slices as before. With sliced passes (`DKB_REPLAY_THREADS`), the end of a sliced pass no longer waits for its slices: the part that holds the pass stays open and the walk goes on while the workers record, up to 2 pass ends at a time by default (`DKB_PAR_DEFER_DEPTH=1..4`; at 4 the Hilltop Layer of Surf Hills ran 9% slower than without the deferral). Before the walk changes anything a held slice reads (a new or revived texture, a first GPU write, an upload, a learned feedback target, a new mirror) it waits for the held slices (`vk_texture.c` `hold_barrier`), and a slice starts only once the slices of earlier passes are recorded (`vk_exec.c` `par_ready`). On the route's Lake Level (3.2.0) it took the replay from 5.96 to 5.44 ms a frame (three interleaved runs each). The perf line `sliced passes on the submitting thread` counts the held pass ends and the walk's waits for them; `ab` alternates it with the A/B blocks. |
 | `TOTK_MEM_REPORT=N` | Logs `mem: commit frame F: guest heap+stack, alias, modules, kernel, other private, mapped, image; process commit (limit)` every N presents (0, the default, off), and once at exit with `exit`. One walk of the address space (`memory.c` `mem_commit_report`), with the GPU side (device-local, mirrors, staging pool, usnap arenas) appended. For where the process's commit goes. Windows only. |
-| `TOTK_HEAP_LAZY=1` | Experimental, off by default (0), Windows only. For 16 GB machines with a small page file, where the commit limit is what ends the game: the guest heap (the game asks for about 9 GiB with SetHeapSize, about 4.2 GiB of it ever resident) stays reserved and each 64 KiB chunk is committed when first touched (`win32.c` `fault_veh`), or by `mem_touch` before a file read or a Vulkan host-pointer import. See the effect with `TOTK_MEM_REPORT=N`: `process commit` and `guest heap+stack` drop, and a `lazy heap` line counts the commit faults. |
+| `TOTK_HEAP_LAZY=0` | On by default (1) since the layer -101 runs (54.3 fps against 53, worst frame about 470 ms against 750), Windows only; `0` commits the whole heap up front as before. For 16 GB machines with a small page file, where the commit limit is what ends the game: the guest heap (the game asks for about 9 GiB with SetHeapSize, about 4.2 GiB of it ever resident) stays reserved and each 64 KiB chunk is committed when first touched (`win32.c` `fault_veh`), or by `mem_touch` before a file read or a Vulkan host-pointer import. See the effect with `TOTK_MEM_REPORT=N`: `process commit` and `guest heap+stack` drop, and a `lazy heap` line counts the commit faults. |
 | `DKB_DRAW_PROFILE=1` | Logs where a draw's replay time goes every 60000 draws, in nanoseconds per draw: `vk_exec: draw profile ...` with the sections pass, shaders, pipeline, state, bind-sig, ubo, ssbo, textures, sets, feedback, vertex-buffers, tail and other-ops (`vk_exec_draw.c` `prepare_draw`). For busy areas where `TOTK_TRACE=perf` reports a large `replay avg`. One clock read per section mark, so leave it off otherwise. |
-| `TOTK_DYN_UBO=1` | Makes the uniform buffers of the allocated fragment set dynamic (`vk_pipeline.c` `dyn_ubo_convert`), so consecutive draws that differ only in a buffer's offset reuse one written set (`vk_exec_draw.c` `bind_resources`). Off by default. Its author measured +16% fps in dense areas on an RTX 3050 laptop; untested on AMD and Intel, and not yet run under the validation layer. Any value other than `0` (including `off`) turns it on; `ab` alternates it with the A/B blocks. |
+| `TOTK_DYN_UBO=1` | Makes the uniform buffers of the allocated fragment set dynamic (`vk_pipeline.c` `dyn_ubo_convert`), so consecutive draws that differ only in a buffer's offset reuse one written set (`vk_exec_draw.c` `bind_resources`). On by default except on Intel GPUs, where nobody has measured it. Its author measured +16% fps in dense areas on an RTX 3050 laptop; #234's author measured +1 to +2.5 fps on an RX 9070 XT and 12% less replay time on an RTX 3060 Ti; on the -101 heavy scene on an RTX 5060 Ti it is even (56.4 to 57.4 fps against 56.8 to 57.2) and the validation layer reports nothing new. `TOTK_DYN_UBO=0` turns it off. Any value other than `0` (including `off`) turns it on; `ab` alternates it with the A/B blocks. |
+| `TOTK_TEX_REPEAT=0` | Looks up every graphics draw's texture descriptors again. By default a draw with the same pipeline as its thread's last descriptor build, the same sampled texture handles, the same descriptor context and generations and the same feedback-layout attachments reuses the descriptors that build wrote (`vk_exec_draw.c` `tex_repeat`); draws that bind storage images always look up. `ab` alternates it with the A/B blocks. For checking a texture glitch against the reuse. |
+| `TOTK_LOCK_HOLDS=1` | Diagnostic, with `TOTK_TRACE=perf`: every 60 frames, the callers that held the texture lock over 200 us, as exe offsets for `totk.map`, with their count, total and longest hold. The perf trace always logs the waits over 100 us on the texture, memory pool and mirror locks. |
 | `TOTK_WB_ASYNC=1` | Writes a deferred guest read's render target back without making the replay wait: the copy is submitted and lands in the storage at a later poll (`vk_texture.c` `vk_texture_wb_poll`), unless the CPU rewrote the storage meanwhile. Off by default: no fps gain beyond run-to-run noise was measured, and 30-45% of the late copies found the storage rewritten and were dropped. |
+| `TOTK_WB_UNLOCKED=0` (or `DKB_WB_UNLOCKED=0`) | Waits for a waited write-back's GPU copy (a CPU read of a render target the GPU wrote, and the write-back at a fence wait) with the texture lock held, as before. By default the copy is queued under the lock, the wait for the GPU happens without it, and the bytes land through the same checks as `TOTK_WB_ASYNC` (`vk_texture.c` `wb_copies`): the lock was held about 0.35 ms per write-back, some 340 times a second in Lake Level, while the replay's texture lookups waited for it. `ab` switches with the A/B blocks. |
+| `TOTK_GS_STORAGE_WRITEBACK=1` | Copies the storage buffers the geometry stage writes (the destructible terrain's) back into guest memory at the end of each submission, as every other GPU write. Off by default: they stay in VRAM, where only later GPU draws read them. In the Hilltop Layer of Surf Hills (3.2.0) the copies were 70 MiB and 7.7 ms of GPU time a frame. `ab` alternates it with the A/B blocks. |
+| `TOTK_SPARSE_MIRROR_COPY=0` | On by default on NVIDIA, the one vendor it was measured on (`1` turns it on elsewhere); `0` copies every VRAM mirror write-back range with a transfer copy. A pool's word-aligned write-back ranges of at most 64 KiB, when there are at least 64 of them and they average at most 4 KiB, are copied by one compute dispatch (one workgroup a range) instead of a copy region each, and its other ranges by a transfer copy, and the range list is reused after the submission completes. In the Hilltop Layer of Surf Hills (3.2.0) that took the write-backs from 4.2 to 0.4 ms of GPU time a frame. Restart required. |
 | `TOTK_PERF_SLOW_GPU_MS=<ms>` | With `TOTK_TRACE=perf`, a replay part that runs this long on the GPU (default 100) gets a line with its draw and dispatch counts and the NVN 2 names of its stages, a second line with the arguments of its indirect draws as read back afterwards, and a third saying whether a shader in that part wrote the largest one's arguments, and which. |
 | `TOTK_FIX_SCREEN_UV=0` (or `DKB_FIX_SCREEN_UV=0`) | Leaves the map's mask shader as the game wrote it. By default its screen position is computed from `gl_FragCoord` instead of read from varyings the vertex stage divided by w: the camera sits inside the box that shader draws, and on AMD (Eglantine as well) the faces behind the camera turned the varyings into long cyan wedges across the map. The shader is recognised by its NVN 2 name or the hash of its translated SPIR-V, and the log names it when it is rewritten (`vk: fs 544677ae4ec509be ... rebuilt from gl_FragCoord`). |
 | `TOTK_DUMP=key` (or `DKB_DUMP=key`) | Frame dump on a key: press F9 in the game window and the frame after next is dumped to `dump\` (`passes.txt`, one PNG per pass target; `TOTK_DUMP=<frame>` dumps a fixed frame instead). With `DKB_DUMP_UBO=1`, `passes.txt` also lists each pipeline's uniform blocks; it always lists the vertex inputs. The PNGs show the game: never attach them publicly. One dump per run. |
@@ -101,8 +107,9 @@ Useful settings, as environment variables (`set NAME=value` in the same Command 
 | `DKB_GEOMETRY_CONTEXT=1` | Logs the first 12 draws with a geometry stage and their buffers (#58). `DKB_GEOMETRY_CONTEXT_ORIGIN=<hex>` keeps only draws with that stage origin. |
 | `DKB_GPU_CHECKPOINTS=1` | On NVIDIA (VK_NV_device_diagnostic_checkpoints), marks every pipeline bind, compute dispatch, copy, blit and colour clear so that a lost device logs the last checkpoints the GPU reached, with the NVN 2 names of the shaders of each pipeline (#75). With VK_EXT_device_address_binding_report it also keeps the last 4096 GPU address bind/unbind events and, for each address in the device fault report, logs the bindings that contain it or the nearest one ending within 1 MiB below it. Also saves the driver's fault dump to `logs\dkb-fault-<time>.bin`; it can contain shader code, never attach it. With VK_KHR_pipeline_executable_properties it also logs, the first time a pipeline is bound, one line per driver executable (stage, NVN 2 stage names, every statistic such as binary size) and saves its internal representation (ISA) to `logs\dkb-isa-<pipeline handle>-<stage>.txt` (or `.bin`; at most 4096 pipelines and 512 MiB; derived from the game, never attach). The capture runs on the recorder thread at each new pipeline's first bind, so it can slow recording, and toggling the variable costs one cold pipeline-cache run. Off by default. AMD always has its own breadcrumbs. |
 | `TOTK_CRUMB_BIND=1` | Debug only, for GPUs with VK_AMD_buffer_marker (AMD) and no NVIDIA checkpoints: marks every pipeline bind with a breadcrumb in its own marker words, and a lost device logs the last bind the GPU reached and finished plus the last 8 binds with their pipeline and NVN 2 stage names. Off by default; costs two buffer-marker writes per bind. |
-| `TOTK_FIX_VS_FAULT=all` | Debug only, for A/B tests of the AMD device loss: runs the light-quad skip of #9, which is NVIDIA-only by default (`1`), on every GPU. `0` turns it off. |
-| `DKB_SKIP_VS=<origin>[,<origin>...]`, `DKB_SKIP_FS=<origin>[,<origin>...]` | Debug only, for diagnosing #75: skips every draw whose NVN 2 vertex (`DKB_SKIP_VS`) or fragment (`DKB_SKIP_FS`) stage origin (the 16-digit hex name logged by `DKB_GPU_CHECKPOINTS=1`) is listed, up to 16. Off by default. |
+| `TOTK_FIX_VS_FAULT` | The light-quad skip. By default (`1`) it skips only vertex stage ba1dd1e7ae8abb33 on NVIDIA, which faults the device in the Snow World descent (#196, #197). `9` also skips the #9 quads (cae0ef8e9fe9147f and the family whose fragment stage reads c0+0x530), which no longer fault on current builds and carry particles (#62). `all` runs the skip on every GPU (debug, for A/B tests of the AMD device loss); `0` turns it off. |
+| `TOTK_FIX_LQ_FOLD=0` (or `DKB_FIX_LQ_FOLD=0`), `=all` | The light-quad fold (NVIDIA only). Some Bananza vertex stages, named by NVN 2 origin in `gfx_spirv.c` `lq_fold_rules`, lose the device or crash the driver's shader compiler; `spirv_lq_fold.cpp` replaces the `& 3` results that feed their branch conditions by 0, and the fault goes. By default (`1`) only Tower's three stages are folded: without the fold Tower lost the device in every run. `all` also folds Ground's, Ice's and Fort's stages, whose light quads are otherwise drawn unfolded or skipped (Ice's `ba1dd1e7ae8abb33` is still skipped by name under `TOTK_FIX_VS_FAULT`, whose default is `1`: drawn folded it faulted in Ice); `0` turns the fold off. It is not exact: a folded light quad draws every instance with texture layer 0, and Fort's stage moves a texture coordinate by up to 0.5 in some invocations. A stage whose module lacks the expected pattern, or whose compiled module the fold fails on, is not touched and stays skipped. The log names each folded stage (`vk: vs origin ... light-quad fold applied`). The fold is tested by `tests/lq_fold_spirv_test.py --cc clang --spirv-val spirv-val --out <dir>`. |
+| `DKB_SKIP_VS=<origin>[,<origin>...]`, `DKB_SKIP_FS=<origin>[,<origin>...]`, `DKB_SKIP_CS=<origin>[,<origin>...]` | Debug only, for diagnosing #75: skips every draw whose NVN 2 vertex (`DKB_SKIP_VS`) or fragment (`DKB_SKIP_FS`) stage origin (the 16-digit hex name logged by `DKB_GPU_CHECKPOINTS=1`) is listed, and every direct dispatch whose compute stage is listed (`DKB_SKIP_CS`), up to 16 each. Off by default. |
 | `DKB_DUMP_SPV=1` | Debug only, for diagnosing #75: writes the exact SPIR-V passed to `vkCreateShaderModule` for each graphics and compute shader (after every rewrite) to `spv/<vs\|fs\|gs\|cs>-<NVN 2 stage origin>-<FNV-1a 64>.spv` next to `dkb.log`, so a SPIR-V hash from an Nsight Aftermath dump maps to its NVN 2 stage; up to 1 GiB, one `vk: spv dump` log line per file. Off by default. The files can hold code derived from the game: never attach them. |
 | `DKB_SPV_OVERRIDE=<hash>:<path.spv>[,<hash>:<path.spv>...]` | Debug only, for #75: a shader module whose final SPIR-V has this FNV-1a 64 hash (16 hex digits, the last part of a `DKB_DUMP_SPV` file name) is created from the given file instead (multiple of 4 bytes, up to 16 MiB; max 8 entries). One `vk: SPIR-V override` log line per replaced module. Off by default. |
 | `DKB_NAN_GUARD=zero` (default), `mark` or `0` | Fragment stages store 0 in place of NaN in their float colour outputs (`spirv_nan_guard.c`). A NaN texel in the HDR scene colour is spread by the bloom into a glowing band crossed by black lines; two frame dumps from a challenge room on an RX 9070 XT had NaN right after the lit opaque pass, which the console does not show. `mark` writes a colour named by the stage instead: r, g and b are each 0, 1, 4 or 16 from bits of the stage's SPIR-V hash (the `fs` hash in a dump's `passes.txt`), and the log lists `vk: fs <hash>: NaN marked as <r> <g> <b>` for each stage, so a dump's `_tm` image shows which stage writes the NaN. `0` stores what the shader computed. The guard tests the float's bits (`(bits & 0x7fffffff) > 0x7f800000`), not `OpIsNan`, which a driver may fold to false because the translator never enables `SignedZeroInfNanPreserve`. It changes the final SPIR-V hash of every fragment stage, so `DKB_SPV_OVERRIDE` hashes and `DKB_DUMP_SPV` file names taken under another `DKB_NAN_GUARD` value do not match. Tested by `tests/nan_guard_spirv_test.py --cc clang --spirv-val spirv-val --out <dir>`. |
@@ -110,7 +117,8 @@ Useful settings, as environment variables (`set NAME=value` in the same Command 
 | `DKB_HDR_TRACE=1` (`hdr_trace = 1`) | Logs the game's HDR and colour-space calls (`hdr-trace:` lines: the first 20 of each, then every 600th, with the caller) and the window texture's format when it changes. |
 | `DKB_HDR_SHOULDER=0` | With `DKB_HDR_NATIVE=1`: leaves the game's HDR composite as the game made it, so its highlights stop at about 1.36 times `hdr_game_nits` (`spirv_hdr_shoulder.c` off). For a comparison, or to rule out the rewrite when a scene looks wrong; default 1. |
 | `DKB_FMZ=0`, `vertex` (default) or `all` | Workaround for #75, on for vertex stages by default (`0` turns it off): rewrites 32-bit float `OpFMul` and GLSL.std.450 `Fma` in the final SPIR-V so `0 * x = 0` even for Inf and NaN (NVIDIA's fused-multiply-zero rule). `vertex` touches vertex-stage modules only, `all` every stage. One `vk: FMZ rewrite <hash> mul=<n> fma=<m>` log line per rewritten module; `DKB_DUMP_SPV` shows the rewritten bytes. `DKB_FMZ_SEL=<mask>:<value>` (hex) limits it to the modules whose FNV-1a 64 hash before the rewrite satisfies `(hash & mask) == value`, so `1:0` and `1:1` split the set in halves for a bisection. |
-| `DKB_FIX_POOL_GUARD=0` | Turns off the workaround for #126 (on by default, 1.0.0 only): five guards in the layer-change loop `main+0x410680` keep list entries and cells that hold reused memory out of its work (`recomp/patches-dkb100.txt`, set `poolguard`). Failed checks are counted and logged as `patches: guard ... failed` lines (the first 32, then at each power of two). |
+| `DKB_FIX_POOL_GUARD=0` | Turns off the workaround for #126 and #218 (on by default, 1.0.0 and 3.2.0): five guards in the layer-change loop `main+0x410680` keep list entries and cells that hold reused memory out of its work; a sixth (#218 crash 2) skips caching an id when the node free list of `main+0x108020` (3.2.0 `main+0x11a7e0`) is empty (`recomp/patches-dkb100.txt` and `recomp/patches-dkb458752.txt`, set `poolguard`). Failed checks are counted and logged as `patches: guard ... failed` lines (the first 32, then at each power of two). |
+| `DKB_FIX_RECORD_GUARD=0` | Turns off the workaround for #229 (on by default, 1.0.0 and 3.2.0): two guards in the record loop of `main+0xa37740` (3.2.0 `main+0xa55740`) skip a record whose table index is 0xffffffff, so the loop no longer reads an entry far outside the table (`recomp/patches-dkb100.txt` and `recomp/patches-dkb458752.txt`, set `recguard`). Failed checks are logged as `patches: guard ... failed` lines. |
 | `TOTK_TRACE=codec` | Log each call of the video decoder that moves a buffer or a picture. For guide movies that stop or show a flat colour. |
 | `TOTK_FRAME_GEN=2x` (`frame_gen = 2x`, default `off`) | Experimental, Bananza only (TotK keeps its back-edge pacing and gets no made frames). The present thread (`vk_backend.c` `present_main`) calls `vk_framegen.c`: each game frame is copied from the window texture's crop, reduced to luma, matched against the frame before it (block matching, 3x3 median) and a frame at t = 0.5 is made; it is presented first and the game's frame half the game's frame interval later, both through the normal present chain (FSR, SMAA, HDR, overlay). No made frame after a gap of over 100 ms, a change of the crop size with the game's own HDR picture, with a window texture that is not 8-bit UNORM, when the display's refresh is below the doubled rate (`over refresh` in the log), or unless `vk_present` is `mailbox` or `immediate` (FIFO would block the present thread). The log has `fg:` lines, one every 5 s. Shaders and algorithm from Hookshot (see `THIRD_PARTY_NOTICES.md`). |
 
@@ -120,16 +128,20 @@ The settings keep TotK Recomp's `TOTK_` names, so its fixes apply without a rena
 Command-line options: `--seconds S` stops the run after S seconds of game time, and `--shot frame.png` with it saves
 that frame. A shot is for your own debugging; do not post it if it shows game content.
 
-## Add-on content
+## Add-on content (untested in game)
 
-The reader (`runtime/aoc_romfs.c`) looks for `aoc-<index>/` folders next to `dkb.exe` (`<index>` is 0 to 31), each
-holding `romfs.bin` and `aoc-index.bin`. The installer writes them (docs/installer.md, "Add-on content"): a `.nup`
-brings its add-on packages, and folder installs take `--dlc <dump>/dlc` (or the add-on's RomFS folder), which the
-window offers as an optional field. Bananza's add-on is index 1.
+Nothing in the game has been run with add-on content (DLC) yet: the reader (`runtime/aoc_romfs.c`) is checked on a
+synthetic pack (`tests/aoc_romfs_test.py`) and by `--probe-aoc` on a real one, and that is all. Update 3.2.0 is the
+same: the installer builds it and it boots, and nobody has played it. If you try either, say so in the report.
 
-After an install, `dkb.exe --probe-aoc` mounts the first pack and reads up to 64 files back whole; with
-`DKB_AOC_SOURCE=<dlc romfs>` it also compares them with the folder. The add-on's shaders are translated in play, so
-its areas stutter the first time. Say in the report whether you played with add-on content.
+The reader looks for `aoc-<index>/` folders next to `dkb.exe` (`<index>` is 0 to 31), each holding `romfs.bin` and
+`aoc-index.bin`. The installer writes them when it is given a `.nup` that holds add-on content: each add-on content
+package (kind `addon` in `extract_nup.py --list`) with a RomFS becomes `aoc-<n>`, where `<n>` is its title id minus the
+application id plus `0x1000` (0 to 31; others are ignored), and the install log has one `aoc: index <n>: <files> files`
+line per pack. A pack that fails is skipped with a warning; the install goes on. With ExeFS and RomFS folders, pass
+the add-on content with `--dlc <dump>/dlc` (or its RomFS folder; the window's add-on content field), and the
+`dkb_addons` step writes `aoc-<n>` (docs/installer.md, "Add-on content from folders"). Then `dkb.exe --probe-aoc` mounts the first
+pack and reads up to 64 files back whole; with `DKB_AOC_SOURCE=<dlc>` it also compares them with the folder.
 
 ## Experimental ultrawide mode
 
@@ -156,8 +168,16 @@ default when no resolution is selected. These dimensions do not establish the na
 host window separately. Use **Black bars** (`DKB_ASPECT=fit`) to preserve proportions
 when the window and game have different aspect ratios.
 
-Build with `recomp/patches-dkb100.txt` and generate matching overlays from your own packed
-RomFS (requires Python `zstandard`). For a 3440x1440 build, generate both HUD variants:
+The installer prepares matching background overlays and both HUD variants for every wide preset automatically.
+Rerun setup to add them to an older installation or repair missing/changed overlays; this does not change your
+resolution or HUD choice. Select **Centered** under HUD position for the central 16:9 HUD and restart.
+If generation fails, setup warns and finishes without new overlays; see the named log and rerun setup to retry.
+
+For a manual build, use the game's patch table and generate matching overlays from your own packed
+RomFS (Python 3.14+ has built-in zstd; older Python needs `zstandard`). For 3440x1440, generate both HUD variants:
+
+The commands below default to 1.0.0. Add `--version dkb458752` for 3.2.0: its confirmation-dialog layout and
+title-effect archive differ. The installer selects this automatically from the verified ExeFS version.
 
 ```powershell
 python tools/dkb_wide_layout.py --romfs build/extracted/dkb100-packed/romfs --out build/ultrawide/romfs-patches-3440x1440 --aspect 3440x1440
@@ -166,14 +186,36 @@ build/ultrawide/dkb.exe
 ```
 
 Repeat for each installed ultrawide resolution, placing the folders beside `romfs-index.bin`.
-The overlays contain game data and must stay private under `build/`. Regenerate older
-overlays to include the title-background fix; updating the executable alone is insufficient.
+The overlays contain game data and must stay private: manual generation stays under `build/`, while setup uses its
+owned build staging folder and copies validated overlays into the installation. Regenerate older overlays or rerun
+setup to include the title-background fix; updating the executable alone is insufficient.
 Missing edge-HUD overlays fall back to the centered variant with a log message.
 
 Environment equivalents are `DKB_ULTRAWIDE=0|1`, `DKB_OUTPUT_RES=<width>x<height>`,
 and `DKB_HUD_POSITION=edges|centered`. Overrides lock the corresponding F1 controls;
 otherwise choices are saved in `dkb.ini` (an existing `totk.ini` is copied to it on the first run; `TOTK_*` environment variables still work, and `DKB_*` ones win over them). Turning Ultrawide off allows the 16:9 presets
 and skips the wide overlay. Invalid sizes fall back to the original 2880x1620 dimensions.
+
+`scene_res` (`DKB_SCENE_RES`, `auto|full`, read at start, F1 "3D scene resolution") controls the size of the 3D scene.
+`auto` keeps the game's own dynamic resolution, which settles at a ratio of 1.5 under emulation, so the scene is
+two thirds of the render resolution on each side (1280x720 at 1920x1080) and is then upscaled. `full` (or a ratio from
+1.0 to 3.0) patches the controller (main 3c12b4 on 1.0.0) to store that ratio: the scene is drawn at the whole render
+resolution (more GPU cost, the render-target pool grows by (1.5/ratio)^2) and the game's upscaler, and so DLSS, is not
+dispatched. `dkb.log` says `Bananza resolution: 3D scene ratio ...`.
+On update 3.2.0 the game also makes each display's 3D image two thirds of the display (a scale in its render
+parameters, read at main 79024), and the ratio divides that image, so the controller alone gives a scene of the
+display x 2/3 / ratio: `full` drew 1920x1080 at a 2880x1620 render resolution and stretched it. There `scene_res` also
+sets that scale to 1.0 (set `render3d`), so the scene is the render resolution divided by the ratio, as on 1.0.0. A ratio
+keeps the upscaler: `scene_res = 1.5` at 3840x2160 draws the scene at 2560x1440 and DLSS outputs 3840x2160
+(`dlss: Quality 2560x1440 -> 3840x2160`), where `auto` outputs 2560x1440.
+The render-target pool is carved from the game's GSys heap, 518144 KiB (506 MiB) in
+`System/HeapSize/Product.Nin_Ounce_NVN2.HeapDef.byml.zs`. A pool GSys cannot hold crashed the game before it showed
+anything (access violation reading 0xa0 in main+0x128d40 on 3.2.0): at 3840x2160, pools of 474 MiB ran and 514 MiB
+crashed, and so did a 5760x3240 output on `auto` (800 MiB). GSys now grows by what the pool adds to the stock
+200 MiB, as TotK's texture heap does (`resolution: HeapDef GSys ... KiB` and a `RomFS overlay` line in `dkb.log`),
+and the application pool by the same amount, so no other heap shrinks. On 3.2.0 at 3840x2160, `full` (802 MiB),
+`1.25` (514 MiB) and 5760x3240 on `auto` (800 MiB) run. When the table cannot be rewritten, `scene_res` keeps the
+pool within 474 MiB instead, raising the ratio as far as needed, and says so.
 
 5120x1440 (32:9) and 3840x2160 used to fail during render-resource creation because the game's
 render-target pool is a fixed 200 MiB; a patch grows it with the output size. Both now run on 1.0.0
@@ -199,15 +241,29 @@ the committed `recomp/patches-dkb458752.txt` (it prints every loose, sibling and
 review), and run `python tools/port_patches.py --self-check` (the 1.0.0 table mapped onto itself must have no
 deltas).
 
+## Mods
+
+Loose replacement files go in a `mods` folder next to `dkb.exe`; no manifest is needed. A file's path below `mods`
+is its RomFS path (`mods/Sound/Resource/Foo.bwav` replaces `Sound/Resource/Foo.bwav`), so the folders mirror the RomFS
+root. A path the RomFS has is replaced, one it lacks is added. Compressed files (`.zs` and the like) must keep the
+game's own format. The files are not checked against anything: a mod that breaks the game is the mod's problem. The
+log shows `RomFS mods: N files from ... (R replace, A add)`. `TOTK_ROMFS_MODS` (`romfs_mods` in `totk.ini`) names
+another folder, and `TOTK_ROMFS_MODS=0` turns mods off. A folder with a `manifest.tsv` is still read as a checked
+overlay.
+
 ## What to report
 
 Open an issue with the issue form, or comment on [#3](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/3)
-(GPU testing) or [#7](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/7) (playing further):
+(GPU testing):
 
-- the commit you built (`git rev-parse --short HEAD`);
-- GPU, driver version and Windows version;
+- the release you downloaded, or the commit you built (`git rev-parse --short HEAD`), and the game version (1.0.0 or
+  3.2.0);
+- GPU, driver version and operating system;
 - how far the game got and what you did just before it stopped;
 - the log, `logs\dkb.log` next to `dkb.exe` (`logs\totk.log` in builds before the rename), as an attachment. After a crash, copy it before you start the game
   again: the next run renames it to `dkb.1.log`.
 
 Never attach game files, keys, builds or the shader cache, and never paste key values into a log or an issue.
+A crash also writes a minidump, `logs\crash-<pid>-<tick>.dmp` (the log's `minidump:` line names it; the newest five
+are kept). It holds memory of the game's threads, so it stays on your PC: never attach it to an issue, and send it only
+privately when a developer asks for it.

@@ -61,6 +61,8 @@
 # memory = auto
 # A new texture created over a live texture's memory starts with that content instead of empty.
 # tex_alias = 1
+# Drop or release cached textures when VRAM usage rises above this percentage (0 to 100; 0 = off). Default: 90.
+# tex_vram_pressure = 90
 # Host zstd decoder in place of the game's (0 = the game's), and a check that decodes every call both ways and logs
 # the differences (1 = on; slow).
 # zstd_native = 1
@@ -125,6 +127,9 @@
 # in front again. 0: it pauses when its window loses focus, as it does on the Switch when Home is pressed; a load
 # interrupted that way can stop for good. Read at each focus change.
 # assume_focus = 1
+# 0 hides the console window the game opens next to its own, for frontends such as Playnite; the log still goes to
+# logs/dkb.log. A command prompt the game was started from stays as it is. Changing this needs a restart.
+# console = 1
 # Performance overlay in the top right corner: off, fps, or full (frame rate, mean and longest frame time). F10
 # cycles the modes in game, as do both stick clicks (L3 + R3) on a controller.
 # perf_overlay = off
@@ -149,6 +154,11 @@
 # and keeps FSR for the window; it needs nvngx_dlss.dll next to dkb.exe (docs/dkb-dlss.md) and falls back to the
 # game's upscaler, with a "dlss:" line in the log, when anything is missing.
 # upscaler = fsr
+# Bananza only: auto keeps the game's dynamic 3D resolution (usually two thirds of output_res on each side), full draws
+# the 3D scene at output_res (sharper, more GPU cost; no upscaler or DLSS then), a ratio from 1.0 to 3.0 draws it at
+# output_res divided by that ratio and upscales it to output_res (1.5 with upscaler = dlss: DLSS Quality at output_res).
+# Read at start.
+# scene_res = auto
 # sharpness = 80
 # SMAA 1x anti-aliasing of the final picture: off (the default), low, medium or high. It runs after the picture is scaled to
 # the window (FSR or bilinear) and before the menu is drawn, so the game's HUD is smoothed as well. Changes while the game
@@ -219,6 +229,13 @@
 # audio_channels = auto
 
 [input]
+# Choose the controller in F1 > Controls > Controller Device. The saved device key is opaque.
+# Saved manual choices apply at startup, with first-available fallback. New connections take over automatically.
+# Disconnecting the active controller falls back to another device. Automatic changes do not overwrite this preference.
+# pad_device = auto
+# Default: Plus + Minus opens settings. Opt in to a physical Start + Back fullscreen hold instead (0.5 s).
+# Guide/Home and keyboard F1 still open settings in either mode.
+# pad_fullscreen_hold = 0
 # Gamepad motion controls (0 = off) and vibration (0 = off).
 # motion = 1
 # rumble = 1
@@ -233,6 +250,10 @@
 # labels (A with B, X with Y; it loads romfs-patches-xbox, docs/controls.md, "Xbox button prompts"). The bind_ lines
 # below apply on top. Changes while the game runs take effect at once; the xbox_prompts prompts at the next start.
 # pad_layout = auto
+# Bananza: the button prompts for a PlayStation pad (cross, circle, square, triangle, L1 to R2, Options, Create;
+# docs/controls.md, "PlayStation button prompts"). auto takes them when a DualShock or DualSense pad is connected at
+# start, playstation always, switch never. The game reads its fonts at boot, so a change takes effect at the next start.
+# pad_prompts = auto
 # Gamepad stick dead zone in percent of full deflection (0 to 50). Raise it for a stick that drifts: inside the circle
 # the stick reads centred, and the rest of its travel is scaled to start there.
 # stick_deadzone = 8
@@ -259,7 +280,8 @@
 # bind_Y = pad:north, key:mouse_l
 
 [files]
-# Folder with RomFS mod files that replace or add game files. Default: none.
+# Folder with RomFS mod files that replace or add game files (docs/dkb-testing.md, "Mods"). Default: the mods folder next
+# to dkb.exe; 0 turns mods off.
 # romfs_mods =
 
 [diagnostics]

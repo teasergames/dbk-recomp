@@ -229,6 +229,27 @@ static void output_open(Mixer *m, int rate) {
         rt_log("audio: no output device (%s): mixing without sound", SDL_GetError());
         return;
     }
+#if !defined(__linux__) && defined(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES)
+    // The same static on a Windows laptop whose device opened with a 1024-frame period (#272), where 480-frame devices
+    // are clean: when the opened device's period is not a whole number of renderer blocks, reopen it asking for one
+    // block per period. Only the opened device's period counts; before opening, SDL reports its own default (1024 at
+    // 48 kHz) for every device. WASAPI may keep its period; then nothing changes.
+    {
+        SDL_AudioSpec d0;
+        int f0 = 0;
+        if (m->frame > 0 && SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(m->stream), &d0, &f0) && f0 > 0 &&
+            f0 % m->frame && !SDL_GetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES)) {
+            char frames[16];
+            snprintf(frames, sizeof frames, "%d", m->frame);
+            SDL_SetHintWithPriority(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames, SDL_HINT_DEFAULT);
+            SDL_DestroyAudioStream(m->stream);
+            m->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, sdl_pull, m);
+            rt_log("audio: the device opened with a %d-frame period, not a multiple of %d: reopened asking for %d (%s)",
+                   f0, m->frame, m->frame, m->stream ? "ok" : SDL_GetError());
+            if (!m->stream) return;
+        }
+    }
+#endif
     if (!SDL_ResumeAudioStreamDevice(m->stream)) {
         rt_log("audio: starting the output failed (%s): mixing without sound", SDL_GetError());
         SDL_DestroyAudioStream(m->stream);

@@ -34,6 +34,7 @@ static struct { VkBufferView zview; } standins;
 void rt_fatal(const char *fmt,...) { (void)fmt; abort(); }
 VkCtx *vk_ctx(void) { return &context; }
 int rt_knob(const char *name,const char *def) { (void)name; (void)def; return 0; } // dynamic uniform buffers off
+VkCaps vk_caps;  // bind_resources reads vk_caps.intel for the TOTK_DYN_UBO default
 int rt_ab(void) { return 0; }
 static void bind_stats(DrawCtx *dc,const VkPipeInfo *info) { (void)dc; (void)info; }
 static int bind_skip_on(DrawCtx *dc) { (void)dc; return 0; } // exercise every descriptor build
@@ -67,6 +68,8 @@ uint32_t vk_sampler_gen(void) { return 0; }
 // TOTK_REPLAY_PAR=check's digest of what a draw bound: off.
 static void dig_bound(DrawCtx *dc) { (void)dc; abort(); }
 static void dig_desc(DrawCtx *dc,const VkPipeInfo *info,const VkDescSlot *d) { (void)dc; (void)info; (void)d; abort(); }
+static uint32_t twin_pass;
+static int tex_repeat(VkExec *ex,const VkPipeInfo *info,const TexPend *tp,int n) { (void)ex; (void)info; (void)tp; (void)n; return 0; }
 static int tex_info_hit(VkExec *ex,const GfxShaderRes *r,uint64_t h,int separate,VkDescriptorImageInfo *out) {
     (void)ex; (void)r; (void)h; (void)separate; (void)out; abort();
 }

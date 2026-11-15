@@ -1,7 +1,7 @@
 name: DKB setup zip
 
 # Builds DKB-Setup-<version>-windows.zip (the portable tools, the source and the installer GUI) and the Linux and macOS
-# source packages DKB-Setup-<version>-linux-x86_64.tar.gz and -macos-arm64.zip (tools/make_release_posix.py), with no game data.
+# source packages DKB-Setup-<version>-linux-x86_64.tar.gz and -macos-arm64.zip (tools/make_release_posix.py), and the self-contained Linux AppImage, with no game data.
 # A manual run or a push to a tag only uploads the zips as workflow artifacts; a tag named v* also publishes them as a
 # GitHub release with the notes of .github/release-notes.md (0.x is experimental, see issue #85).
 
@@ -109,9 +109,36 @@ jobs:
           path: build/release/DKB-Setup-*-macos-arm64.zip
           if-no-files-found: error
 
+  appimage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch refs
+        run: sh tools/fetch_refs.sh
+      - name: Fetch the release toolchain
+        run: python tools/make_release_linux.py --fetch-toolchain --out build/ci-toolchain
+      - name: Build the self-contained AppImage in the pinned container (as in dkb-linux.yml)
+        run: |
+          python tools/make_release_linux.py --game dkb --stub             --out build/release/DKB-Setup-linux             --appimage "build/release/DKB-Setup-$(cat VERSION)-x86_64.AppImage"             --ci-container
+      - name: Smoke-test the AppImage
+        env:
+          DKB_SETUP_HOME: ${{ runner.temp }}/dkb-setup
+        run: xvfb-run -a ./build/release/DKB-Setup-*-x86_64.AppImage --appimage-extract-and-run --selftest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DKB-Setup-appimage
+          path: build/release/DKB-Setup-*-x86_64.AppImage
+          if-no-files-found: error
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [zip, linux, macos]
+    needs: [zip, linux, macos, appimage]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4   # for .github/release-notes.md

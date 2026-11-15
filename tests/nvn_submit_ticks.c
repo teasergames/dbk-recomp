@@ -35,6 +35,10 @@ static void state_reset(VkExec *ex) { memset(ex,0,sizeof *ex); }
 void vk_dump_init(void) {}
 void vk_exec_pass_end(VkExec *ex) { ex->in_pass=0; }
 static void par_flush(VkExec *ex) { (void)ex; }
+// No pass end is held back (TOTK_PAR_DEFER off): nothing to settle, and no slice contexts wait for their merge.
+static void par_settle_all(VkExec *ex) { (void)ex; }
+static int par_no_defer __attribute__((unused)), par_unmerged, par_nworkers;
+void vk_exec_draw_slices_end(int n) { (void)n; }
 static int par_mode;
 static int par_threads(void) { return par_mode; }
 static int npiece __attribute__((unused));   // vk_exec.c only assigns it now
@@ -108,7 +112,7 @@ static void complete_one(void) {
 }
 // Vulkan queue adapter. The real vk_sync_submit forwarding hop is also checked by vk_resource_frontier_test.py.
 #if BY_VALUE_API
-uint64_t vk_sync_submit(const uint64_t *h,int n,uint64_t stamp) {
+uint64_t vk_sync_submit_guest(const uint64_t *h,int n,uint64_t stamp) {
     uint64_t f=++issued;vk_exec_record((VkCommandBuffer)1,h,n,f,stamp);
 #else
 uint64_t vk_sync_submit(const uint64_t *h,int n) {

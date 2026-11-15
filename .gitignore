@@ -9,6 +9,7 @@ __pycache__/
 
 # Personal paths to game files and keys
 /config.local.toml
+/test.local.toml
 
 # Game inputs and everything derived from them. Never commit these.
 # tools/check_content.py enforces the same rule in CI and the pre-commit hook.
@@ -68,6 +69,8 @@ __pycache__/
 *.orig
 *.rej
 *.log
+*.dmp
+*.dmp.partial
 # The driver's GPU fault dump (DKB_GPU_CHECKPOINTS=1) can hold shader code derived from the game.
 dkb-fault-*.bin
 # The driver's compiled shader code per pipeline (DKB_GPU_CHECKPOINTS=1) is derived from the game shaders: local only.

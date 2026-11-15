@@ -56,6 +56,7 @@ void vk_sync_note_write(uint64_t addr, uint64_t size, uint64_t stage) {
 void vk_mem_use(VkMemSpan *span) { (void)span; }
 void vk_mem_bound_note(void *pool) { (void)pool; }
 void vk_mem_gpu_wrote(const VkMemSpan *span, uint64_t n) { (void)span; (void)n; wrote++; }
+int vk_mem_gpu_kept(const VkMemSpan *span, uint64_t n) { (void)span; (void)n; wrote++; return 1; }
 void vk_usnap_drop(uint64_t addr, uint64_t n) { (void)addr; (void)n; dropped++; }
 int vk_usnap_covers(uint64_t addr, uint64_t n) { (void)addr; (void)n; return 0; }
 void vk_exec_par_order_hazard(void) {}
@@ -103,6 +104,8 @@ int vk_mem_resolve(uint64_t addr, uint64_t n, VkMemSpan *span) {
                # bind_range asks for a stage origin only when vk_sync_noting(), which is 0 in this fixture
                '#define find_stage_origin(dc, p, st, ctl, code, len, o) ((void)(dc), find_stage_scan(p, st, ctl, code, len) && (*(o) = 0, 1))\n',
                function(draw, 'static p_bind_buf guarded_storage_binding('),
+               # ssbo_info is asked for no written binding here, so the geometry-stage write-back switch is never read
+               'static int gs_storage_writeback(void) { return 0; }' + chr(10),
                function(draw, 'static VkDescriptorBufferInfo ssbo_info(')]
     after = r'''
 int main(void) {

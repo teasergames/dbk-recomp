@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        DKB Recomp is not playable yet, so crashes are expected. A good report still helps: it shows where the next problem is.
+        A good crash report shows where the next problem is.
         Check the pinned issues first, and see [docs/dkb-testing.md](https://github.com/Lucas-blip-png/dkb-pc-recomp/blob/bananza/docs/dkb-testing.md) for how to run and where the log is.
 
         Do not attach or link game files, keys, firmware, builds, shader caches or screenshots of the game. Issues that do are closed.
@@ -19,15 +19,24 @@ body:
   - type: input
     id: version
     attributes:
-      label: Commit
-      description: The commit you built, from `git rev-parse --short HEAD`. The game must be base version 1.0.0.
+      label: Release or commit
+      description: The release you downloaded (for example 0.3.0), or the commit you built, from `git rev-parse --short HEAD`.
+    validations:
+      required: true
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game version
+      options:
+        - "1.0.0 (base)"
+        - "3.2.0 (update 458752)"
     validations:
       required: true
   - type: input
     id: system
     attributes:
-      label: GPU, driver and Windows version
-      description: For example "Radeon RX 7800 XT, Adrenalin 25.10.1, Windows 11 24H2".
+      label: GPU, driver and operating system
+      description: For example "GeForce RTX 4070, 591.44, Windows 11 24H2" or "Radeon RX 6600, Mesa 25.2, Arch Linux".
     validations:
       required: true
   - type: dropdown
@@ -37,10 +46,10 @@ body:
       options:
         - At startup, before any picture
         - Before or on the title screen
-        - Loading into the tutorial cave
-        - In the tutorial cave
-        - During or right after a guide movie
-        - Further into the game
+        - In the first level
+        - While loading or changing layer
+        - During or right after a movie
+        - Further into the game (say the layer below)
     validations:
       required: true
   - type: dropdown
@@ -57,13 +66,13 @@ body:
     id: steps
     attributes:
       label: What you did before the crash
-      description: Fresh profile or an existing save? Keyboard or controller? Any settings changed?
+      description: The layer or area, fresh profile or an existing save, keyboard or controller, and how long you had played.
     validations:
       required: true
   - type: textarea
     id: log
     attributes:
       label: Log
-      description: Attach logs\dkb.log from the folder of dkb.exe. Copy it before you start the game again, because the next start renames it.
+      description: Attach logs/dkb.log from the folder of dkb.exe (or the dkb binary on Linux). Copy it before you start the game again, because the next start renames it to dkb.1.log. Say if you changed dkb.ini, and paste the changed lines.
     validations:
       required: true

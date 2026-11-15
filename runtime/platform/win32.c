@@ -256,6 +256,14 @@ uint64_t plat_counter_hz(void) { return qpc_freq(); }
 // The default timer tick is 15.6 ms; a 1 ms wait would cost a full tick.
 void plat_timer_1ms(void) { timeBeginPeriod(1); }
 
+// Only a console this process got for itself (the only process attached to it): a console the game was started from,
+// such as a command prompt, stays visible. The window is hidden, not freed, so stdout and stderr stay valid handles.
+void plat_console_hide(void) {
+    HWND w = GetConsoleWindow();
+    DWORD pids[2];
+    if (w && GetConsoleProcessList(pids, 2) == 1) ShowWindow(w, SW_HIDE);
+}
+
 static PlatScale qpc_ns;   // set before main, so no thread reads it half written
 
 __attribute__((constructor)) static void qpc_ns_init(void) { qpc_ns = plat_scale(1000000000u, qpc_freq()); }
@@ -678,14 +686,132 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
 
 static void (*crash_fn)(const PlatCrash *c);
 
+// ---- minidumps of crashes
+// logs\crash-<pid>-<tick>.dmp beside the executable: thread stacks, registers and the module list, no heap (a few MiB).
+// MiniDumpWriteDump runs on a thread of its own, so a crash with a used-up stack (stack overflow) still gets one.
+// dbghelp.dll is loaded when the crash handler is installed (plat_crash_hook), not at the crash: a crash under the
+// loader lock (in a driver's DllMain, say) would block a LoadLibrary there. The dump holds stack memory with
+// game-derived data: it stays on this machine like the logs, and is only ever sent privately, when asked for.
+typedef BOOL(WINAPI *MiniDumpWriteDumpFn)(HANDLE, DWORD, HANDLE, int, void *, void *, void *);
+static MiniDumpWriteDumpFn dump_write;   // MiniDumpWriteDump, or NULL when dbghelp.dll is missing
+#define DUMP_WAIT_MS 5000                // how long the crashing thread waits for its dump before it exits
+#define DUMP_KEEP 5                      // crash dumps kept in logs\ (the newest), counting the next one
+typedef struct {
+    DWORD thread_id;
+    EXCEPTION_POINTERS *ep;    // NULL for abort and invalid parameter, which raise no exception
+    wchar_t path[MAX_PATH];
+    wchar_t partial[MAX_PATH];   // path + ".partial": the dump is written here and renamed to path when complete
+    BOOL ok;
+} DumpJob;
+// MINIDUMP_EXCEPTION_INFORMATION (dbghelp.h), declared here to keep the header out. dbghelp.h declares it under
+// pack(4), so the pointer is at offset 4: with natural alignment MiniDumpWriteDump fails with ERROR_NOACCESS.
+#pragma pack(push, 4)
+typedef struct {
+    DWORD ThreadId;
+    EXCEPTION_POINTERS *ExceptionPointers;
+    BOOL ClientPointers;
+} DumpExceptionInfo;
+#pragma pack(pop)
+_Static_assert(sizeof(DumpExceptionInfo) == 16, "MINIDUMP_EXCEPTION_INFORMATION is 16 bytes under pack(4)");
+#define DUMP_TYPE (0x00000000 | 0x00000020 | 0x00001000)   // MiniDumpNormal | WithUnloadedModules | WithThreadInfo
+
+static DWORD WINAPI dump_thread(void *arg) {
+    DumpJob *j = arg;
+    MiniDumpWriteDumpFn write = dump_write;
+    if (!write) return 0;
+    HANDLE f = CreateFileW(j->partial, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    DumpExceptionInfo ei = {j->thread_id, j->ep, FALSE};
+    j->ok = write(GetCurrentProcess(), GetCurrentProcessId(), f, DUMP_TYPE, j->ep ? &ei : NULL, NULL, NULL);
+    CloseHandle(f);
+    // A dump the crashing thread gave up waiting for keeps writing until exit: a .partial file never looks complete.
+    if (j->ok) j->ok = MoveFileExW(j->partial, j->path, MOVEFILE_REPLACE_EXISTING);
+    if (!j->ok) DeleteFileW(j->partial);
+    return 0;
+}
+
+// Writes the minidump for the crash on the calling thread; its UTF-8 path, or NULL. Once per process.
+static const char *write_crash_dump(EXCEPTION_POINTERS *ep) {
+    static DumpJob job;
+    static char path8[MAX_PATH * 3];
+    static volatile LONG once;
+    if (InterlockedExchange(&once, 1)) return NULL;
+    wchar_t exe[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (!n || n >= MAX_PATH) return NULL;
+    wchar_t *slash = wcsrchr(exe, L'\\');
+    if (!slash) return NULL;
+    *slash = 0;
+    _snwprintf(job.path, MAX_PATH, L"%ls\\logs", exe);
+    CreateDirectoryW(job.path, NULL);
+    _snwprintf(job.path, MAX_PATH, L"%ls\\logs\\crash-%lu-%llu.dmp", exe, GetCurrentProcessId(),
+               (unsigned long long)GetTickCount64());
+    job.path[MAX_PATH - 1] = 0;
+    _snwprintf(job.partial, MAX_PATH, L"%ls.partial", job.path);
+    job.partial[MAX_PATH - 1] = 0;
+    job.thread_id = GetCurrentThreadId();
+    job.ep = ep;
+    HANDLE t = CreateThread(NULL, 1 << 20, dump_thread, &job, 0, NULL);
+    if (!t) return NULL;
+    // A dump not written by then is given up; the report is already logged. If MiniDumpWriteDump suspends this waiting
+    // thread, the timeout cannot fire and the process hangs, but only after the report is in the log.
+    WaitForSingleObject(t, DUMP_WAIT_MS);
+    CloseHandle(t);
+    if (!job.ok || !WideCharToMultiByte(CP_UTF8, 0, job.path, -1, path8, sizeof path8, NULL, NULL)) return NULL;
+    return path8;
+}
+
+// The exception of the crash being reported, for plat_crash_dump (NULL for abort and invalid parameter).
+static _Thread_local EXCEPTION_POINTERS *crash_ep;   // per thread: two threads can crash at once
+
+// The report is logged first and the dump written after: MiniDumpWriteDump suspends the other threads and can block on
+// a lock one of them holds (a heap corruption inside HeapAlloc), and the report is what a player has to attach.
+const char *plat_crash_dump(void) { return write_crash_dump(crash_ep); }
+
+static const char *exception_name(DWORD code) {
+    return code == EXCEPTION_ACCESS_VIOLATION ? "access violation"
+         : code == EXCEPTION_ILLEGAL_INSTRUCTION ? "illegal instruction"
+         : code == EXCEPTION_INT_DIVIDE_BY_ZERO ? "integer division by zero"
+         : code == EXCEPTION_PRIV_INSTRUCTION ? "privileged instruction"
+         : code == EXCEPTION_STACK_OVERFLOW ? "stack overflow"
+         : code == EXCEPTION_IN_PAGE_ERROR ? "in-page error" : NULL;
+}
+
+// The last chance: an exception no handler took, in any module (a driver, a Vulkan layer, a C++ runtime throw nobody
+// caught). Without this the process ends with the exception code and no report; with it the report names the module.
+static LONG WINAPI crash_unhandled(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    static char what[96], module[MAX_PATH];
+    const char *name = exception_name(code);
+    if (name) snprintf(what, sizeof what, "unhandled %s", name);
+    else snprintf(what, sizeof what, "unhandled exception %#lx", (unsigned long)code);
+    HMODULE h = NULL;
+    PlatCrash c = {what, (uint32_t)code, rip, 0, -1, 0};
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)rip, &h) && h != GetModuleHandleW(NULL)) {
+        char full[MAX_PATH];
+        DWORD n = GetModuleFileNameA(h, full, sizeof full);
+        const char *base = n ? strrchr(full, '\\') : NULL;
+        snprintf(module, sizeof module, "%s", base ? base + 1 : n ? full : "unknown module");
+        c.module = module;
+        c.offset = rip - (uintptr_t)h;
+    } else if (h) {
+        c.offset = rip - (uintptr_t)h;
+    } else {
+        snprintf(module, sizeof module, "no module");
+        c.module = module;
+    }
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+        c.access = (int)ep->ExceptionRecord->ExceptionInformation[0], c.addr = ep->ExceptionRecord->ExceptionInformation[1];
+    crash_ep = ep;
+    crash_fn(&c);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
-    const char *what = code == EXCEPTION_ACCESS_VIOLATION ? "access violation"
-                     : code == EXCEPTION_ILLEGAL_INSTRUCTION ? "illegal instruction"
-                     : code == EXCEPTION_INT_DIVIDE_BY_ZERO ? "integer division by zero"
-                     : code == EXCEPTION_PRIV_INSTRUCTION ? "privileged instruction"
-                     : code == EXCEPTION_STACK_OVERFLOW ? "stack overflow"
-                     : code == EXCEPTION_IN_PAGE_ERROR ? "in-page error" : NULL;
+    const char *what = exception_name(code);
     if (!what) return EXCEPTION_CONTINUE_SEARCH;
     uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
     MODULEINFO mi;
@@ -695,6 +821,7 @@ static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
     PlatCrash c = {what, (uint32_t)code, rip, rip - (uintptr_t)mi.lpBaseOfDll, -1, 0};
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
         c.access = (int)ep->ExceptionRecord->ExceptionInformation[0], c.addr = ep->ExceptionRecord->ExceptionInformation[1];
+    crash_ep = ep;
     crash_fn(&c);
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -714,6 +841,7 @@ __attribute__((noinline)) static void crash_from_runtime(const char *what, uint3
             if ((uintptr_t)f[i] - base < mi.SizeOfImage) c.frames[c.nframes++] = (uintptr_t)f[i];
         if (c.nframes) c.rip = c.frames[0], c.offset = c.rip - base;
     }
+    crash_ep = NULL;
     crash_fn(&c);
 }
 
@@ -725,9 +853,44 @@ static void invalid_parameter(const wchar_t *expr, const wchar_t *func, const wc
     crash_from_runtime("invalid parameter to a C runtime function", 0xc0000417u);   // STATUS_INVALID_CRUNTIME_PARAMETER
 }
 
+// Deletes the oldest crash-*.dmp in logs\ beside the executable until DUMP_KEEP - 1 are left (a leftover .partial counts), so the next crash's
+// dump makes DUMP_KEEP. Run at start, never during a crash.
+static void prune_crash_dumps(void) {
+    wchar_t dir[MAX_PATH], pat[MAX_PATH], path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
+    wchar_t *slash = n && n < MAX_PATH ? wcsrchr(dir, L'\\') : NULL;
+    if (!slash) return;
+    *slash = 0;
+    _snwprintf(pat, MAX_PATH, L"%ls\\logs\\crash-*.dmp*", dir);
+    pat[MAX_PATH - 1] = 0;
+    for (;;) {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(pat, &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        int count = 0;
+        FILETIME oldest = {0};
+        wchar_t name[MAX_PATH] = L"";
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            count++;
+            if (!name[0] || CompareFileTime(&fd.ftLastWriteTime, &oldest) < 0)
+                oldest = fd.ftLastWriteTime, wcsncpy(name, fd.cFileName, MAX_PATH - 1), name[MAX_PATH - 1] = 0;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        if (count < DUMP_KEEP) return;
+        _snwprintf(path, MAX_PATH, L"%ls\\logs\\%ls", dir, name);
+        path[MAX_PATH - 1] = 0;
+        if (!DeleteFileW(path)) return;
+    }
+}
+
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;
+    HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
+    dump_write = dbg ? (MiniDumpWriteDumpFn)(void *)GetProcAddress(dbg, "MiniDumpWriteDump") : NULL;
+    prune_crash_dumps();
     AddVectoredExceptionHandler(0, crash_veh);
+    SetUnhandledExceptionFilter(crash_unhandled);
     signal(SIGABRT, abort_signal);
     _set_invalid_parameter_handler(invalid_parameter);
 }

@@ -24,6 +24,26 @@ typedef struct { const char *lang; const char *const *text; } Row;
     [UI_SWKBD_CANCEL] = cancel, [UI_SWKBD_PAD_HINT] = hint, LANG_NAMES
 
 static const char *const text_en[UI_TEXT_COUNT] = {
+    [UI_MENU_PAD_DEVICE] = "Controller Device",
+    [UI_MENU_PAD_DEVICE_DESC] = "Choose which controller to use. Changes take effect immediately.\n\n"
+        "Newly connected controllers take over automatically. If the active controller disconnects, another available controller takes over.\n\n"
+        "Manual choices apply immediately and are saved for startup. Auto starts with the first available controller. Later connections can still take over.\n\n"
+        "Keyboard and mouse remain available.",
+    [UI_MENU_PAD_FULLSCREEN_HOLD] = "Fullscreen hold shortcut",
+    [UI_MENU_PAD_FULLSCREEN_HOLD_DESC] = "Off: Plus + Minus opens or closes settings.\n\nOn: hold Plus + Minus for 0.5 seconds to toggle fullscreen instead.\n\nGuide/Home and keyboard F1 remain available in either mode.",
+    [UI_MENU_SHORTCUT_SETTINGS_COMBO_DESC] = "Press both displayed Plus and Minus bindings together to open or close settings.\n\nThis shortcut follows the current button bindings.\n\nKeyboard equivalent: F1.",
+    [UI_MENU_SHORTCUTS] = "Shortcuts",
+    [UI_MENU_SHORTCUT_READONLY] = "Read-only shortcuts",
+    [UI_MENU_SHORTCUT_SETTINGS] = "Open settings menu",
+    [UI_MENU_SHORTCUT_SETTINGS_DESC] = "Press the Guide or Home button to open or close settings.\n\nKeyboard equivalent: F1.\n\nThe client or operating system must pass this button to the game.",
+    [UI_MENU_SHORTCUT_FULLSCREEN] = "Toggle fullscreen",
+    [UI_MENU_SHORTCUT_FULLSCREEN_DESC] = "Hold both displayed buttons together for 0.5 seconds to toggle fullscreen.\n\nRelease both before repeating.\n\nKeyboard equivalent: F11.",
+    [UI_MENU_SHORTCUT_PERFORMANCE] = "Toggle performance data",
+    [UI_MENU_SHORTCUT_PERFORMANCE_DESC] = "Press both stick-click bindings together to cycle performance data: Off, FPS, then Full.\n\nThis shortcut follows the current stick-click bindings.\n\nKeyboard equivalent: F10.",
+    [UI_MENU_PAD_CONNECTED] = "Connected",
+    [UI_MENU_PAD_WAITING] = "Connect a controller to resume",
+    [UI_MENU_PAD_NONE] = "No controller connected",
+    [UI_MENU_PAD_SAVED] = "Saved controller",
     SWKBD("Text entry", "Enter a name", "Horse", "OK", "Cancel", "Controller: A = OK, B = Cancel"),
 
     [UI_MENU_TITLE] = "Settings",
@@ -80,10 +100,15 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_RENDER_SCALE_DESC] = "Size of the 3D scene relative to the game resolution; the game's FSR scales it to "
                                   "that size. Above 100 % smooths jagged edges (supersampling) at a high GPU cost.",
     [UI_MENU_RENDER_SCALE_GAME] = "Game (83 %)",
+    [UI_MENU_SCENE_RES] = "3D scene resolution",
+    [UI_MENU_SCENE_RES_DESC] = "Auto lets the game scale its 3D scene by load, usually to two thirds of the render resolution "
+                               "on each side, then upscale it. Full draws the 3D scene at the whole render resolution: a "
+                               "sharper picture at a higher GPU cost, and the upscaler and DLSS are not used. Applies at the next start.",
+    [UI_MENU_SCENE_RES_AUTO] = "Auto (game)", [UI_MENU_SCENE_RES_FULL] = "Full",
     [UI_MENU_UPSCALER] = "Upscaling method",
     [UI_MENU_UPSCALER_DESC] = "This applies when the game image is smaller than the area it fills on your screen or in your window. "
                               "AMD FSR 1 can keep edges sharper than Bilinear.",
-    [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Bilinear",
+    [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Bilinear", [UI_MENU_UPSCALER_DLSS] = "NVIDIA DLSS",
     [UI_MENU_ASPECT] = "Display scaling",
     [UI_MENU_ASPECT_DESC] = "Default keeps the game's shape and adds black bars if needed.\n"
                             "Stretch to fill uses the whole window or screen. The image stretches only if the shapes differ.",
@@ -265,7 +290,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_REPLAY_ASYNC] = "GPU frame prep on its own thread",
     [UI_MENU_REPLAY_ASYNC_DESC] = "Prepares frames for the GPU on a separate thread instead of the game thread. Adds up to one frame of latency.",
     [UI_MENU_REPLAY_THREADS] = "Threads recording big render passes",
-    [UI_MENU_REPLAY_THREADS_DESC] = "Records the draws of big render passes on this many threads at once. Experimental; Off records them on one thread. Faster in busy areas on CPUs with many cores.",
+    [UI_MENU_REPLAY_THREADS_DESC] = "Records the draws of big render passes on this many threads at once. Automatic uses 6 threads on 12 or more logical processors and 4 on 8 to 11 (not on AMD); Off records them on one thread. Faster in busy areas on CPUs with many cores.",
     [UI_MENU_TIMER_1MS] = "1 ms Windows timer",
     [UI_MENU_TIMER_1MS_DESC] = "Raises the system timer resolution to 1 ms for steadier frame pacing.",
     [UI_MENU_PIPE_WAIT] = "Waiting draw handling",
@@ -416,10 +441,15 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_RENDER_SCALE_DESC] = "Размер 3D-сцены относительно разрешения игры; FSR игры доводит её до этого размера. "
                                   "Выше 100 % сглаживает лесенки на краях (суперсэмплинг) ценой большой нагрузки на GPU.",
     [UI_MENU_RENDER_SCALE_GAME] = "Как в игре (83 %)",
+    [UI_MENU_SCENE_RES] = "Разрешение 3D-сцены",
+    [UI_MENU_SCENE_RES_DESC] = "Авто: игра сама меняет размер 3D-сцены по нагрузке, обычно до двух третей разрешения рендеринга "
+                               "по каждой стороне, и затем растягивает её. Полное: 3D-сцена рисуется в полном разрешении "
+                               "рендеринга, картинка чётче, но нагрузка на GPU выше; апскейлер и DLSS не работают. Действует после перезапуска.",
+    [UI_MENU_SCENE_RES_AUTO] = "Авто (игра)", [UI_MENU_SCENE_RES_FULL] = "Полное",
     [UI_MENU_UPSCALER] = "Масштабирование под окно",
     [UI_MENU_UPSCALER_DESC] = "Этот параметр действует, когда изображение игры меньше области вывода на экране или в окне. "
                               "AMD FSR 1 может сохранять края более чёткими, чем билинейное масштабирование.",
-    [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Билинейное",
+    [UI_MENU_UPSCALER_FSR] = "AMD FSR 1", [UI_MENU_UPSCALER_BILINEAR] = "Билинейное", [UI_MENU_UPSCALER_DLSS] = "NVIDIA DLSS",
     [UI_MENU_ASPECT] = "Масштабирование вывода",
     [UI_MENU_ASPECT_DESC] = "По умолчанию пропорции игры сохраняются, при необходимости появляются чёрные полосы.\n"
                             "В режиме «Растянуть» изображение заполняет всё окно или экран. Оно растягивается, только "
@@ -615,7 +645,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_REPLAY_ASYNC] = "Подготовка кадра для GPU в отдельном потоке",
     [UI_MENU_REPLAY_ASYNC_DESC] = "Кадр для GPU готовится в отдельном потоке, а не в потоке игры. Добавляет до одного кадра задержки.",
     [UI_MENU_REPLAY_THREADS] = "Потоки записи больших проходов",
-    [UI_MENU_REPLAY_THREADS_DESC] = "Отрисовки больших проходов записываются сразу в столько потоков. Экспериментально; «Выкл.» — в одном потоке. Быстрее в насыщенных местах на процессорах с большим числом ядер.",
+    [UI_MENU_REPLAY_THREADS_DESC] = "Отрисовки больших проходов записываются сразу в столько потоков. «Автоматически» — 6 потоков при 12 и более логических процессорах и 4 при 8–11 (кроме AMD); «Выкл.» — в одном потоке. Быстрее в насыщенных местах на процессорах с большим числом ядер.",
     [UI_MENU_TIMER_1MS] = "Таймер Windows 1 мс",
     [UI_MENU_TIMER_1MS_DESC] = "Повышает точность системного таймера до 1 мс для ровного темпа кадров.",
     [UI_MENU_PIPE_WAIT] = "Обработка ожидающих отрисовок",

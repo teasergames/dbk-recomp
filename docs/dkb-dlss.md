@@ -9,7 +9,17 @@ Needs:
 - An NVIDIA RTX GPU on Windows, with a driver recent enough for DLSS. The driver installs the NGX core
   (`_nvngx.dll`); the runtime finds it through the driver's registry keys.
 - `nvngx_dlss.dll`, the DLSS model, next to `dkb.exe`. DKB Recomp does not ship it. Take it from a game or from
-  NVIDIA's DLSS SDK release (310.5 or later for preset M, which the runtime asks for).
+  NVIDIA's DLSS SDK release (310.5 or later for preset M, which `dlss_preset = m` asks for).
+
+The model: `dlss_preset` in `dkb.ini` (`DKB_DLSS_PRESET`, `auto|k|m`, applies at the next upscale). `auto`, the
+default, asks for DLSS 4's transformer model (preset K) in every quality mode but Ultra Performance, which has its own
+model (L); `m` asks for DLSS 4.5's second transformer model (preset M) instead of K. NVIDIA recommends K for DLAA,
+Quality and Balanced and M for Performance; `auto` keeps K in Performance as well, because the game's dynamic
+resolution can move the input across the Balanced/Performance scale and each crossing would recreate the feature
+(about 80 ms). In the Hilltop Layer of Surf Hills (3.2.0, RTX 5090, `Quality 2560x1440 -> 3840x2160`) the upscale took
+2.6 to 3.7 ms of GPU time a frame with M and 0.8 ms with K. It runs near the end of the frame, while the game's main
+thread waits for the GPU, so the whole difference shows in the frame time. `dkb.log` names the preset of each feature
+(`dlss: Quality 2560x1440 -> 3840x2160, preset K`).
 
 What it does: the game has no temporal anti-aliasing of its own (no velocity target, no history), so the runtime
 makes the inputs DLSS needs.
@@ -38,7 +48,8 @@ A frame without the scene noted at the input size (a cutscene drawn another way,
 as before this change: zero motion vectors, a zero depth image, a new history. The quality mode follows the ratio of
 output to input (DLAA at 1:1).
 
-DLSS only runs where the game runs its own upscaler. When the game draws the scene at the output size (in 150 s
+DLSS only runs where the game runs its own upscaler. `scene_res = full` (`docs/dkb-testing.md`) draws the scene at
+the whole render resolution on purpose, so neither the game's upscaler nor DLSS runs then. When the game draws the scene at the output size (in 150 s
 replays on 1.0.0 with a 1920x1080 output it switched to that partway through the play, at a different point in each
 run), there is no upscaler dispatch to replace and the game's picture is shown as it is.
 

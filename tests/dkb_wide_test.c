@@ -6,9 +6,9 @@
 
 #include "../runtime/dkb_wide.c"
 
-static unsigned checks, failures, page_reads;
-static int setting, set_index, switched;
-static const char *resolution;
+static unsigned checks, failures, page_reads, fs_calls, fs_out[2], fs_scene_on;
+static int setting, set_index, scene_index, switched, scene_switched, heapdef_grown, fs_wide;
+static const char *resolution, *scene_res;
 static uint8_t test_page[4096];
 
 #define CHECK(c) do { checks++; if (!(c)) { \
@@ -20,22 +20,38 @@ int cfg_bool(const char *key) {
     return setting;
 }
 const char *cfg_value(const char *key) {
-    CHECK(!strcmp(key, "TOTK_OUTPUT_RES"));
-    return resolution;
+    CHECK(!strcmp(key, "TOTK_OUTPUT_RES") || !strcmp(key, "TOTK_SCENE_RES"));
+    return key[5] == 'O' ? resolution : scene_res;
 }
 int rt_patch_set(const char *name) {
+    if (!strcmp(name, "dkbscene")) return scene_index;
+    if (!strcmp(name, "render3d")) return -1;
     CHECK(!strcmp(name, "dkbwide"));
     return set_index;
 }
 void rt_patch_switch(int set, int on) {
-    CHECK(set == 0);
-    switched = on;
+    CHECK(set == 0 || set == scene_index);
+    if (set == 0) switched = on;
+    else scene_switched = on;
 }
 void *rt_patch_page(void) { page_reads++; return test_page; }
 void rt_log(const char *fmt, ...) { (void)fmt; }
+int res_heapdef_grown(void) { return heapdef_grown; }
+// RomFS setup picks the UI overlay from the output at the time it runs (romfs.c overlay_init): record what it sees.
+void fs_init(void) {
+    fs_calls++;
+    fs_wide = dkb_wide_output(fs_out);
+    fs_scene_on = scene_switched;
+}
 
 static void reset(const char *text) {
     resolution = text;
+    scene_res = "auto";
+    scene_index = -1;
+    heapdef_grown = 0;
+    scene_switched = 0;
+    fs_calls = 0;
+    heap_extra_done = 0;
     set_index = 0;
     setting = 1;
     switched = 1;
@@ -81,7 +97,91 @@ static void rejected(const char *text) {
     for (size_t i = 0; i < sizeof test_page; i++) CHECK(test_page[i] == 0xa5);
 }
 
+static uint32_t page_pool(void) {
+    uint32_t pool;
+    memcpy(&pool, test_page + 0x110, 4);
+    return pool;
+}
+
+// The pool GSys must hold, in KiB above the stock 200 MiB, at an output and scene_res.
+static void extra_case(const char *text, const char *scene, uint64_t kib) {
+    reset(text);
+    scene_res = scene;
+    if (strcmp(scene, "auto")) scene_index = 1;
+    CHECK(dkb_wide_heap_extra_kib() == kib);
+    CHECK(dkb_wide_heap_extra_kib() == kib);   // read once, same answer after
+}
+
+static void heap_extras(void) {
+    extra_case("2880x1620", "auto", 0);
+    extra_case("1920x1080", "auto", 0);
+    extra_case("3840x2160", "auto", (0x16400000u - 0xc800000u) >> 10);
+    extra_case("3440x1440", "auto", (0xd600000u - 0xc800000u) >> 10);
+    extra_case("3441x1440", "auto", 0);   // rejected output
+    // scene_res 1.0 asks for (1.5 / 1.0)^2 times the pool; a build without the scene set ignores it
+    extra_case("2880x1620", "full", (uint64_t)(dkb_scene_pool(0xc800000u, 1.0f) - 0xc800000u) >> 10);
+    extra_case("2880x1620", "2.0", (uint64_t)(dkb_scene_pool(0xc800000u, 2.0f) - 0xc800000u) >> 10);
+    reset("3840x2160");
+    scene_res = "full";
+    CHECK(dkb_wide_heap_extra_kib() == (0x16400000u - 0xc800000u) >> 10);   // scene_index -1
+    reset("3440x1440");
+    set_index = -1;
+    CHECK(dkb_wide_heap_extra_kib() == 0);
+    reset("3440x1440");
+    setting = 0;
+    CHECK(dkb_wide_heap_extra_kib() == 0);   // ultrawide off
+}
+
+// RomFS setup runs once and reads the output then: it comes after the output is set, before the scene, and only
+// when GSys grows.
+static void ordering(void) {
+    reset("3440x1440");
+    dkb_wide_init();
+    CHECK(fs_calls == 1 && fs_wide == 1 && fs_out[0] == 3440 && fs_out[1] == 1440);
+    reset("3840x1600");
+    scene_res = "full";
+    scene_index = 1;
+    dkb_wide_init();
+    CHECK(fs_calls == 1 && fs_out[0] == 3840 && fs_out[1] == 1600 && fs_scene_on == 0 && scene_switched == 1);
+    reset("2560x1080");   // the stock pool holds it
+    dkb_wide_init();
+    CHECK(fs_calls == 0);
+    reset("1920x1080");
+    dkb_wide_init();
+    CHECK(fs_calls == 0);
+    reset("3440x1441");
+    dkb_wide_init();
+    CHECK(fs_calls == 0);
+}
+
+// dkb_wide_scene with GSys at its stock size (no grown HeapDef) keeps the pool within the cap; with it grown the
+// pool is what the ratio asks for.
+static void scene_pool(void) {
+    reset("3840x2160");
+    scene_res = "1.0";
+    scene_index = 1;
+    dkb_wide_init();
+    float ratio;
+    memcpy(&ratio, test_page + 0x118, 4);
+    CHECK(page_pool() <= DKB_SCENE_POOL_MAX && ratio > 1.0f && scene_switched == 1);
+    reset("3840x2160");
+    scene_res = "1.0";
+    scene_index = 1;
+    heapdef_grown = 1;
+    dkb_wide_init();
+    memcpy(&ratio, test_page + 0x118, 4);
+    CHECK(page_pool() == dkb_scene_pool(dkb_wide_pool_bytes(3840, 2160), 1.0f) && ratio == 1.0f);
+    reset("7680x4320");   // the output's own pool is above the cap and is never cut
+    scene_res = "2.0";
+    scene_index = 1;
+    dkb_wide_init();
+    CHECK(page_pool() >= dkb_wide_pool_bytes(7680, 4320));
+}
+
 int main(void) {
+    heap_extras();
+    ordering();
+    scene_pool();
     CHECK(dkb_wide_pool_bytes(2880, 1620) == 0xc800000);
     CHECK(dkb_wide_pool_bytes(1280, 720) == 0xc800000);
     CHECK(dkb_wide_pool_bytes(3440, 1440) == 0xd600000);

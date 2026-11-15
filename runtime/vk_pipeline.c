@@ -212,10 +212,11 @@ static int ensure_init(void) {
     vkGetPhysicalDeviceProperties2(c->phys, &p2);
     P.max_push = pd.maxPushDescriptors;
     P.max_stage_samplers = p2.properties.limits.maxPerStageDescriptorSamplers;
-    {   // TOTK_DYN_UBO (default off, 1 on, ab as 1 here; bind_resources reads the same knob): see dyn_ubo_convert.
-        // Off until it has run under the validation layer and on AMD and Intel.
+    {   // TOTK_DYN_UBO (0 off, 1 on, ab as 1 here; bind_resources reads the same knob): see dyn_ubo_convert.
+        // On by default except on Intel, where nobody has measured it: the -101 scene ran clean under the validation
+        // layer, and players measured gains on NVIDIA and AMD (docs/dkb-testing.md).
         uint32_t lim = p2.properties.limits.maxDescriptorSetUniformBuffersDynamic;
-        P.dyn_ubo = !rt_knob("DYN_UBO", "0") ? 0 : lim < VK_DYN_UBO_MAX ? lim : VK_DYN_UBO_MAX;
+        P.dyn_ubo = !rt_knob("DYN_UBO", vk_caps.intel ? "0" : "1") ? 0 : lim < VK_DYN_UBO_MAX ? lim : VK_DYN_UBO_MAX;
         rt_log("vk_pipeline: dynamic uniform buffers in the allocated fragment set: %s (up to %u, device limit %u)",
                P.dyn_ubo ? "on" : "off", P.dyn_ubo, lim);
     }
@@ -2921,6 +2922,11 @@ static struct {
     int32_t keep_n;
     int idle;                                          // build at PLAT_PRIO_IDLE (boot), normal (preparation)
     PlatMutex stat;
+    // preparation progress: ok[i] set when variant i finished, mark = first unfinished index (saved to prog_path)
+    uint8_t *ok;
+    size_t mark;
+    char prog_path[PLAT_PATH_MAX * 2 + 32];
+    uint64_t sig;                                      // FNV-1a of shader-prepared.bin: a new list starts over
 } LB = {.stat = PLAT_MUTEX_INIT};
 
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
@@ -3223,6 +3229,15 @@ static void lb_warm_worker(void *arg) {
         if (owned) gfx_shader_release_private(sh);
         plat_mutex_lock(&LB.stat);
         uint64_t d = ++LB.done;
+        LB.ok[i] = 1;
+        size_t old = LB.mark;
+        while (LB.mark < LB.n && LB.ok[LB.mark]) LB.mark++;
+        // resume point on disk every 256 variants: a closed or killed run continues there (lb_warm_prepared)
+        if (LB.mark / 256 != old / 256) {
+            char buf[64];
+            int len = snprintf(buf, sizeof buf, "%zu %llu %zu\n", LB.n, (unsigned long long)LB.sig, LB.mark);
+            plat_file_write_atomic(LB.prog_path, buf, (size_t)len);
+        }
         plat_mutex_unlock(&LB.stat);
         if (d % 4000 == 0) lb_report("preparation progress");
     }
@@ -3238,9 +3253,29 @@ static void lb_warm_prepared(const char *dir) {
     LB.e = n ? calloc(n, sizeof *LB.e) : NULL;
     for (size_t i = 0; LB.e && i < n; i++)
         memcpy(LB.e[i].iid, f + 16 + 36 * i + 4, 32), LB.e[i].stage = f[16 + 36 * i], LB.e[i].prio = f[16 + 36 * i + 1];
+    uint64_t sg = 1469598103934665603ull;
+    for (size_t i = 0; f && i < size; i++) sg = (sg ^ f[i]) * 1099511628211ull;
     free(f);
     if (!LB.e) return;
     LB.n = n, LB.idle = 0, LB.t0 = now_ms();
+    // Resume: lib-warm.progress holds "count signature mark" of an interrupted run over this same list (the driver
+    // cache keeps the variants below mark). A finished run deletes it, so the next run builds everything again.
+    LB.ok = calloc(n, 1);
+    LB.sig = sg;
+    snprintf(LB.prog_path, sizeof LB.prog_path, "%s/lib-warm.progress", dir);
+    uint64_t psz = 0;
+    uint8_t *pf = plat_file_read(LB.prog_path, &psz);
+    size_t pn = 0, pm = 0;
+    unsigned long long ps = 0;
+    if (pf && psz < 63) {
+        char b[64] = {0};
+        memcpy(b, pf, psz);
+        if (sscanf(b, "%zu %llu %zu", &pn, &ps, &pm) == 3 && pn == n && ps == LB.sig && pm <= n) {
+            memset(LB.ok, 1, pm), LB.mark = pm, LB.next = (int64_t)pm, LB.done = pm;
+            rt_log("vk_pipeline: stage library prebuild resumes at %zu of %zu variants", pm, n);
+        }
+    }
+    free(pf);
     static const uint32_t no_pr[16], no_fs[4];
     lb_state(no_pr, no_fs);
     int cpus = (int)plat_cpu_usable(), k = 0;
@@ -3250,6 +3285,8 @@ static void lb_warm_prepared(const char *dir) {
     if (!k) lb_warm_worker(NULL);
     for (int i = 0; i < k; i++) plat_thread_join(t[i]);
     lb_report("preparation done");
+    plat_file_delete(LB.prog_path);
+    free(LB.ok), LB.ok = NULL, LB.mark = 0;
     // with gpl off only compute variants are built: say so, rather than count the skipped ones as built
     if (LB.nolib)
         printf("prepare-shaders: %zu variants on %d threads in %.0f ms, %llu vertex/fragment variants skipped (graphics "

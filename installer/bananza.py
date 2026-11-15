@@ -6,10 +6,6 @@ marked task directory; only verified files enter the portable destination. No pr
 A .nup (the container Eglantine and Eden load) is read with tools/extract_nup.py: preflight reads only its table of
 contents, which records every file's size and SHA-256, so the target is chosen and the ExeFS checked before anything
 is written; the Data step then extracts the ExeFS and packs the RomFS straight from the container.
-
-Add-on content (DLC) comes from the .nup's add-on packages or from --dlc folders. The Addons step packs each RomFS
-into <dest>/aoc-<index>/romfs.bin with its TOTKRFS1 index aoc-index.bin, the layout runtime/aoc_romfs.c discovers
-next to the executable, after checking every packed file against the preflight snapshot as the Data step does.
 """
 import hashlib
 import copy
@@ -28,7 +24,7 @@ from pathlib import Path
 from . import layout as layouts
 from . import state as statefile
 from . import ini
-from .events import Reporter
+from .events import LauncherReporter, Reporter
 from .runner import Context, InstallError, Step, run_steps
 
 STATE = 'dkb-install.json'
@@ -39,6 +35,10 @@ TARGETS = (GAME, 'dkb458752')   # 1.0.0 and 3.2.0 (title version 458752); tools/
 NUP_SELECT = ('latest', 'base')
 EXE = '.exe' if os.name == 'nt' else ''
 CHUNK = 8 << 20
+WIDE_SIZES = ('2560x1080', '3440x1440', '3840x1600', '5120x2160', '3840x1080', '5120x1440')
+# The PlayStation prompt overlays and the pad layout each is made for (runtime/romfs.c ps_prompts_init).
+PS_FOLDERS = {'romfs-patches-ps': 'xbox', 'romfs-patches-ps-nintendo': 'nintendo'}
+WIDE_FOLDERS = tuple(f'romfs-patches-{size}{suffix}' for size in WIDE_SIZES for suffix in ('', '-hud-edges'))
 COMMIT_WARN_GIB = 24   # the game commits about 14 GB; README asks for 16 GB of RAM plus a large page file
 AOC_MAX = 32                     # runtime/aoc_romfs.c looks for aoc-0 to aoc-31 next to the executable
 AOC_TITLE = 0x040074A01BF13000   # Bananza's add-on content title ids: the program's (040074A01BF12000) + 0x1000 + index
@@ -91,7 +91,7 @@ def plain_destination(dest, dlls=()):
     # profile/ and caches belong to the player and are never traversed or written by setup.
     files = (STATE, STATE + '.tmp', DEST_OWNER, '.dkb-setup.lock', 'dkb.ini', 'dkb.ini.tmp', 'totk.ini',
              'totk.ini.tmp', 'romfs-index.bin', 'seed-nvn2.bin', 'dkb' + EXE, 'totk_xlate' + EXE, 'totk_xlate.id', *(p.name for p in dlls))
-    for name in ('exefs', 'romfs', *(f'aoc-{i}' for i in range(AOC_MAX)), *files, *(name + '.setup-part' for name in files)):
+    for name in ('exefs', 'romfs', *WIDE_FOLDERS, *(f'aoc-{i}' for i in range(AOC_MAX)), *files, *(name + '.setup-part' for name in files)):
         plain_tree(dest / name)
 
 
@@ -116,6 +116,9 @@ def inventory(root, reporter):
     files = tree_files(root)
     if not files:
         raise InstallError('dkb.romfs_empty', path=str(root))
+    # The largest real RomFS file is about 55 MB; a file past 1 GiB is a RomFS image from a dumping tool.
+    if any(p.stat().st_size > 1 << 30 for p in files):
+        raise InstallError('dkb.romfs_image', path=str(root))
     result = []
     for i, p in enumerate(files):
         before = p.stat()
@@ -181,7 +184,7 @@ def romfs_index_bytes(manifest):
     for e in entries:
         name = e['path'].encode()
         rows += struct.pack('<QQII', e['offset'], e['size'], len(strings), len(name) + 1)
-        strings += name + b'\0'
+        strings += name + bytes(1)
     return struct.pack('<8sQQ', b'TOTKRFS1', len(entries), 24 + len(rows)) + bytes(rows) + bytes(strings)
 
 
@@ -283,6 +286,12 @@ def tree_key(base):
                    if p.is_file() and '__pycache__' not in p.parts])
 
 
+def prebuilt_runtime(layout):
+    """The release's runtime/libtotkrt.a, built with the folder's toolchain and sysroot, or None: a checkout compiles
+    runtime/ from source, and so does a source package that carries no library."""
+    return layout.runtime_lib if not layout.dev and layout.runtime_lib.is_file() else None
+
+
 def tool_module(layout, name):
     spec = importlib.util.spec_from_file_location('_dkb_' + name.removesuffix('.py'), layout.tools / name)
     module = importlib.util.module_from_spec(spec)
@@ -294,14 +303,13 @@ def translator_identity(layout):
     return tool_module(layout, 'build_xlate.py').identity()
 
 
-def nup_source(layout, path, select, addons=True):
+def nup_source(layout, path, select):
     """What a .nup install takes from the container, from its table of contents alone: the target (by the recorded
-    SHA-256 of main), the ExeFS hashes checked against the target's, the RomFS file list (path, size, SHA-256) in
-    the format and order inventory() gives for a loose folder, and the same list for each add-on content package
-    ([{'index', 'files'}], empty with addons=False). Nothing is decompressed or written."""
+    SHA-256 of main), the ExeFS hashes checked against the target's, and the RomFS file list (path, size, SHA-256) in
+    the format and order inventory() gives for a loose folder. Nothing is decompressed or written."""
     tool = tool_module(layout, 'extract_nup.py')
     try:
-        container = tool.Nup(path)
+        container = tool.open_container(path)
     except (tool.NupError, OSError, ValueError, UnicodeDecodeError) as e:
         raise InstallError('dkb.nup_invalid', path=str(path), detail=str(e)) from None
     try:
@@ -322,17 +330,10 @@ def nup_source(layout, path, select, addons=True):
                 raise InstallError('dkb.exefs_invalid', path=f'{path} (exefs/{name})')
         if any(name.startswith('subsdk') for name in exefs):
             raise InstallError('dkb.update_unsupported')
-        listing = lambda entries: [{'path': '/'.join(parts), 'size': container.files[idx][1],
-                                    'sha256': container.files[idx][4].hex()} for parts, idx in entries]
-        files = listing(romfs)
+        files = [{'path': '/'.join(parts), 'size': container.files[idx][1], 'sha256': container.files[idx][4].hex()}
+                 for parts, idx in romfs]
         if not files:
             raise InstallError('dkb.romfs_empty', path=f'{path} (romfs)')
-        packs = []
-        for index, pkg in (tool.addon_plan(container) if addons else []):
-            entries = tool.packed_entries(tool.merged_entries(container, [pkg], 'romfs'))
-            if entries:
-                packs.append({'index': index, 'files': listing(entries), 'title': f'{pkg.title_id:016X}'})
-                romfs = [*romfs, *entries]   # their compression counts for the zstd check below
         compressed = any(container.files[i][5] for i in (*exefs.values(), *(idx for _, idx in romfs)))
     except tool.NupError as e:
         raise InstallError('dkb.nup_invalid', path=str(path), detail=str(e)) from None
@@ -344,7 +345,7 @@ def nup_source(layout, path, select, addons=True):
                                capture_output=True, text=True)
         if probe.returncode:
             raise InstallError('dkb.nup_zstd', path=str(path))
-    return game, hashes, files, packs
+    return game, hashes, files
 
 
 def unsafe_temp_chars(path):
@@ -370,14 +371,15 @@ def preflight(layout, options, dest, temp, rep):
     recorded = old['sources'] if old else {}
     if not nup_arg and not options.exefs and not options.romfs and recorded.get('nup'):
         nup_arg = Path(recorded['nup'])
-    # Add-on content: --dlc folders, else the ones the last run recorded; --no-dlc installs none. A .nup brings its own.
+    # Add-on content folders (a .nup brings its own, which the Data step packs): --dlc, else the ones the last run
+    # recorded; --no-dlc forgets them, and the Addons step then removes the folders it wrote.
     given = list(getattr(options, 'dlc', None) or [])
-    no_dlc = bool(getattr(options, 'no_dlc', False)) or (not given and bool(recorded.get('no_dlc')))
-    dlc_args = [] if no_dlc else given
-    if dlc_args and nup_arg:
+    no_dlc = bool(getattr(options, 'no_dlc', False))
+    if given and no_dlc:
+        raise InstallError('dkb.dlc_and_no_dlc')
+    if given and nup_arg:
         raise InstallError('dkb.nup_and_dlc')
-    if not dlc_args and not no_dlc and not nup_arg:
-        dlc_args = [Path(p) for p in recorded.get('dlc', [])]
+    dlc_args = given or ([] if no_dlc or nup_arg else [Path(p) for p in recorded.get('dlc', [])])
     select = getattr(options, 'nup_package', None) or (recorded.get('nup_package') if nup_arg else None) or 'latest'
     if select not in NUP_SELECT:
         raise InstallError('dkb.nup_invalid', path=str(nup_arg), detail=f'unknown package choice {select}')
@@ -388,10 +390,8 @@ def preflight(layout, options, dest, temp, rep):
         if not nup.is_file():
             raise InstallError('dkb.need_nup')
         rep.progress('check', 'dkb_base')
-        game, hashes, files, addons = nup_source(layout, nup, select, addons=not no_dlc)
+        game, hashes, files = nup_source(layout, nup, select)
         inputs, sources = (nup,), {'nup': str(nup), 'nup_package': select}
-        if no_dlc:
-            sources['no_dlc'] = True
     else:
         exefs_arg = options.exefs or (Path(recorded['exefs']) if recorded.get('exefs') else None)
         romfs_arg = options.romfs or (Path(recorded['romfs']) if recorded.get('romfs') else None)
@@ -404,7 +404,6 @@ def preflight(layout, options, dest, temp, rep):
             raise InstallError('dkb.need_folders')
         game = select_target(layout, exefs)
         inputs, sources = (exefs, romfs), {'exefs': str(exefs), 'romfs': str(romfs)}
-        addons = []
     dlc_folders = []
     for arg in dlc_args:
         ensure_plain(arg.absolute())
@@ -467,16 +466,21 @@ def preflight(layout, options, dest, temp, rep):
         files = files if nup_arg else inventory(romfs, rep)
         romfs_id = digest(files)
         romfs_size = sum(e['size'] + 15 for e in files)
-    for index, romfs_dir in sorted(dlc_folders):
-        addons.append({'index': index, 'source': str(romfs_dir), 'files': inventory(romfs_dir, rep)})
+    addons = [{'index': index, 'source': str(romfs_dir), 'files': inventory(romfs_dir, rep)}
+              for index, romfs_dir in sorted(dlc_folders)]
     addons_id = digest([(a['index'], a['files']) for a in addons])
     addon_size = sum(e['size'] + 15 for a in addons for e in a['files'])
     missing = [p for p in (layout.clang, layout.ninja, layout.recomp / 'gen.py',
                            layout.recomp / f'patches-{game}.txt', layout.tools / 'dkb_pack_romfs.py',
                            *([layout.tools / 'extract_nup.py'] if nup_arg else []),
+                           *([layout.tools / 'extract_nx.py'] if nup_arg and nup_arg.suffix.lower() == '.nx' else []),
                            layout.tools / 'dkb_shader_census.py',
-                           layout.runtime / 'nvn2_lower.cpp', layout.tools / 'data' / f'expected-{game}.json')
+                           layout.tools / 'dkb_wide_layout.py', layout.tools / 'ultrawide_layout.py',
+                           layout.tools / 'dkb_ps_prompts.py', layout.tools / 'data' / f'expected-{game}.json')
                if not p.is_file()]
+    # The release compiles nvn2_lower.cpp into libtotkrt.a, so it is not needed when the library is present.
+    if prebuilt_runtime(layout) is None and not (layout.runtime / 'nvn2_lower.cpp').is_file():
+        missing.append(layout.runtime / 'nvn2_lower.cpp')
     if layout.deps:
         missing += [p for p in (layout.deps / 'include', layout.deps / 'lib') if not p.is_dir()]
     if os.name == 'nt':
@@ -636,7 +640,9 @@ class Check(Step):
             host = json.loads(result.stdout)
         except ValueError:
             raise InstallError('check.host_probe_failed', code=result.returncode) from None
-        if not host['x86_64_v3']:
+        # Without AVX2 the game builds for x86-64-v2 (tools/build_game.py then compiles runtime/ instead of the
+        # release's v3 library)
+        if not host['x86_64_v3'] and not host['x86_64_v2']:
             raise InstallError('check.cpu_no_avx2')
         if not host['loader']:
             raise InstallError('check.vulkan_missing')
@@ -655,6 +661,8 @@ class Data(Step):
                  sha256(ctx.layout.tools / 'dkb_pack_romfs.py')]
         if 'nup' in ctx.info['sources']:   # folder installs keep the key they had before .nup input existed
             parts += [sha256(ctx.layout.tools / 'extract_nup.py'), ctx.info['sources']['nup_package']]
+            if ctx.info['sources']['nup'].lower().endswith('.nx'):
+                parts.append(sha256(ctx.layout.tools / 'extract_nx.py'))
         return digest(*parts)
 
     def current(self, ctx, record):
@@ -681,7 +689,7 @@ class Data(Step):
             # below against the preflight list taken from the same records.
             romfs = Path(sources['nup'])
             run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'extract_nup.py', romfs,
-                                     '--select', sources['nup_package'], '--pack', '--out', stage])
+                                     '--select', sources['nup_package'], '--pack', '--aoc', '--out', stage])
         else:
             exefs = Path(sources['exefs'])
             for name in ctx.info['hashes']:
@@ -699,28 +707,47 @@ class Data(Step):
             raise InstallError('dkb.input_changed', path=str(romfs))
         if ctx.info['files'] is not None:
             # Compare every packed file with the preflight content snapshot; no NCA authenticity is claimed.
-            manifest = compare_pack(stage / 'romfs', ctx.info['files'], romfs)
+            files = ctx.info['files']
+            if [(e['path'], e['size']) for e in manifest['files']] != [(e['path'], e['size']) for e in files]:
+                raise InstallError('dkb.input_changed', path=str(romfs))
+            with (stage / 'romfs' / 'romfs.bin').open('rb') as packed:
+                for entry, source in zip(manifest['files'], files):
+                    packed.seek(entry['offset'])
+                    h, remaining = hashlib.sha256(), entry['size']
+                    while remaining:
+                        block = packed.read(min(CHUNK, remaining))
+                        if not block:
+                            raise InstallError('dkb.pack_invalid', path=str(romfs), detail='short file')
+                        h.update(block)
+                        remaining -= len(block)
+                    if h.hexdigest() != source['sha256']:
+                        raise InstallError('dkb.input_changed', path=str(romfs / source['path']))
         # Final names are replaced only after the complete stage has passed its checks.
         for name in ctx.info['hashes']:
             copy_file(stage / 'exefs' / name, ctx.dest / 'exefs' / name)
         for name in ('romfs.bin', 'index.json'):
             copy_file(stage / 'romfs' / name, ctx.dest / 'romfs' / name)
+        # Add-on content found in the .nup: a failed pack was skipped by the tool, so only whole folders are here.
+        for folder in sorted((stage / 'aoc').glob('aoc-*')):
+            try:
+                for name in ('romfs.bin', 'aoc-index.bin'):
+                    copy_file(folder / name, ctx.dest / folder.name / name)
+            except (InstallError, OSError) as e:
+                ctx.reporter.log(f'{self.id}: add-on content {folder.name} not installed: {e}')
         image = ctx.dest / 'romfs' / 'romfs.bin'
         return {'sha256': manifest['romfs_sha256'], 'size': image.stat().st_size, 'mtime_ns': image.stat().st_mtime_ns,
                 'index_sha256': sha256(ctx.dest / 'romfs' / 'index.json')}
 
 
 class Addons(Step):
-    """Pack the add-on content into <dest>/aoc-<index>/ (romfs.bin and aoc-index.bin), where runtime/aoc_romfs.c finds
-    it. Every packed file is checked against the preflight snapshot before anything replaces the installed folders.
+    """Pack the add-on content of --dlc folders into <dest>/aoc-<index>/ (romfs.bin and aoc-index.bin), where
+    runtime/aoc_romfs.c finds it. A .nup's add-on content is packed by the Data step (extract_nup.py --aoc) instead.
+    Every packed file is checked against the preflight snapshot before anything replaces the installed folders.
     Folders this step wrote before and the new input no longer has are removed; no other aoc-<n> folder is touched."""
     id = 'dkb_addons'
 
     def key(self, ctx):
-        parts = [ctx.info['addons_id'], ctx.info['pipeline'], sha256(ctx.layout.tools / 'dkb_pack_romfs.py')]
-        if 'nup' in ctx.info['sources']:
-            parts.append(sha256(ctx.layout.tools / 'extract_nup.py'))
-        return digest(*parts)
+        return digest(ctx.info['addons_id'], ctx.info['pipeline'], sha256(ctx.layout.tools / 'dkb_pack_romfs.py'))
 
     def current(self, ctx, record):
         try:
@@ -746,28 +773,20 @@ class Addons(Step):
         stage = ctx.temp / 'addons'
         if addons:
             owned_dir(ctx, stage)
-            if 'nup' in ctx.info['sources']:
-                run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'extract_nup.py',
-                                         ctx.info['sources']['nup'], '--pack-addons', '--quiet', '--out', stage])
-            else:
-                for addon in addons:
-                    run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'dkb_pack_romfs.py',
-                                             '--dir', addon['source'], '--out', stage / f"aoc-{addon['index']}"],
-                             name=f"{self.id}-{addon['index']}")
             for addon in addons:
                 folder = stage / f"aoc-{addon['index']}"
-                manifest = compare_pack(folder, addon['files'],
-                                        addon.get('source') or f"{ctx.info['sources']['nup']} (add-on {addon['index']})")
+                run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'dkb_pack_romfs.py',
+                                         '--dir', addon['source'], '--out', folder], name=f"{self.id}-{addon['index']}")
+                manifest = compare_pack(folder, addon['files'], addon['source'])
                 (folder / 'aoc-index.bin').write_bytes(romfs_index_bytes(manifest))
         # Final names are replaced only after every pack has passed its checks.
-        packs = {}
         wanted = {str(addon['index']) for addon in addons}
         for index in previous:
-            if index not in wanted:
-                old = ctx.dest / f'aoc-{index}'
-                if old.exists():
-                    plain_tree(old)
-                    shutil.rmtree(old)
+            old = ctx.dest / f'aoc-{index}'
+            if index not in wanted and old.exists():
+                plain_tree(old)
+                shutil.rmtree(old)
+        packs = {}
         for addon in addons:
             folder, target = stage / f"aoc-{addon['index']}", ctx.dest / f"aoc-{addon['index']}"
             copy_file(folder / 'romfs.bin', target / 'romfs.bin')
@@ -777,8 +796,8 @@ class Addons(Step):
                                           'mtime_ns': image.stat().st_mtime_ns,
                                           'index_sha256': sha256(target / 'aoc-index.bin'), 'files': len(addon['files'])}
         if addons:
-            summary = ', '.join('aoc-%s (%d files)' % (i, p['files']) for i, p in packs.items())
-            ctx.reporter.log('add-on content: ' + summary)
+            ctx.reporter.log('add-on content: ' +
+                             ', '.join('aoc-%s (%d files)' % (i, p['files']) for i, p in packs.items()))
         return {'packs': packs}
 
 
@@ -860,11 +879,13 @@ class Compile(Step):
     id = 'compile'
 
     def key(self, ctx):
+        lib = prebuilt_runtime(ctx.layout)
         return digest(ctx.keys['lift'], source_key(ctx.layout, 'runtime', 'tools/build_game.py', 'tools/romfs_index.py'),
                       str(ctx.layout.llvm), str(ctx.layout.deps),
                       sha256(ctx.layout.clang), sha256(ctx.layout.ninja),
                       tree_key(ctx.layout.deps) if ctx.layout.deps else 'system-libraries',
-                      [(str(p), sha256(p)) for p in ctx.layout.dlls])
+                      [(str(p), sha256(p)) for p in ctx.layout.dlls],
+                      sha256(lib) if lib else 'runtime-from-source')
 
     def current(self, ctx, record):
         exe = ctx.dest / ('dkb' + EXE)
@@ -883,6 +904,9 @@ class Compile(Step):
                 '--modules', 'main,sdk', '--exefs', ctx.dest / 'exefs', '--romfs', ctx.dest / 'romfs',
                 '--profile', ctx.dest / 'profile', '--runtime', ctx.layout.runtime, '--toolchain', ctx.layout.llvm,
                 '--ninja', ctx.layout.ninja, '--jobs', ctx.options.jobs, '--full-build']
+        lib = prebuilt_runtime(ctx.layout)
+        if lib:
+            args += ['--runtime-lib', lib]
         if ctx.layout.deps:
             args += ['--deps', ctx.layout.deps]
         if ctx.layout.sysroot:
@@ -932,6 +956,98 @@ class Shaders(Step):
         return {'prepared': True, 'libraries': libraries}
 
 
+class WideLayouts(Step):
+    """Validate both HUD variants for every wide menu preset before publishing any overlay."""
+    id = 'dkb_wide'
+
+    def key(self, ctx):
+        return digest(ctx.keys['dkb_data'], ctx.info['game'], WIDE_SIZES,
+                      source_key(ctx.layout, 'tools/dkb_wide_layout.py', 'tools/ultrawide_layout.py'))
+
+    def current(self, ctx, record):
+        try:
+            return (set(record.get('outputs', {})) == set(WIDE_FOLDERS) and
+                    all((ctx.dest / name / 'manifest.tsv').is_file() and
+                        tree_key(ctx.dest / name) == record['outputs'][name] for name in WIDE_FOLDERS))
+        except OSError:
+            return False
+
+    def verify(self, ctx, record):
+        return self.current(ctx, record)
+
+    def run(self, ctx):
+        plain_outputs(ctx)
+        staged = ctx.temp / 'build' / 'wide-overlays'
+        owned_dir(ctx, staged)
+        try:
+            run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'dkb_wide_layout.py',
+                                    '--version', ctx.info['game'],
+                                    '--romfs', ctx.dest / 'romfs', '--out', staged,
+                                    '--installer-workspace', ctx.temp, '--presets', *WIDE_SIZES])
+        except InstallError as error:
+            if error.id != 'dkb.tool_failed':   # path/ownership failures still stop setup
+                raise
+            ctx.reporter.warning('warn.dkb_wide_failed', code=error.params.get('code'),
+                                 log=str(error.params.get('log')))
+            # These assets are optional for 16:9 play. Publish nothing on failure, retain any installed overlays,
+            # and leave outputs unrecorded so the next setup run can retry generation.
+            return {'prepared': False}
+        plain_outputs(ctx)
+        # Every preset has been validated. Publish each manifest last, so an interrupted copy is detected by
+        # the runtime's resource hashes and the next install repairs it without recompiling the game.
+        for name in WIDE_FOLDERS:
+            folder = staged / name
+            for source in sorted(folder.rglob('*')):
+                if source.is_file() and source.name != 'manifest.tsv':
+                    copy_file(source, ctx.dest / name / source.relative_to(folder))
+            copy_file(folder / 'manifest.tsv', ctx.dest / name / 'manifest.tsv')
+        return {'outputs': {name: tree_key(ctx.dest / name) for name in WIDE_FOLDERS}}
+
+
+class PadPrompts(Step):
+    """The PlayStation button prompts (tools/dkb_ps_prompts.py): one overlay per pad layout, from the user's font."""
+    id = 'dkb_prompts'
+
+    def key(self, ctx):
+        return digest(ctx.keys['dkb_data'], ctx.info['game'], PS_FOLDERS, source_key(ctx.layout, 'tools/dkb_ps_prompts.py'))
+
+    def current(self, ctx, record):
+        try:
+            return (set(record.get('outputs', {})) == set(PS_FOLDERS) and
+                    all((ctx.dest / name / 'manifest.tsv').is_file() and
+                        tree_key(ctx.dest / name) == record['outputs'][name] for name in PS_FOLDERS))
+        except OSError:
+            return False
+
+    def verify(self, ctx, record):
+        return self.current(ctx, record)
+
+    def run(self, ctx):
+        plain_outputs(ctx)
+        staged = ctx.temp / 'build' / 'ps-prompts'
+        owned_dir(ctx, staged)
+        try:
+            for name, layout in PS_FOLDERS.items():
+                run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'dkb_ps_prompts.py',
+                                        '--romfs', ctx.dest / 'romfs', '--out', staged / name, '--layout', layout,
+                                        '--installer-workspace', ctx.temp], name=f'{self.id}-{layout}')
+        except InstallError as error:
+            if error.id != 'dkb.tool_failed':   # path/ownership failures still stop setup
+                raise
+            ctx.reporter.warning('warn.dkb_prompts_failed', code=error.params.get('code'),
+                                 log=str(error.params.get('log')))
+            # Optional: the Switch prompts stay. Nothing is published and nothing recorded, so the next setup retries.
+            return {'prepared': False}
+        plain_outputs(ctx)
+        for name in PS_FOLDERS:   # each manifest last, as WideLayouts
+            folder = staged / name
+            for source in sorted(folder.rglob('*')):
+                if source.is_file() and source.name != 'manifest.tsv':
+                    copy_file(source, ctx.dest / name / source.relative_to(folder))
+            copy_file(folder / 'manifest.tsv', ctx.dest / name / 'manifest.tsv')
+        return {'outputs': {name: tree_key(ctx.dest / name) for name in PS_FOLDERS}}
+
+
 class Prepare(Step):
     id = 'dkb_verify'
 
@@ -944,9 +1060,7 @@ class Prepare(Step):
     def run(self, ctx):
         for name in ('dkb.ini', 'dkb.ini.tmp', 'totk.ini'):
             ensure_plain(ctx.dest / name)
-        # Headless launcher setup leaves language choices made in the launcher or game intact.
-        if not (getattr(ctx.options, 'preserve_language', False) and (ctx.dest / 'dkb.ini').is_file()):
-            ini.write(ctx.dest, ctx.state['lang'], ctx.layout.ini_example, 'dkb.ini', fallback='totk.ini')
+        ini.write(ctx.dest, ctx.state['lang'], ctx.layout.ini_example, 'dkb.ini', fallback='totk.ini')
         run_tool(ctx, self.id, [ctx.dest / ('dkb' + EXE), '--selftest'])
         return {'selftest': True}
 
@@ -957,7 +1071,7 @@ class Cleanup(Step):
     def run(self, ctx):
         # Update 458752 keeps generated C and objects so a second install does not relift or recompile.
         keep = ctx.info['game'] != GAME
-        for name in ('data', 'addons', 'xlate', 'dotnet-home', 'nuget') if keep else ('data', 'addons', 'gen', 'build', 'xlate', 'dotnet-home', 'nuget'):
+        for name in ('data', 'addons', 'build/wide-overlays', 'xlate', 'dotnet-home', 'nuget') if keep else ('data', 'addons', 'gen', 'build', 'xlate', 'dotnet-home', 'nuget'):
             p = ctx.temp / name
             if p.exists():
                 owned_dir(ctx, p)
@@ -965,7 +1079,7 @@ class Cleanup(Step):
 
 
 def all_steps():
-    return [Check(), Data(), Addons(), Translator(), Lift(), Compile(), Shaders(), Prepare(), Cleanup()]
+    return [Check(), Data(), Addons(), Translator(), Lift(), Compile(), Shaders(), WideLayouts(), PadPrompts(), Prepare(), Cleanup()]
 
 
 def cancel(*_):
@@ -982,8 +1096,8 @@ def write_owner(path, value):
             raise InstallError('dkb.temp_unrelated', path=str(path.parent)) from None
 
 
-def main(options, reporter=None):
-    rep = reporter if reporter is not None else Reporter()
+def main(options):
+    rep = LauncherReporter() if getattr(options, 'prepare', False) else Reporter()
     locks = []
     started = time.monotonic()
     try:

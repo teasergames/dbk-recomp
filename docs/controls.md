@@ -5,7 +5,33 @@
 > names are written below with the TotK Recomp names. In the Bananza build read `TOTK_*` as `DKB_*` (both work, `DKB_`
 > wins) and `totk.ini` as `dkb.ini` (a `totk.ini` is copied to it on the first run).
 
-Input comes from the first SDL3 gamepad, the keyboard and the mouse, merged into one Switch controller (`runtime/input_win.c`). Buttons are ORed; each stick takes the source with the larger deflection. Keys and mouse buttons count only while the game window is in the foreground. `TOTK_INPUT=none` disables both (automated runs). `TOTK_*` settings can also be set in `totk.ini` next to `totk.exe` (`input = none`, `motion = 0`, `rumble = 0`); the environment overrides the file. `TOTK_RUMBLE_STRENGTH` is the rumble strength in percent (0 to 300, default 130; 0 is the same as `rumble = 0`). `TOTK_RUMBLE_CURVE` is the exponent applied to the amplitude before the strength (0.2 to 1.5, default 0.6; lower makes weak pulses stronger, 1 is linear). `TOTK_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad.
+Input comes from the selected SDL3 gamepad, the keyboard and the mouse, merged into one Switch controller (`runtime/input.c`). Buttons are ORed; each stick takes the source with the larger deflection. Keys and mouse buttons count only while the game window is in the foreground. `TOTK_INPUT=none` disables both (automated runs). `TOTK_*` settings can also be set in `totk.ini` next to `totk.exe` (`input = none`, `motion = 0`, `rumble = 0`); the environment overrides the file. `TOTK_RUMBLE_STRENGTH` is the rumble strength in percent (0 to 300, default 130; 0 is the same as `rumble = 0`). `TOTK_RUMBLE_CURVE` is the exponent applied to the amplitude before the strength (0.2 to 1.5, default 0.6; lower makes weak pulses stronger, 1 is linear). `TOTK_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad.
+
+## Controller device
+
+Choose **Controller Device** in F1 > Controls > Controller. Changes apply to gameplay and the menu without restarting.
+At startup, a saved manual choice is used when available; otherwise the first available controller is used.
+A newly connected controller takes over automatically, including after a manual choice. If the active controller
+disconnects, another available controller takes over. With no controllers, keyboard and mouse remain available.
+Only the currently active controller controls gameplay and the controller shortcuts.
+
+A manual menu choice applies immediately and is saved for the next startup. Automatic takeovers and fallbacks
+show **Auto: controller name** and do not overwrite that saved startup preference. Choosing Auto explicitly
+resets startup selection to the first available controller. Refreshing the list, opening the menu or changing
+an unrelated setting does not count as a new connection. Devices already connected at launch are a baseline;
+if several arrive between polls, the last enumerated new device is chosen. Discovery may take about one second.
+
+Identities are cached per connected SDL instance ID: routine scans do not repeatedly initialize USB/Bluetooth
+controllers. Failed opens are also remembered until that device disconnects; reconnecting allows a fresh attempt.
+A new/reconnected device can still cause a brief initialization hitch.
+
+The selection is saved as `pad_device` in `totk.ini` (`dkb.ini` in Bananza). Set it to `auto` to reset it, or use
+`TOTK_PAD_DEVICE` / `DKB_PAD_DEVICE` to override it. The other values are opaque device keys written by the menu.
+Devices with serial numbers can be identified across sessions; otherwise identical devices use fallback ordinals,
+which can become ambiguous if their connection order changes. Duplicate names have numbered menu labels.
+
+Motion and vibration use the selected controller's existing capabilities. Switching devices keeps the existing
+button mappings and button-layout setting.
 
 `TOTK_PAD_LAYOUT` (`pad_layout`, the *Button layout* row on the Controls tab, live) picks which face button is Switch A:
 
@@ -49,15 +75,38 @@ The buttons change at once, but the game reads its UI archive and fonts once at 
 
 Without the folder (an install made by an older setup, or one where the setup could not prepare it and showed a warning) the menu says the files are missing, the log has `RomFS overlay: pad_layout = xbox_prompts, but ...`, and the Switch prompts stay; running the setup again on the install folder writes it. In a source build, `.venv-py314\Scripts\python tools\make_romfs_patches.py --version <ver> --xbox-prompts` writes `build\<ver>\romfs-patches-xbox`.
 
+## PlayStation button prompts (Bananza)
+
+With a DualShock 4 or DualSense pad connected when the game starts, Bananza shows PlayStation symbols in its button prompts: a cross, circle, square and triangle for the face buttons, L1, R1, L2 and R2 for the shoulder buttons and triggers, and the Options and Create marks for + and -. `pad_prompts` in `dkb.ini` chooses: `auto` (default) as above, `playstation` always, `switch` never. The game reads its fonts once at boot, so a pad connected later, or a changed setting, takes effect at the next start. The log says `RomFS overlay: PlayStation button prompts` when they are on.
+
+Which button each symbol names follows `pad_layout`, as the buttons do:
+
+- `auto` (a Sony pad counts as `xbox`) and `xbox`: Switch A is the bottom button, so A shows the cross, B the circle, X the square and Y the triangle. The face-button diamonds that point at one button point at the bottom one for A, and so on.
+- `nintendo` and `xbox_prompts`: Switch A is the right button, so A shows the circle, B the cross, X the triangle and Y the square.
+
+As with the Xbox prompts, a button remapped with a `bind_` line keeps the symbol of the Switch button it was. `auto` looks at every pad connected at start, not at the one `pad_device` chooses (the choice is made later, when input starts): with a PlayStation pad connected next to the one you play with, set `pad_prompts = switch`.
+
+Every prompt is a glyph of one font, `scft/NinDev-HardKey.bfotf`, the same in each `Font/Font*.Nin_Ounce_NVN2.bfarc.zs`: an irregular plate with the button's letter cut out of it (`tools/dkb_prompt_survey.py` found it). The setup runs `tools/dkb_ps_prompts.py`, which keeps each plate of the user's own font and cuts the PlayStation symbol into it instead of the letter: the symbols, the 1 and the 2 are drawn by the tool, and the L and R are the game's, from its ZL and ZR glyphs. It writes `romfs-patches-ps` and `romfs-patches-ps-nintendo` next to `romfs-index.bin`; `runtime/romfs.c` (`ps_prompts_init`) loads one of them next to the other overlays, which replace no Font archive. The D-pad, the sticks, Home and the controller pictures stay as the game draws them.
+
 ## Window keys
 
 | Key | Gamepad | Action |
 |---|---|---|
-| F1 or Esc | Guide (Xbox, PS) button, or Minus and Plus together | open or close the settings menu; the game gets no input while it is open |
+| F1 or Esc | Guide / Home button, or Minus + Plus together (default) | open or close the settings menu; the game gets no input while it is open |
 | F10 | L3 + R3 (both stick clicks) | performance overlay: off, frame rate, full panel |
-| F11 | | windowed, or back to the last full-screen mode (`window_mode`), saved to `totk.ini` |
+| F11 | Hold Start + Back for 0.5 seconds (opt-in) | windowed, or back to the last full-screen mode (`window_mode`), saved to `totk.ini` |
 
-The Minus+Plus combo never reaches the game. In the menu the arrow keys, the D-pad or the left stick move, Enter or A selects, Q and E or L and R switch tabs, Esc or B goes back (Switch button names, as in the table above).
+By default, the original immediate Minus + Plus settings shortcut remains available and follows the current bindings.
+Enable **Fullscreen hold shortcut** in F1 > Controls > Controller (`pad_fullscreen_hold = 1`, or
+`TOTK_PAD_FULLSCREEN_HOLD` / `DKB_PAD_FULLSCREEN_HOLD`) to replace that combination with fullscreen.
+The setting defaults to off and takes effect immediately. Guide / Home and keyboard F1 work in either mode.
+In Steam Deck Game Mode, enabling the fullscreen hold leaves only keyboard F1 to open settings when Steam intercepts Guide / Home.
+
+The opt-in fullscreen hold uses the selected controller's physical SDL Start and Back buttons (Options + Create on DualSense), independently of button remapping. It fires once per hold; release both buttons before repeating. Once the buttons overlap, neither reaches the game until both are released. An individual button pressed before the combination forms still works normally. Switching or reconnecting controllers does not inherit a held shortcut.
+
+The read-only **Shortcuts** section above **Buttons** shows settings, fullscreen and performance shortcuts using the selected controller's button labels and the enabled shortcut mode. Performance data follows the current stick-click bindings, as before. Guide / Home must be forwarded by the operating system or streaming client.
+
+In the menu the arrow keys, the D-pad or the left stick move, Enter or A selects, Q and E or L and R switch tabs, Esc or B goes back (Switch button names, as in the table above).
 
 ## Remapping
 
@@ -87,7 +136,7 @@ Enable **Direct mouse camera** in F1 > Controls to use raw mouse distance for ro
 
 Other camera modes use the existing mouse-to-stick fallback. Each presented frame converts raw counts into `counts per second * TOTK_MOUSE_SENS / 3000` of full stick deflection, held for that frame. In that path the game's stick curve and dead zone still apply, and the larger deflection wins between mouse, controller and arrow keys. Aiming and special transformations still need gameplay validation. The setting is stored as `mouse_camera` in `totk.ini`; `DKB_MOUSE_CAMERA=0|1` overrides it. Direct rotation requires regenerating the game code with `recomp/patches-dkb100.txt`.
 
-`TOTK_MOUSE_SENS` (0 to 10, default 1; higher turns faster, 0 turns the mouse camera and the cursor capture off). While the window is the foreground window the cursor is hidden and confined to the client area. It is released on focus loss, minimise, while F11 changes the window, during a size or move loop and while a text entry is open. Esc releases it by hand: the cursor shows, the mouse camera and mouse buttons stop, and the window can be moved, minimised or closed. A mouse click inside the client area captures it again; that click does not reach the game. Activating the window by a click on its title bar or border does not capture, so it can be dragged or closed right away; Alt+Tab or a click in the client area captures as before. `TOTK_INPUT=none` disables the capture too.
+`TOTK_MOUSE_SENS` (0 to 10, default 1; higher turns faster, 0 turns the mouse camera and the cursor capture off). While the window is the foreground window the cursor is hidden and confined to the client area. It is released on focus loss, on minimise, while F11 changes the window, during a size or move loop and while a text entry is open. Esc releases it by hand: the cursor shows, the mouse camera and mouse buttons stop, and the window can be moved, minimised or closed. A mouse click inside the client area captures it again; that click does not reach the game. Activating the window by a click on its title bar or border does not capture, so it can be dragged or closed right away; Alt+Tab or a click in the client area captures as before. `TOTK_INPUT=none` disables the capture too.
 
 `TOTK_STICK_DEADZONE` (0 to 50, default 8) is the gamepad stick dead zone in percent of full deflection, the same for both sticks. It is round: a stick inside the circle reads centred, and the rest of its travel is scaled to start at 0 at the edge, so full deflection still reaches full. Raise it for a stick that drifts. The game's own dead zone applies after it.
 

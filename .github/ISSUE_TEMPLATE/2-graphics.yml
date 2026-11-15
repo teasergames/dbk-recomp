@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Known glitches are tracked in the pinned [roadmap](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/10) (for example the empty colour grading LUT and the checkerboard textures).
+        Known glitches are tracked in the pinned [roadmap](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/10).
 
         Do not attach or link game files, keys, firmware, builds, shader caches or screenshots of the game. Describe what you see instead. Issues that break this are closed.
   - type: checkboxes
@@ -18,14 +18,24 @@ body:
   - type: input
     id: version
     attributes:
-      label: Commit
-      description: The commit you built, from `git rev-parse --short HEAD`.
+      label: Release or commit
+      description: The release you downloaded (for example 0.3.0), or the commit you built, from `git rev-parse --short HEAD`.
+    validations:
+      required: true
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game version
+      options:
+        - "1.0.0 (base)"
+        - "3.2.0 (update 458752)"
     validations:
       required: true
   - type: input
     id: system
     attributes:
-      label: GPU, driver and Windows version
+      label: GPU, driver and operating system
+      description: For example "GeForce RTX 4070, 591.44, Windows 11 24H2" or "Radeon RX 6600, Mesa 25.2, Arch Linux".
     validations:
       required: true
   - type: textarea
@@ -39,6 +49,6 @@ body:
     id: log
     attributes:
       label: Log
-      description: Attach logs\dkb.log from the folder of dkb.exe. Lines with "validation", "shader" or "nvn2" are the interesting ones.
+      description: Attach logs/dkb.log from the folder of dkb.exe (or the dkb binary on Linux). Copy it before you start the game again, because the next start renames it to dkb.1.log. Say if you changed dkb.ini, and paste the changed lines.
     validations:
       required: true

@@ -1,6 +1,8 @@
 // CPU fixture for vk_resource_frontier_test.py. Production functions/types are inserted at the markers below.
 // Every driver entry is redirected to an explicitly synthetic adapter. No window, loader, Vulkan device or GPU runs.
 #include <windows.h>
+
+void vk_texture_new_submit(void) {}
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -17,6 +19,9 @@
 #define vkWaitForFences synthetic_wait_fences
 #define vkDestroyImage synthetic_destroy_image
 #define vkDestroyImageView synthetic_destroy_view
+#define vkDestroyPipeline synthetic_destroy_pipeline
+#define vkDestroyPipelineLayout synthetic_destroy_pipeline_layout
+#define vkDestroyDescriptorSetLayout synthetic_destroy_set_layout
 #define vmaDestroyImage synthetic_vma_destroy_image
 #define vmaDestroyBuffer synthetic_vma_destroy_buffer
 #define vkBeginCommandBuffer synthetic_begin
@@ -62,6 +67,10 @@ void vk_exec_pool_counts(uint64_t *c, uint64_t *t) { *c = *t = 0; }
 _Thread_local int vk_spec_here;
 int vk_spec_fail(int why) { rt_fatal("unexpected helper failure %d in the frontier fixture", why); }
 void vk_spec_world_changed(void) {}
+// No pass end is held back (vk_exec.c par_defer): the texture cache's barrier never waits and nothing is frozen.
+static int tex_frozen;
+static int vk_exec_held_pending(void) { return 0; }
+static void hold_barrier(void) {}
 void vk_spec_event(void) {}
 // The actual shared split helper also contains the ordered-readback branch. Retirement scenarios must keep using
 // the nonwaiting branch; reaching any of these new dependencies is a fixture failure, not a simulated success.
@@ -176,8 +185,20 @@ static VkResult synthetic_device_idle(VkDevice d) {
 }
 void vk_texture_shutdown(void) { check(scenario == SHUTDOWN, "shutdown uses an empty synthetic texture cache"); }
 
+// vk_memory.c's compute copy of small write-back ranges (TOTK_SPARSE_MIRROR_COPY): never made in this fixture, so
+// vk_mem_shutdown finds nothing to destroy.
+static struct { VkPipeline pipeline; VkPipelineLayout layout; VkDescriptorSetLayout set; } sparse_copy;
+static void synthetic_destroy_pipeline(VkDevice d, VkPipeline p, const VkAllocationCallbacks *a) { (void)d; (void)p; (void)a; check(0, "no sparse copy pipeline"); }
+static void synthetic_destroy_pipeline_layout(VkDevice d, VkPipelineLayout l, const VkAllocationCallbacks *a) { (void)d; (void)l; (void)a; check(0, "no sparse copy layout"); }
+static void synthetic_destroy_set_layout(VkDevice d, VkDescriptorSetLayout l, const VkAllocationCallbacks *a) { (void)d; (void)l; (void)a; check(0, "no sparse copy set layout"); }
+// The sparse mirror cache and the slice threads' write-back lists (vk_memory.c) stay empty in this fixture.
+static int mirror_sparse;
+static void sparse_cache_close(void) {}
+typedef struct WbLocal { void *a; int n, cap; void *k; int nk, ck; struct WbLocal *next; } WbLocal;
+static WbLocal *wb_locals;
 #define cmd_pool memory_cmd_pool
 @MEMORY_FUNCTIONS@
+static void pinned_reader(void) { (void)pinned_batch; }   // vk_upload_flush reads it; not part of this fixture
 #undef cmd_pool
 
 static void own_remove(Tex *e) { check(!e->listed, "fixture has no GPU writeback-list entry"); }
@@ -206,6 +227,7 @@ void vk_mem_shadow_sync(void) {}
 static void ts_begin(VkCommandBuffer cb) { (void)cb; }
 static void ts_end(VkCommandBuffer cb, uint64_t fence) { (void)cb; check(fence == 2, "split keeps its final fence"); }
 static void ts_drop(void) {}
+static void held_none(const char *where) { (void)where; }   // no split part held back (vk_sync_split_defer)
 void rec_begin(VkCommandBuffer cb) { (void)cb; }
 int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t fence) { (void)cb; (void)crumb; (void)fence; return 0; }
 // The recorder ends no command buffer above, so split_impl submits every part itself and never hands one over.

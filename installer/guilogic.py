@@ -26,7 +26,7 @@ from .events import render
 TEXT = Path(__file__).resolve().parent / 'text'
 UI_LANGUAGES = ('en', 'ru')
 STEP_ORDER = ('check', 'extract', 'lift', 'compile', 'prepare', 'cleanup')
-DKB_STEP_ORDER = ('check', 'dkb_data', 'dkb_addons', 'dkb_translator', 'lift', 'compile', 'dkb_shaders', 'dkb_verify', 'cleanup')
+DKB_STEP_ORDER = ('check', 'dkb_data', 'dkb_addons', 'dkb_translator', 'lift', 'compile', 'dkb_shaders', 'dkb_wide', 'dkb_prompts', 'dkb_verify', 'cleanup')
 # message parameter -> catalog id prefix of the names that replace its raw values
 PARAM_NAMES = {'lang': 'lang.', 'known': 'lang.', 'step': 'step.', 'input': 'param.input.'}
 LANG_RU = 0x19   # primary language id of Russian in a Windows LANGID
@@ -189,8 +189,8 @@ class Form:
                   ('--lang', self.lang), ('--dest', self.dest))
         if self.game == 'bananza':
             cmd += ['--game', 'bananza']
-            fields = (('--nup', self.nup), ('--exefs', self.exefs), ('--romfs', self.romfs), ('--dlc', self.dlc),
-                      ('--package', self.package), ('--lang', self.lang), ('--dest', self.dest))
+            fields = (('--nup', self.nup), ('--exefs', self.exefs), ('--romfs', self.romfs), ('--dlc', self.dlc), ('--package', self.package),
+                      ('--lang', self.lang), ('--dest', self.dest))
         for flag, value in fields:
             if value.strip():
                 cmd += [flag, value.strip()]

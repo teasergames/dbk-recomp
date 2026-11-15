@@ -6,8 +6,8 @@ Legacy TotK: --base FILE --update FILE --keys FILE --lang CODE --dest DIR [--roo
 
 A first install needs every option. On a folder with totk-install.json (resume after a cancel or failure, or update
 with a newer release) only --dest is needed: --lang defaults to the recorded language, and the game files are needed
-only when the extraction has to run again. Prints JSON events on stdout (events.py). Exit code: 0 done, 1 failed,
-2 bad command line, 3 cancelled (Ctrl+C or Ctrl+Break).
+only when the extraction has to run again. Prints JSON events on stdout (events.py), or with --prepare the `progress`
+lines RecompLauncher reads. Exit code: 0 done, 1 failed, 2 bad command line, 3 cancelled (Ctrl+C or Ctrl+Break).
 """
 import argparse
 import hashlib
@@ -46,6 +46,27 @@ def cancel(signum, frame):
     raise KeyboardInterrupt
 
 
+def child_dir(folder, name):
+    """folder/name as a folder, whatever the case of its name (dump tools write exefs, ExeFS or EXEFS)."""
+    for p in folder.iterdir():
+        if p.is_dir() and p.name.lower() == name:
+            return p
+    return None
+
+
+def source_inputs(source):
+    """--source as (nup, exefs, romfs): a file is a .nup, a folder holds exefs/ and romfs/. RecompLauncher hands over
+    the player's copy as one path of either kind. None when it is neither."""
+    if source.is_file():
+        return source, None, None
+    if not source.is_dir():
+        return None
+    exefs, romfs = child_dir(source, 'exefs'), child_dir(source, 'romfs')
+    if exefs is None or romfs is None:
+        return None
+    return None, exefs, romfs
+
+
 def main(argv=None):
     ap = Parser(prog='python -m installer', description=__doc__.splitlines()[0])
     ap.add_argument('--base', type=Path, help='base game, XCI or NSP')
@@ -65,9 +86,15 @@ def main(argv=None):
     ap.add_argument('--exefs', type=Path, help='Bananza 1.0.0 or 3.2.0 ExeFS folder')
     ap.add_argument('--romfs', type=Path, help='Bananza loose RomFS folder or packed romfs.bin/index.json folder')
     ap.add_argument('--dlc', type=Path, action='append',
-                    help='add-on content (DLC) folder: its RomFS, or a dump folder holding <title id>/<version>/romfs '
-                         'folders; repeatable. A .nup brings its own add-on content')
-    ap.add_argument('--no-dlc', action='store_true', help='install no add-on content, also none a .nup holds')
+                    help='add-on content (DLC) folder for an --exefs/--romfs install: its RomFS, or a dump folder '
+                         'holding <title id>/<version>/romfs folders; repeatable. A .nup brings its own')
+    ap.add_argument('--no-dlc', action='store_true', help='remove the add-on content installed from --dlc folders')
+    ap.add_argument('--source', type=Path,
+                    help='Bananza: your copy as one path, a .nup file or a folder with exefs/ and romfs/ in it (instead '
+                         'of --nup, or --exefs and --romfs)')
+    ap.add_argument('--prepare', action='store_true',
+                    help='for RecompLauncher (recomplauncher.json): print "progress <0..1> <text>" lines instead of '
+                         'JSON events')
     ap.add_argument('--package', type=Path, help='tool package with llvm/, runtime/deps/ and bin/')
     ap.add_argument('--toolchain', type=Path, help='LLVM toolchain directory')
     ap.add_argument('--deps', type=Path, help='build dependency directory with include/ and lib/')
@@ -79,6 +106,13 @@ def main(argv=None):
     ap.add_argument('--no-update-check', action='store_true',
                     help='do not ask GitHub for a newer release (also DKB_NO_UPDATE_CHECK=1)')
     args = ap.parse_args(argv)
+    if args.source:
+        if args.nup or args.exefs or args.romfs:
+            ap.error('--source replaces --nup, --exefs and --romfs')
+        found = source_inputs(args.source)
+        if found is None:
+            ap.error(f'--source {args.source}: neither a .nup file nor a folder with exefs/ and romfs/ in it')
+        args.nup, args.exefs, args.romfs = found
 
     # Only for a person at a terminal: the window checks by itself, and its CLI subprocess and the tests are not a tty.
     if sys.stdout.isatty() and not update.disabled(args.no_update_check):
@@ -86,8 +120,8 @@ def main(argv=None):
         if found:
             Reporter().warning('warn.update_available', tag=found[0], url=found[1])
 
-    if (args.game == 'bananza' or args.nup or args.nup_package or args.exefs or args.romfs or args.dlc or
-            args.no_dlc or (args.game is None and (args.dest / 'dkb-install.json').is_file())):
+    if (args.game == 'bananza' or args.nup or args.nup_package or args.exefs or args.romfs or args.dlc or args.no_dlc or
+            (args.game is None and (args.dest / 'dkb-install.json').is_file())):
         if args.game == 'totk':
             ap.error('--nup/--exefs/--romfs/--dlc require --game bananza')
         from .bananza import main as bananza_main

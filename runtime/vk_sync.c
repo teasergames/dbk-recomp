@@ -430,7 +430,17 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
     return cb;
 }
 
+// The parts vk_sync_split_defer left open, oldest first: command buffer, the value it belongs to, timing (sub_lock).
+#define HELD_MAX 8
+static struct { int ts; VkCommandBuffer cb; uint64_t fence; PartNote note; } held[HELD_MAX];
+static int held_head, held_n;
+
+static void held_none(const char *where) {
+    if (held_n) rt_fatal("vk: %s while %d split parts are still held back (vk_sync_split_finish)", where, held_n);
+}
+
 static VkCommandBuffer split_impl(int wait) {
+    held_none("a split");
     VkCtx *c = vk_ctx();
     VkFence prefix = VK_NULL_HANDLE;
     if (wait) {
@@ -479,6 +489,58 @@ static VkCommandBuffer split_impl(int wait) {
 
 VkCommandBuffer vk_sync_split(void) { return split_impl(0); }
 
+VkCommandBuffer vk_sync_split_defer(void) {
+    if (held_n == HELD_MAX) rt_fatal("vk: more than %d split parts held back", HELD_MAX);
+    VkCommandBuffer cb = slots[cur_slot].cb;
+    rec_end();   // the recorder has made every call queued for cb; cb stays open, and its slot claimed for cur_fence
+    typeof(held[0]) *h = &held[(held_head + held_n++) % HELD_MAX];
+    h->cb = cb, h->fence = cur_fence, h->ts = ts_cur, h->note = note;
+    ts_cur = -1, note.args = NULL;   // the note's argument list moved to the held part
+    vk_upload_flush(0);   // the uploads the part asked for so far precede it in queue order
+    CmdSlot *s = take_slot(vk_ctx(), cur_fence);
+    part_begin(s->cb, cur_fence);
+    return s->cb;
+}
+
+// The recorder is drained first and records nothing meanwhile: the open part and the one it is recording come from the
+// same command pool, and this thread is its only producer. The uploads and mirror copies asked for since the held split
+// (by the slices and by the replay of the parts after it) go to the queue ahead of the part: they are first uses in
+// this submission, which the part did not make.
+// The held part's last calls: the tail, the end timestamp, vkEndCommandBuffer. On the recorder thread, which recorded
+// the rest of the part: the AMD driver of issue #5 did not cope with a part ended by another thread than the one that
+// recorded it (vk_rec.c rec_end_cb), and the submitting thread waits meanwhile.
+typedef struct { void (*tail)(VkCommandBuffer cb, void *arg); void *arg; typeof(held[0]) *h; } HeldEnd;
+static void held_end(void *p) {
+    HeldEnd *e = p;
+    e->tail(e->h->cb, e->arg);
+    ts_close(e->h->cb, e->h->ts, e->h->fence, &e->h->note);
+    vkEndCommandBuffer(e->h->cb);
+}
+
+void vk_sync_split_finish(void (*tail)(VkCommandBuffer cb, void *arg), void *arg) {
+    if (!held_n) return;
+    typeof(held[0]) h = held[held_head];
+    held_head = (held_head + 1) % HELD_MAX, held_n--;
+    VkCtx *c = vk_ctx();
+    HeldEnd e = {tail, arg, &h};
+    if (rec_call(held_end, &e)) rec_drain();   // after the calls queued before it, then the wait for the end
+    else rec_drain(), held_end(&e);
+    vk_upload_flush(0);
+    VkCommandBuffer pro = prologue(c, h.fence);
+    VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
+                                        {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = h.cb}};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
+                        .pCommandBufferInfos = pro ? cbi : cbi + 1};
+    rec_submit_wait();   // a part the recorder still submits comes first
+    vk_queue_lock();
+    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
+    vk_queue_unlock();
+    if (r != VK_SUCCESS) {
+        vk_device_fault_report(r);
+        rt_fatal("vk: vkQueueSubmit2 of a held-back part of value %llu failed (%d)", (unsigned long long)h.fence, (int)r);
+    }
+}
+
 // A part recorded by the helper thread (vk_spec.h) goes into the queue between two of the replay thread's: the caller
 // has just split, so the part before is ended and on its way, and nothing of the part after is recorded yet. The ring
 // may still hold that part's submit and, with TOTK_REC_BEGIN=1, the next part's begin, so prologue drains it before it
@@ -486,6 +548,7 @@ VkCommandBuffer vk_sync_split(void) { return split_impl(0); }
 // The recorder submits it in ring order, behind that part; without the recorder it is submitted here, once the
 // recorder's own submits are through. Not timed (ts_open): the perf trace's GPU figure leaves a helper part out.
 void vk_sync_split_insert(VkCommandBuffer cb) {
+    held_none("a helper part");
     VkCtx *c = vk_ctx();
     vk_upload_flush(0);
     VkCommandBuffer pro = prologue(c, cur_fence);   // the mirrors the helper was first to use in this submission
@@ -517,11 +580,13 @@ uint64_t vk_sync_reserve(void) {
     return v;
 }
 
-uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t submitted_ticks) {
+static uint64_t submit_record(VkSyncRecordFn record, void *context, uint64_t submitted_ticks, int guest) {
     if (!record) rt_fatal("vk: submission without a recorder");
     vk_sync_start();
     VkCtx *c = vk_ctx();
     plat_mutex_lock(&sub_lock);
+    // Keep texture freshness stable while another guest submission is recording.
+    if (guest) vk_texture_new_submit();
     vk_mem_dirty_submit();   // TOTK_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
@@ -532,6 +597,7 @@ uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t su
     uint64_t t0 = perf_begin();
     part_begin(s->cb, fence);
     int recorded = record(s->cb, fence, submitted_ticks, context);
+    held_none("the end of a submission");
     s = &slots[cur_slot];   // the last part (vk_sync_split)
     if (recorded) ts_end(s->cb, fence);
     else ts_drop();
@@ -573,6 +639,10 @@ uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t su
     return fence;
 }
 
+uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t submitted_ticks) {
+    return submit_record(record, context, submitted_ticks, 0);
+}
+
 typedef struct { const uint64_t *handles; int n; } ReplayHandles;
 
 static int record_handles(VkCommandBuffer cb, uint64_t fence, uint64_t submitted_ticks, void *context) {
@@ -583,6 +653,11 @@ static int record_handles(VkCommandBuffer cb, uint64_t fence, uint64_t submitted
 uint64_t vk_sync_submit(const uint64_t *handles, int n, uint64_t submitted_ticks) {
     ReplayHandles r = {handles, n};
     return vk_sync_submit_record(record_handles, &r, submitted_ticks);
+}
+
+uint64_t vk_sync_submit_guest(const uint64_t *handles, int n, uint64_t submitted_ticks) {
+    ReplayHandles r = {handles, n};
+    return submit_record(record_handles, &r, submitted_ticks, 1);
 }
 
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {

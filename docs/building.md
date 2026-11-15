@@ -244,6 +244,20 @@ reconstruction and sharpening. `TOTK_MVK_UPSCALE_BLIT=0` (or `DKB_MVK_UPSCALE_BL
 
 ## Checks
 
+`.venv\Scripts\python tools\test.py` runs every check listed in `tests\manifest.toml` that this machine can run, and
+names the missing tool or device for each one it skips. Tiers: 0 Python only, 1 host toolchain (Clang, SPIR-V tools,
+the translator), 2 a Vulkan device, 3 your dump or your build of the game. The default is `--tier 0-2`; add
+`--tier 0-3` for the game-file checks, `--area geometry` or test names to narrow it, `--changed` for the tests mapped
+to the files changed since a revision, `--list` to see what would run, and `--tools` to see where each tool was found.
+Tool paths come from `--set name=path`, `DKB_TEST_<NAME>`, or a `[tools]` table in `test.local.toml` (ignored by git),
+else the MSYS2 UCRT64 defaults. Logs go to `build\test\runner\<name>.log` and the summary to
+`build\test\runner\report.json`; `--junit FILE` writes JUnit XML. A new test gets an entry in the manifest; a test that
+fails today for a known reason gets `known_failure`, so it shows as XFAIL until it passes.
+
+Tier 3 executable probes default to `build/dkb100/dkb.exe` on Windows. When testing another build, pass
+`--set game_exe=build/<name>/dkb.exe` and, if applicable, `--set xlate=build/<name>/totk_xlate.exe`; otherwise the
+probes can test an older executable than the one just built.
+
 Before a commit:
 
 - `python tools/check_content.py --staged`: nothing game-derived is staged. CI runs the same check;
@@ -267,6 +281,7 @@ change passes these, all run with `.venv`:
 | `tests\aoc_romfs_test.py --cc <clang>` | the add-on content reader on synthetic TOTKRFS1 packs: bad and unsorted indexes, EOF reads, handle table, unmount and remount, `ListAddOnContent` paging | no |
 | `tests\texture_written_late_test.py --cc <clang> --deps <runtime deps>` | the texture marking a helper part defers to its join (`vk_texture_gpu_written_late`), with a game thread's release before and after it, and the pending mirror copy count (`range_add`, `vk_mem_mirror_pending`); `--source-root <checkout>` runs it on another tree | no |
 | `tests\lowend_bench_test.py` | `tools\lowend_bench.py` `parse_log` on a synthetic perf log (the tool itself runs `dkb.exe` pinned to N cores and prints a before/after table) | no |
+| `tests\layout_neutral_runtime_test.py` | no file under `runtime\` names a module base or size: the prebuilt library is linked at install time against the `modules.c` generated for the user's game (`--runtime-lib`), so the layout must come from `rt_layout`, never from `layout.h` | no |
 | `tests\jumptables_check.py` | `recomp/jumptables.py` against a Unicorn oracle; must report 0 disagreements, on 1.4.3 too | yes |
 
 Runtime probes, each a mode of `totk.exe` (the list is at the top of `runtime/main.c`): `--probe-kernel`,

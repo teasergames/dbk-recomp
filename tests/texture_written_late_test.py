@@ -66,6 +66,10 @@ void rt_fatal(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vfprintf(st
 uint32_t plat_thread_id(void) { return 1; }
 void plat_mutex_lock(PlatMutex *m) { if (m->p) rt_fatal("nonrecursive lock reentered\n"); m->p = (void *)1; }
 void plat_mutex_unlock(PlatMutex *m) { if (!m->p) rt_fatal("unlock without lock\n"); m->p = NULL; }
+int plat_mutex_trylock(PlatMutex *m) { if (m->p) return 0; m->p = (void *)1; return 1; }
+uint64_t kern_now_ns(void) { return 0; }
+void perf_lock_wait(int lock, uint64_t ns) { (void)lock; (void)ns; }
+const char *cfg_get(const char *key) { (void)key; return NULL; }   // TOTK_LOCK_HOLDS: off
 void plat_cond_broadcast(PlatCond *c) { (void)c; }
 void plat_cond_wait(PlatCond *c, PlatMutex *m) { (void)c; (void)m; rt_fatal("unexpected fixture wait\n"); }
 // The replay side the marking reports to.
@@ -85,6 +89,10 @@ static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now) {
     (void)e; (void)since; rewritten++; *now = 77; return 0;
 }
 typedef struct PoolRec PoolRec;
+// No pass end is held back (vk_exec.c par_defer): the texture cache's barrier never waits.
+int vk_exec_held_pending(void) { return 0; }
+void vk_exec_held_wait(void) {}
+void plat_yield(void) {}
 '''
 
 FIXTURE = r'''
@@ -170,12 +178,16 @@ def source(root):
         'static uint64_t max_owned', 'static uint64_t gpu_writes', 'static uint32_t tex_gen', 'static uint32_t slots_gen',
         '#define AGEN_N', 'static uint32_t agen[AGEN_N]', 'static volatile int32_t tex_ready', '#define RELEASED_MAX',
         'enum { SNAP_MAX', 'static int wb_exact', 'enum { WB_SMALL_DEFAULT', 'static int small_pending',
-        'static uint64_t wb_limit', 'static int wb_trace', 'static int wb_cfg_read')]
+        'static uint64_t wb_limit', 'static int wb_trace', 'static int wb_cfg_read', 'static int tex_frozen')]
     parts += [statement(common, 'static PlatMutex once_lock'), statement(common, 'static PlatCond once_done'), STUBS]
     parts += [typedef(memory, 'MRange'), statement(memory, 'static MRange *pend'), statement(memory, 'static int npend')]
-    parts += [function(common, name) for name in ('plat_rmutex_lock', 'plat_rmutex_unlock', 'plat_once')]
+    parts += [function(common, name) for name in ('plat_rmutex_lock', 'plat_rmutex_trylock', 'plat_rmutex_unlock',
+                                                  'plat_rmutex_release', 'plat_rmutex_retake', 'plat_once')]
+    parts += ['#define HOLD_SITES 16\n#define lock() lock_at(0)', typedef(tex, 'HoldSite')] + [statement(tex, name) for name in (
+        'static int holds_on', 'static _Thread_local uint64_t hold_t0', 'static _Thread_local void *hold_ra',
+        'static PlatMutex holds_lock', 'static HoldSite holds')]
     parts += [function(tex, name) for name in (
-        'tex_init', 'lock', 'unlock', 'agen_idx', 'tex_gen_bump', 'make_key', 'owned_lower', 'own_add', 'rel_append',
+        'tex_init', 'hold_note', 'lock_at', 'unlock', 'hold_barrier', 'lock_unfrozen', 'agen_idx', 'tex_gen_bump', 'make_key', 'owned_lower', 'own_add', 'rel_append',
         'sweep_released', 'fills_no_page', 'wb_cfg_init', 'vk_texture_gpu_written_ready')]
     parts += [statement(tex, 'static void gpu_written_entry(Tex *e);')]
     parts += [function(tex, name) for name in ('vk_texture_gpu_written_late', 'gpu_written_entry', 'vk_texture_release')]

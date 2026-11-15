@@ -282,7 +282,7 @@ class Check(Step):
         except ValueError:
             raise InstallError('check.host_probe_failed', code=r.returncode) from None
         ctx.reporter.log(f'host: {r.stdout.strip()}')
-        if not host['x86_64_v3']:
+        if not host['x86_64_v3'] and not host.get('x86_64_v2'):   # v2 builds from source (tools/build_game.py)
             raise InstallError('check.cpu_no_avx2')
         if not host['loader']:
             raise InstallError('check.vulkan_missing')

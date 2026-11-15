@@ -245,6 +245,8 @@ def main():
                 walk(raw, row['path'], found, errors)
             except (ValueError, struct.error, OSError, _zstd.ZstdError) as e:
                 errors[type(e).__name__ + ': ' + str(e)[:50]] += 1
+    if not found:
+        sys.exit(f'found 0 shader stages in {romfs}; the RomFS folder is probably an image, not extracted files, so no seed pack was written')
     out.mkdir(parents=True, exist_ok=True)
     pad = lambda b: b + bytes(-len(b) % 4)
     by_stage = collections.Counter(v[0] for v in found.values())

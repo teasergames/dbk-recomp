@@ -115,7 +115,8 @@ RUNTIME_SUFFIXES = {'.h', '.inc', '.ico'}   # .ico: the installer window icon
 # --full-build), so the folder carries every runtime source and the translator's inputs instead of libtotkrt.a.
 GAME = 'totk'
 GAMES = {'totk': dict(lifted=('v121', 'v143'), name='TotK-Setup'), 'dkb': dict(lifted=('dkb100',), name='DKB-Setup')}
-DKB_TOOLS_FILES = ['build_xlate.py', 'dkb_pack_romfs.py', 'dkb_shader_census.py', 'extract_nup.py']   # extract_nup: .nup input
+DKB_TOOLS_FILES = ['build_xlate.py', 'dkb_pack_romfs.py', 'dkb_shader_census.py', 'dkb_wide_layout.py',
+                   'extract_nup.py', 'extract_nx.py', 'dkb_ps_prompts.py']   # extract_nup, extract_nx: .nup and .nx input
 DKB_TOOLS_DIRS = ['vendor/ryujinx', 'xlate']   # translator identity hashes these
 
 PROBES = ['--probe-kernel', '--probe-vkexec', '--probe-nvn-tex', '--probe-shader']
@@ -382,6 +383,13 @@ def runtime_lib(out, llvm):
     """Build libtotkrt.a with the folder's llvm/ and copy it, the headers and the install-side sources into runtime/."""
     if GAME == 'dkb':   # no prebuilt library: the installer compiles the full runtime sources
         copy_tree(ROOT / 'runtime', out / 'runtime', lambda r: '__pycache__' in r)
+        # build_game.runtime_sources() keeps only these files, so a release unpacked over an older one cannot
+        # compile the sources the older one shipped and this one dropped.
+        src = ROOT / 'runtime'
+        names = sorted(p.relative_to(src).as_posix() for p in src.rglob('*')
+                       if p.is_file() and '__pycache__' not in p.parts)
+        (out / 'runtime' / 'sources.txt').write_text(''.join(f'{n}\n' for n in names), encoding='utf-8',
+                                                      newline='\n')
         return
     build = MAIN_ROOT / 'build' / 'release-check' / 'rtlib'
     version = lifted_version()

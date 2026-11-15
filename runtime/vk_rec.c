@@ -45,14 +45,26 @@ enum {
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
     R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb, R_Crumb, R_Checkpoint, R_BeginCb,
-    R_Submit,
+    R_Submit, R_Call,
 };
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
 
 // ---- consumer
 
-static void exec_packet(uint32_t op, void *p);
+static void exec_cb(VkCommandBuffer cb, uint32_t op, void *p);
+
+// Publishes how far the recorder got. The driver may write command buffers through a write-combined mapping (RADV
+// does, and AMD's Windows driver is the other place the recorder lost the device), and on x86 a release store does not
+// wait for write-combined stores: the producer could see tail, end and submit the part while its last commands are
+// still in the CPU's write-combining buffers. SFENCE drains them first; on ARM64 the release store already orders them.
+// Lead from mkw-recomp de006fc (vk_rec.c publish_tail), reported in #204.
+static inline void publish_tail(uint64_t t) {
+#if defined(__x86_64__) || defined(_M_X64)
+    __builtin_ia32_sfence();
+#endif
+    __atomic_store_n(&tail, t, __ATOMIC_RELEASE);
+}
 
 static void rec_main(void *arg) {
     (void)arg;
@@ -73,11 +85,11 @@ static void rec_main(void *arg) {
         for (int k = 0; t != h; k++) {
             uint64_t w = ring[t % RING_WORDS];
             uint32_t op = (uint32_t)(w & 0xffff), n = (uint32_t)(w >> 32);
-            if (op != R_PAD) exec_packet(op, &ring[t % RING_WORDS + 1]);
+            if (op != R_PAD) exec_cb(__atomic_load_n(&rec_cb, __ATOMIC_RELAXED), op, &ring[t % RING_WORDS + 1]);
             t += n;
-            if ((k & 63) == 63) __atomic_store_n(&tail, t, __ATOMIC_RELEASE);
+            if ((k & 63) == 63) publish_tail(t);
         }
-        __atomic_store_n(&tail, t, __ATOMIC_RELEASE);
+        publish_tail(t);
     }
     return;
 }
@@ -104,8 +116,57 @@ static void wait_space(uint64_t need) {
 }
 
 // Room for a packet of bytes of arguments; the caller fills it and calls pub().
+// ---- capture (vk_exec.c: the end of a sliced pass whose slices are still being recorded)
+// Between rec_capture_begin and rec_capture_end the packets of the part being recorded go to cap instead of the ring,
+// after the ones captured before, and rec_capture_play makes the words [lo, hi) later into a command buffer on the
+// calling thread, while the recorder is idle; rec_capture_reset empties cap once nothing captured is held. The packets'
+// pointers point into cap itself, which never moves. A call without a packet (FALLBACK) cannot be held back, nor a
+// packet that no longer fits: the capture spills (spill_fn, vk_exec.c par_spill), which makes what it held into the part
+// at once and ends the capture, and the call goes on as without one.
+#define CAP_WORDS (1u << 15)
+static uint64_t cap[CAP_WORDS];
+static uint64_t cap_n;
+static int capturing;
+static void (*spill_fn)(void);
+
+void rec_capture_spill(void (*fn)(void)) { spill_fn = fn; }
+int rec_capture_room(uint32_t words) { return cap_n + words <= CAP_WORDS; }
+
+static void spill(void) {
+    if (!spill_fn) rt_fatal("vk_rec: a held-back pass end cannot be captured and nothing can spill it");
+    spill_fn();   // it ends the capture (rec_capture_end)
+    if (capturing) rt_fatal("vk_rec: a spilled pass end is still captured");
+}
+
+uint32_t rec_capture_begin(void) {
+    capturing = 1;
+    return (uint32_t)cap_n;
+}
+uint32_t rec_capture_end(void) {
+    capturing = 0;
+    return (uint32_t)cap_n;
+}
+void rec_capture_reset(void) { cap_n = 0; }
+
+void rec_capture_play(VkCommandBuffer cb, uint32_t lo, uint32_t hi) {
+    for (uint64_t t = lo; t < hi;) {
+        uint32_t op = (uint32_t)(cap[t] & 0xffff), n = (uint32_t)(cap[t] >> 32);
+        exec_cb(cb, op, &cap[t + 1]);
+        t += n;
+    }
+}
+
+int rec_owns(VkCommandBuffer cb) { return rec_live && cb == rec_cb; }
+
 static void *put(uint32_t op, size_t bytes) {
     uint64_t n = 1 + (bytes + 7) / 8, pos = put_h % RING_WORDS;
+    if (capturing && cap_n + n > CAP_WORDS) spill();
+    if (capturing) {
+        cap[cap_n] = (uint64_t)op | n << 32;
+        cap_n += n;
+        RS_.packets++, RS_.words += n;
+        return &cap[cap_n - n + 1];
+    }
     if (n > RING_WORDS / 4) rt_fatal("vk_rec: a packet of %llu bytes", (unsigned long long)bytes);
     if (pos + n > RING_WORDS) {
         uint64_t pad = RING_WORDS - pos;
@@ -121,6 +182,7 @@ static void *put(uint32_t op, size_t bytes) {
 }
 
 static void pub(void) {
+    if (capturing) return;
     if (rec_batch) {
         if (++unpub < rec_batch) return;
         unpub = 0;
@@ -217,6 +279,22 @@ int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n) {
 // fence wait is waiting for. Queue order is as before: the packet follows the part's last call, the end of every later
 // part and of the submission drains the ring first (rec_end_cb, rec_end), and an upload batch waits for a submit in
 // flight (rec_submit_wait). 0, the default: the replaying thread submits every part; ab: switches with the A/B blocks.
+// The recorder calls fn(arg) after every call queued before it (1); 0 without a recorder thread or during a capture,
+// when the caller calls it. vk_sync.c vk_sync_split_finish ends a held part with it, on the thread that recorded it.
+typedef struct { void (*fn)(void *); void *arg; } A_Call;
+int rec_call(void (*fn)(void *), void *arg) {
+    if (!rec_thread) return 0;
+    // A captured packet runs when the capture is replayed, after the caller has gone on; vk_sync_split_finish, the
+    // one caller, runs between captures, so a call here while capturing is a bug, not something to make in place.
+    if (capturing) rt_fatal("vk_rec: rec_call inside a capture");
+    A_Call *a = put(R_Call, sizeof *a);
+    *a = (A_Call){fn, arg};
+    unpub = 0;
+    __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
+    wake();
+    return 1;
+}
+
 typedef struct { VkCommandBuffer pro, cb; uint64_t fence; } A_Submit;
 static volatile uint64_t sub_put, sub_done;   // part submits queued by the producer, made by the recorder
 
@@ -293,7 +371,7 @@ void rec_stats_log(void) {
 // reading them while the producer moves to another part is not a data race.
 #define OWNED(cb) (__atomic_load_n(&rec_live, __ATOMIC_RELAXED) && (cb) == __atomic_load_n(&rec_cb, __ATOMIC_RELAXED))
 // A call the ring takes no packet for: everything queued first, then the call here.
-#define FALLBACK() (rec_drain(), RS_.fallbacks++)
+#define FALLBACK() (capturing ? spill() : (void)0, rec_drain(), RS_.fallbacks++)
 
 // Copies n elements of arr after the fixed part at *at and returns where they went (NULL for none).
 static void *tail_copy(uint8_t **at, const void *arr, size_t bytes) {
@@ -679,8 +757,7 @@ TARGET_CMD(rec_write_mask, R_WriteMask, PFN_vkCmdSetColorWriteMaskEXT, VkColorCo
 
 // ---- the recorder's side
 
-static void exec_packet(uint32_t op, void *p) {
-    VkCommandBuffer cb = __atomic_load_n(&rec_cb, __ATOMIC_RELAXED);
+static void exec_cb(VkCommandBuffer cb, uint32_t op, void *p) {
     switch (op) {
 #define F(name, ...) case R_##name: { A_##name *a = p; vkCmd##name(cb, __VA_ARGS__); break; }
     F(BeginQuery, a->p, a->q, a->f)
@@ -753,6 +830,7 @@ static void exec_packet(uint32_t op, void *p) {
     case R_Checkpoint: { A_Checkpoint *a = p; vk_checkpoint(cb, a->marker); break; }
     case R_Crumb: { A_Crumb *a = p; vk_crumb(cb, a->kind, a->n); break; }
     case R_BeginCb: begin_cb(cb, p); break;
+    case R_Call: { A_Call *a = p; a->fn(a->arg); break; }
     case R_EndCb: {
         A_EndCb *a = p;
         if (a->kind) vk_crumb(cb, a->kind, a->n);

@@ -404,7 +404,7 @@ class App:
 
     def pick_file(self, name, pick_id):
         if self.game == 'bananza' and name == 'nup':
-            types = [(self.cat('dkb.ui.type_nup'), '*.nup'), (self.cat('ui.type_all'), '*.*')]
+            types = [(self.cat('dkb.ui.type_nup'), '*.nup *.nx'), (self.cat('ui.type_all'), '*.*')]
             path = filedialog.askopenfilename(title=self.cat(pick_id), filetypes=types)
             if path:
                 self.vars[name].set(os.path.normpath(path))

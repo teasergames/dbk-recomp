@@ -471,6 +471,7 @@ uint64_t plat_counter_hz(void) { return 1000000000u; }
 // The timer slack (50 us by default) is how late the kernel may wake a sleeping thread to batch wakeups. New threads
 // inherit it from the thread that creates them.
 void plat_timer_1ms(void) { prctl(PR_SET_TIMERSLACK, 1000ul, 0, 0, 0); }
+void plat_console_hide(void) {}
 
 // clock_nanosleep wakes within the timer slack (50 us by default) of its deadline; the last PLAT_SPIN_NS are spent
 // yielding so the deadline is met closely, as on Windows.
@@ -985,6 +986,8 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_hook = fn;
     fault_install();
 }
+
+const char *plat_crash_dump(void) { return NULL; }
 
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;

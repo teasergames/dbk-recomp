@@ -50,6 +50,11 @@ enum { PERF_CNT_PIPE_ASYNC, PERF_CNT_PIPE_SKIP, PERF_CNT_TEX_UP, PERF_CNT_TEX_RE
        PERF_CNT_PIPE_WAIT, PERF_CNT_ONESHOT_WAIT, PERF_CNT_PIPE_BUILT, PERF_CNT_TEX_NEW, PERF_CNT_TEX_ALIAS,
        PERF_CNT_WB, PERF_CNT_WB_SKIP, PERF_CNT_N };
 void perf_count(int kind);
+// TOTK_TRACE=perf: a contended acquire of one of the replay's shared locks waited ns (callers time only after a failed
+// try). The perf line counts the waits over 100 us per lock and the longest: slices of parallel passes stalled for
+// milliseconds now and then, and a lock held by another thread is one cause.
+enum { PERF_LOCK_TEXTURE, PERF_LOCK_POOL, PERF_LOCK_MIRROR, PERF_LOCK_N };
+void perf_lock_wait(int lock, uint64_t ns);
 void perf_present(uint64_t frame);
 void perf_summary_flush(void);                  // prints the frame-time summary of the running period (exit); the 60 s lines come from perf_present
 void gfx_exit_log(void);                        // back end's lines for the exit summary (weak no-op in prof_win.c)
@@ -281,8 +286,11 @@ uint64_t res_heap_extra_kib(void);                         // added to the HeapD
 int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n);   // the HeapDef table (.byml.zs) with
                                                            // the grown heaps, malloc'd; 0 = cannot (logged)
 void res_heapdef_served(void);                             // romfs.c serves the grown table
+int res_heapdef_grown(void);                               // 1 once romfs.c serves it
+const char *res_heapdef_path(void);                        // the game's HeapDef table in the RomFS
 void res_init(void);                                       // after rt_patches_init: the patch page and the sets
 void dkb_wide_init(void);                                  // Bananza-only virtual display and camera patch values
+uint64_t dkb_wide_heap_extra_kib(void);                    // Bananza: what the render-target pool needs added to GSys
 int dkb_wide_output(unsigned out[2]);                      // active mode; optional output gets its size or the stock size
 int res_sizes(unsigned out[2], unsigned scene[2]);         // the output and scene sizes in effect (the game's own
                                                            // until res_init switched the sets on). Bananza: the game's

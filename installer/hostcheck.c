@@ -43,8 +43,16 @@ static int x86_64_v3(void) {
     return (c & (1u << 5)) != 0;   // LZCNT (ABM)
 }
 
+// The x86-64-v2 level: SSSE3, SSE4.1, SSE4.2, POPCNT and CMPXCHG16B (what -march=x86-64-v2 code may use).
+static int x86_64_v2(void) {
+    unsigned a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d)) return 0;
+    const unsigned need = (1u << 0) | (1u << 9) | (1u << 13) | (1u << 19) | (1u << 20) | (1u << 23);   // SSE3 SSSE3 CX16 SSE4.1 SSE4.2 POPCNT
+    return (c & need) == need;
+}
+
 int main(void) {
-    printf("{\"x86_64_v3\": %s, ", x86_64_v3() ? "true" : "false");
+    printf("{\"x86_64_v3\": %s, \"x86_64_v2\": %s, ", x86_64_v3() ? "true" : "false", x86_64_v2() ? "true" : "false");
 #ifdef _WIN32
     // The commit limit (RAM plus page file): what all processes together can commit before allocations fail.
     MEMORYSTATUSEX mem = {.dwLength = sizeof mem};

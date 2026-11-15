@@ -786,6 +786,60 @@ static void probe_menu_gate(void) {
     printf("menu gate: Minus alone passes, Minus+Plus is consumed and toggles once per hold, an open menu gives a neutral pad\n");
 }
 
+// ---- the selected physical gamepad's timed Start/Back gate (no wall-clock waits)
+static void probe_fullscreen_hold(void) {
+    const uint64_t minus = 1ull << 11, plus = 1ull << 10, a = 1ull;
+    InputHoldGate gate = {0};
+    uint64_t b = 0;
+    input_hold_gate(&gate, 1, 0, &b);   // connected and initially neutral
+    b = minus | a;
+    CHECK(!input_hold_gate(&gate, 1, 1, &b) && b == (minus | a), "Select alone must pass");
+    b = plus;
+    CHECK(!input_hold_gate(&gate, 1, 2, &b) && b == plus, "Start alone must pass");
+    b = minus | plus | a;
+    CHECK(!input_hold_gate(&gate, 1, 10, &b) && b == a, "a fresh chord is consumed without immediately toggling");
+    b = minus | plus;
+    CHECK(!input_hold_gate(&gate, 1, 500000009, &b) && !b, "499999999 ns is too short");
+    b = minus | plus;
+    CHECK(input_hold_gate(&gate, 1, 500000010, &b) == 1 && !b, "500000000 ns toggles once");
+    b = minus | plus;
+    CHECK(!input_hold_gate(&gate, 1, 9000000000ull, &b) && !b, "continued hold must not repeat");
+    b = minus;
+    CHECK(!input_hold_gate(&gate, 1, 9100000000ull, &b) && !b, "partial release must not leak Select");
+    b = minus | plus;
+    CHECK(!input_hold_gate(&gate, 1, 10000000000ull, &b), "partial release must not rearm the chord");
+    b = 0;
+    input_hold_gate(&gate, 1, 11000000000ull, &b);
+    b = plus;
+    CHECK(!input_hold_gate(&gate, 1, 11000000001ull, &b) && b == plus, "Start works after full release");
+    b = minus | plus;
+    input_hold_gate(&gate, 1, 12000000000ull, &b);
+    b = minus;   // interrupted before the threshold; repress must get a fresh full half-second
+    input_hold_gate(&gate, 1, 12200000000ull, &b);
+    b = minus | plus;
+    CHECK(!input_hold_gate(&gate, 1, 12400000000ull, &b), "interrupted hold restarts its timer");
+    b = minus | plus;
+    CHECK(!input_hold_gate(&gate, 1, 12899999999ull, &b), "restarted hold is not due at 499999999 ns");
+    b = minus | plus;
+    CHECK(input_hold_gate(&gate, 1, 12900000000ull, &b) == 1, "restarted hold becomes due at 500 ms");
+    // Switching to another pad, even one already holding both, requires a release on that device.
+    b = minus | plus;
+    CHECK(!input_hold_gate(&gate, 2, 14000000000ull, &b) && !b, "device switch cannot inherit a hold");
+    b = minus | plus;
+    CHECK(!input_hold_gate(&gate, 2, 15000000000ull, &b), "new device already holding chord must release first");
+    b = 0;
+    input_hold_gate(&gate, 2, 16000000000ull, &b);
+    b = minus | plus;
+    input_hold_gate(&gate, 2, 17000000000ull, &b);
+    b = minus | plus;
+    CHECK(input_hold_gate(&gate, 2, 17500000000ull, &b) == 1, "new device rearms after full release");
+    b = 0;
+    input_hold_gate(&gate, 0, 18000000000ull, &b);
+    b = minus | plus;
+    CHECK(!input_hold_gate(&gate, 3, 19000000000ull, &b), "reconnection does not revive an old hold");
+    printf("fullscreen hold: exact 500 ms threshold, single activation, full release, interrupted hold, device switch and reconnect passed\n");
+}
+
 // ---- shared fonts: the extracted files when present (the missing case is a fatal child)
 static void probe_fonts(void) {
     char dir[PLAT_PATH_MAX], path[PLAT_PATH_MAX + 32];
@@ -860,6 +914,7 @@ static void probe_main(Cpu *c) {
     probe_swkbd();
     probe_menu_text();
     probe_menu_gate();
+    probe_fullscreen_hold();
     probe_fonts();
 }
 

@@ -18,6 +18,7 @@
 
 #include "cfg.h"
 #include "gfx.h"
+#include "gfx_spirv.h"
 #include "host.h"
 #include "vk.h"
 
@@ -41,6 +42,7 @@ void vk_caps_driver(VkPhysicalDevice p) {
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
     vkGetPhysicalDeviceProperties2(p, &p2);
     vk_caps.amd = p2.properties.vendorID == 0x1002;
+    vk_caps.intel = p2.properties.vendorID == 0x8086;
     // AMD split RDNA 1 and 2 off into a driver branch of their own; its driverInfo reads
     // "26.10.1 (AMD proprietary shader compiler)" where the RDNA 3 and 4 driver names LLPC.
     vk_caps.amd_sc = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && strstr(drv.driverInfo, "shader compiler");
@@ -117,6 +119,7 @@ void vk_caps_init(VkCtx *c) {
     gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather);
     uint32_t geometry_told = vk_caps.sg_pin_stages & VK_SHADER_STAGE_GEOMETRY_BIT ? want : sg.subgroupSize;
     gfx_shader_set_geometry_host(geometry_told);
+    gfx_spirv_set_lq_fold_platform(c->props.vendorID == 0x10de);   // the light-quad fold is for NVIDIA (gfx_spirv.c)
     if (gather) rt_log("vk caps: gather coordinates biased for %u sub-texel bits (TOTK_GATHER_BIAS)", gather);
 
     char dv[32];

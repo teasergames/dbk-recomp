@@ -717,14 +717,19 @@ static void row_window_mode(void) {
 
 static void rows_render_options(const MenuTarget &target) {
     if (rt_game_version) row_render_scale();
-    static const UiTextId up[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR};
+    else if (rt_patch_set("dkbscene") >= 0) {
+        static const UiTextId scene[] = {UI_MENU_SCENE_RES_AUTO, UI_MENU_SCENE_RES_FULL};
+        opt_choice("TOTK_SCENE_RES", UI_MENU_SCENE_RES, scene, 2, UI_MENU_SCENE_RES_DESC);
+    }
+    // DLSS (runtime/vk_dlss.c) takes effect at the next start: NGX adds its Vulkan extensions when the device is made.
+    static const UiTextId up[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR, UI_MENU_UPSCALER_DLSS};
     int fitted[4];
     gfx_fit_rect(target.image_w, target.image_h, target.width, target.height, fitted);
     bool no_upscale = target.image_w > 0 && target.image_h > 0 &&
                       fitted[2] <= target.image_w && fitted[3] <= target.image_h;
     // DLSS can run inside the game's renderer, even if the final image fits the display.
     if (no_upscale && strcmp(cfg_value("TOTK_UPSCALER"), "dlss")) opt_disable_next(UI_MENU_NO_UPSCALING);
-    opt_choice("TOTK_UPSCALER", UI_MENU_UPSCALER, up, 2, UI_MENU_UPSCALER_DESC);
+    opt_choice("TOTK_UPSCALER", UI_MENU_UPSCALER, up, 3, UI_MENU_UPSCALER_DESC);
     if (no_upscale) opt_disable_next(UI_MENU_NO_UPSCALING);
     else if (!strcmp(cfg_value("TOTK_UPSCALER"), "bilinear")) opt_disable_next(UI_MENU_SHARPNESS_NEEDS_FSR);
     opt_slider("TOTK_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
@@ -829,7 +834,70 @@ static const char *pad_layout_note(void) {
     return note;
 }
 
+// Hide session IDs from players; only duplicate names need a short ordinal.
+static void controller_display_name(const char *name, char *out, size_t size) {
+    snprintf(out, size, "%s", name);
+    char *suffix = strrchr(out, '(');
+    if (suffix && suffix > out && (!strncmp(suffix, "(#", 2) || !strncmp(suffix, "(ID ", 4)))
+        suffix[-1] = 0;
+}
+
+static void row_controller_device(void) {
+    static InputPadDevice *devices;
+    static int count;
+    static uint64_t next;
+    uint64_t now = plat_now_ns();
+    if (!next || now >= next) {
+        free(devices);
+        count = input_pad_devices(&devices);
+        next = now + 1000000000ull;
+    }
+    // Extra slot for a saved, temporarily disconnected preference.
+    const char **values = (const char **)malloc((size_t)(count + 2) * sizeof(char *));
+    const char **names = (const char **)malloc((size_t)(count + 2) * sizeof(char *));
+    char (*display)[256] = (char (*)[256])calloc((size_t)(count + 1), 256);
+    if (!values || !names || !display) { free(values); free(names); free(display); return; }
+    values[0] = "auto"; names[0] = "Auto";
+    const char *preferred = cfg_value("TOTK_PAD_DEVICE");
+    int found = !strcmp(preferred, "auto");
+    for (int i = 0; i < count; i++) {
+        controller_display_name(devices[i].name, display[i], sizeof display[i]);
+        int duplicates = 0, ordinal = 0;
+        for (int j = 0; j < count; j++) {
+            char other[256];
+            controller_display_name(devices[j].name, other, sizeof other);
+            if (!strcmp(other, display[i])) { duplicates++; if (j <= i) ordinal++; }
+        }
+        if (duplicates > 1) {
+            size_t used = strlen(display[i]);
+            snprintf(display[i] + used, sizeof display[i] - used, " (%d)", ordinal);
+        }
+        values[i + 1] = devices[i].key; names[i + 1] = display[i];
+        if (!strcmp(preferred, devices[i].key)) found = 1;
+    }
+    int n = count + 1;
+    if (!found) { values[n] = preferred; names[n++] = menu_text(UI_MENU_PAD_SAVED); }
+    InputPadInfo info;
+    int connected = input_pad_info(&info);
+    int cur = 0;
+    if (input_pad_automatic()) {
+        if (connected) {
+            snprintf(display[count], sizeof display[count], "Auto: %.240s", info.name);
+            names[0] = display[count];
+        }
+    } else if (connected) {
+        for (int i = 0; i < count; i++) if (devices[i].id == info.id) cur = i + 1;
+    }
+    const char *status = menu_text(connected ? UI_MENU_PAD_CONNECTED : UI_MENU_PAD_NONE);
+    char detail[320];
+    snprintf(detail, sizeof detail, "%s%s%s", status, connected ? ": " : "", connected ? info.name : "");
+    if (opt_choice_list("TOTK_PAD_DEVICE", UI_MENU_PAD_DEVICE, values, names, n, UI_MENU_PAD_DEVICE_DESC, cur, status, detail))
+        input_pad_selection_changed();
+    free(values); free(names); free(display);
+}
+
 static void rows_controller(void) {
+    row_controller_device();
     static const UiTextId layout[] = {UI_MENU_PAD_LAYOUT_AUTO, UI_MENU_PAD_LAYOUT_NINTENDO, UI_MENU_PAD_LAYOUT_XBOX,
                                       UI_MENU_PAD_LAYOUT_XBOX_PROMPTS};
     opt_choice("TOTK_PAD_LAYOUT", UI_MENU_PAD_LAYOUT, layout, 4, UI_MENU_PAD_LAYOUT_DESC, pad_layout_note());
@@ -838,6 +906,7 @@ static void rows_controller(void) {
     opt_slider("TOTK_RUMBLE_CURVE", UI_MENU_RUMBLE_CURVE, 0.2f, 1.5f, UI_MENU_RUMBLE_CURVE_DESC, 0.05f, "%.2f");
     opt_toggle("TOTK_RUMBLE_TRIGGERS", UI_MENU_RUMBLE_TRIGGERS, UI_MENU_RUMBLE_TRIGGERS_DESC);
     opt_slider("TOTK_STICK_DEADZONE", UI_MENU_STICK_DEADZONE, 0, 50, UI_MENU_STICK_DEADZONE_DESC, 1, "%.0f %%");
+    opt_toggle("TOTK_PAD_FULLSCREEN_HOLD", UI_MENU_PAD_FULLSCREEN_HOLD, UI_MENU_PAD_FULLSCREEN_HOLD_DESC);
 }
 
 static void tab_controls(float scale) {
@@ -937,11 +1006,12 @@ static void tab_advanced(float scale) {
     opt_choice("TOTK_ASYNC_PREEMPT", UI_MENU_ASYNC_PREEMPT, preempt, 3, UI_MENU_ASYNC_PREEMPT_DESC);
     opt_toggle("TOTK_REPLAY_ASYNC", UI_MENU_REPLAY_ASYNC, UI_MENU_REPLAY_ASYNC_DESC);
     {
-        static const char *const vals[] = {"0", "2", "4", "5", "6", "8", "12", "16"};
+        static const char *const vals[] = {"", "0", "2", "4", "5", "6", "8", "12", "16"};   // "": vk_exec.c par_threads picks
         enum { N = sizeof vals / sizeof *vals };
         const char *names[N];
-        names[0] = menu_text(UI_MENU_OFF);
-        for (int i = 1; i < N; i++) names[i] = vals[i];
+        names[0] = menu_text(UI_MENU_AUTO);
+        names[1] = menu_text(UI_MENU_OFF);
+        for (int i = 2; i < N; i++) names[i] = vals[i];
         opt_choice_list("TOTK_REPLAY_THREADS", UI_MENU_REPLAY_THREADS, vals, names, N, UI_MENU_REPLAY_THREADS_DESC);
     }
     opt_toggle("TOTK_TIMER_1MS", UI_MENU_TIMER_1MS, UI_MENU_TIMER_1MS_DESC);

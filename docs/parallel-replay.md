@@ -1,6 +1,11 @@
 # Recording the replay on several threads
 
-Status: plan, stage 1 done (measurements and descriptor pools). Branch `claude/parallel-replay`.
+Status: in bananza since pull request 195 (`TOTK_REPLAY_THREADS`; by default 4 threads from 8 logical processors since 13 November, and 6 from 12 since pull request 271, except on
+AMD): big passes are recorded in slices by up to 16 threads, each with a draw context of its own (pull request 190).
+The 6-thread default was measured on 16 logical processors only (a Ryzen 7 9800X3D); machines with 12 to 15, and
+Intel chips with performance and efficiency cores, were not measured, and there 6 threads leave fewer processors to
+the game's own threads. The sections below follow the work in the
+order it was done; the plan at the end is the first one and is kept for the record.
 
 ## Why
 
@@ -346,3 +351,76 @@ submission, the game's threads waiting 4.9 ms a frame on fences, GPU 10.5 ms); n
 
 Each stage is a commit that keeps the game working; stage 3 onward is checked in game on the RX 9070 XT before the
 next starts.
+
+### DLSS (after pull request 195)
+
+With `upscaler = dlss`, `par_start` refused every pass, because `vk_dlss.c` notes the scene's depth and camera at the
+first scene draw of a pass, on the replaying thread. With `TOTK_REPLAY_THREADS` set the helpers took no run either,
+so a DLSS player got neither: Zorkats measured 11.6-12.5 fps with eight threads against 14.5 off and 23.5-24.5 with
+the helpers (RTX 3060 Ti, Hilltop). The collection now notes the scene itself (`par_take`, from `X` with the draw's
+targets and binds, in draw order), the slices skip that note, and the jitter they read sets `J.used` atomically. The
+log names the remaining refusals (an armed dump, a pass that did not open again) instead of "not refused".
+
+### Where eight threads wait on the per-thread draw contexts (b0da3d7)
+
+`DKB_REPLAY_THREADS=8`, the hills, standing still. `DKB_DRAW_PROFILE` now logs the slices' contexts apart from the
+replay thread's: a sliced draw took about 2,000 ns against about 700 on one thread, and every section grew, most of all
+the pipeline lookup (230-390 ns against 45), the sets (330 against 55), the storage buffers (230 against 38) and the
+textures (180 against 12). A `TOTK_PROFILE_CHAINS` profile of the same build put 21% of the samples under `par_record`
+in waits for the texture lock, almost all in `vk_texture_slot_token`: Bananza registers descriptors all through a frame,
+`vk_texture_slots_gen` moves about 160 times a frame, and after every move each thread read the token of every slot
+it checked again under the lock (`slot_still` from `feedback_scan` and the texture memo). Another 7% waited for
+`mirror_lock` in `vk_mem_gpu_wrote`; the driver's push descriptors and draws took about 10%.
+
+- A descriptor slot now has a generation of its own (`vk_texture.c` `rgen`, hashed by the slot's address), bumped
+  before the slot is registered again and when it is retired. A token read under the lock comes with a stamp, and
+  `vk_texture_slot_token_again` gives the token again without the lock while the slot's generation stays (its address
+  generation is read anew).
+- A thread recording slices adds its write-back ranges to a list of its own, which `vk_mem_mirror_end` moves into the
+  submission's list.
+
+With both (f3fdcde, the hills, standing still, `TOTK_TRACE=perf` 60-frame windows of 27,800 to 28,800 draws, one launch
+each): eight threads 41.9 fps median (41.2-43.8 quartiles) against 40.9 (40.2-41.5) at 4b25f1f, a sliced draw on a
+worker 1.85 us against 2.03, replay 14.8 ms against 15.4. Six threads did better than eight on this 8-core, 16-thread
+CPU: 44.9 fps, 1.43 us a sliced draw; with `TOTK_DYN_UBO=1`, six threads gave 46.0 fps, five 44.7 and eight 44.4.
+`TOTK_ONE_PER_CORE=1` gave 26 fps: it leaves the process eight logical processors for the game and the slices.
+
+### The pipeline step of a sliced draw (3.2.0, RTX 5090)
+
+Lake Level on 3.2.0 (RTX 5090, Ryzen 7 9800X3D, 3840x2160 DLSS Quality), a recorded route replayed with
+`TOTK_INPUT_SCRIPT` and `TOTK_FIXED_STEP=1`, about 7,000-7,900 draws a frame. `TOTK_CRIT` put the frame's critical
+path in the submitting thread's replay (6.3 of 10.7 ms) and in the main thread's `nvnSyncWait` for it (2.9 ms); the
+game's own code on the path was 0.8 ms, and generated code at -O2 changed nothing measurable. `DKB_DRAW_PROFILE` of the
+slices grew with the thread count, most of all in the pipeline section (`draw_impl` from `geometry_feedback_safe` to
+the pipeline lookup): 134 ns a sliced draw with two threads, 259 with four, 500 with six, a sliced draw 1083, 1446 and
+1944 ns. Every slice thread took two global locks there for each draw: the texture lock in `twin_prepare`, and
+`vk_pipeline.c`'s lock for the lookup whenever the state differed from the previous draw, which it did at the first
+draw of every slice. `twin_prepare` now answers the textures that need no twin from a per-context entry keyed by the
+slot token, and the pipeline memo keeps recent pipelines by shader pair as well as the last one. Pipeline section:
+158 ns with four threads, 221 with six; a sliced draw 1370 and 1647 ns. Replay per draw over three alternating runs of
+each: 0.81-0.83 us against 0.84-0.92; the frame rate stayed within the route's run-to-run spread.
+
+### Stalls in slices: the texture lock across a guest read's GPU wait
+
+With six threads in the hills (RX 9070 XT), the pass ends waited for the workers about 1.2 ms a frame, mostly in about
+two waits a frame of 0.5 to 3 ms, and about 500 slices a minute took over 1 ms, the longest about 3 ms for a few hundred
+draws. Smaller slices (a cap of 128 to 256 draws, a smaller minimum, a smaller share per thread) and more spare
+descriptor pools (none was created in the frame once the perf line counted the slice threads' pools) changed nothing.
+
+Timing the contended acquires of the shared locks (`perf_lock_wait`, always on with `TOTK_TRACE=perf`) put the waits on
+the texture lock: about 117 waits over 100 us every 60 frames, about 200 ms of thread time, up to 4.4 ms. Timing the
+holds by caller (`TOTK_LOCK_HOLDS=1`) found one holder: `vk_be_guest_read` through `vk_texture_write_back`, about 1.4
+times a frame for 1.2 ms on average and up to 4.5 ms, against a few hundred long holds in all for every other caller. A
+game thread's read of GPU-written texture storage read each texture back with `vk_upload_flush(1)`, waiting under the
+lock for every GPU job queued so far. Queuing the copies under the lock, waiting for the GPU without it and writing
+the storage under it again (as #259 now does, `TOTK_WB_UNLOCKED`) took the texture lock waits from 130 to 19 per 60
+frames in a build of ours, the longest wait at a pass end from 3.3 ms to 0.4 ms and the longest slice from 4.3 to
+1.8 ms; the frame rate stayed the same (43.9 fps both, same session), since the stalled workers mostly overlapped the
+submitting thread's own collection and slices.
+
+The uniform snapshot spent 0.38 ms a submission sorting the GPU write ranges of the submissions in flight (about 7,400
+new ones a submission); `wr_prune` now sorts only those added since the last prune and merges them in (0.24 ms,
+`tests/usnap_prune_test.py`). The vk_usnap summary times its steps.
+
+The GPU time of the same spot moved between sessions (11.0 to 13.1 ms with the same build), so builds are compared in
+one session only.

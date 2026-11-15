@@ -103,7 +103,11 @@ FITS(win_t, NVNwindow);
 
 // Command records live in host memory; finished copies are owned by guest control memory.
 typedef struct {
-    uint32_t magic, recording;
+    uint32_t magic;
+    // recording: between Begin and EndRecording. seg_tok: owner token of seg, SEG_TOK(o) for the object that owns it. A
+    // copied cmd_t keeps the original's token, so it fails the test. 31 bits of the address (8-byte aligned objects), so
+    // two objects 16 GiB apart would alias; the game's command buffers sit in one heap.
+    uint32_t recording:1, seg_tok:31;
     uint8_t *cur;
     uint64_t guest_flags;                // +0x10: NVN 55 inline code writes the dirty flag here
     uint8_t *end;

@@ -19,6 +19,7 @@ PROC(nvnCommandBufferFinalize);
 PROC(nvnCommandBufferAddCommandMemory);
 PROC(nvnCommandBufferAddControlMemory);
 PROC(nvnCommandBufferBeginRecording);
+PROC(nvnCommandBufferSetScissor);
 PROC(nvnCommandBufferEndRecording);
 PROC(nvnCommandBufferPushGraphicsConstants);
 PROC(nvnCommandBufferPushComputeConstants);
@@ -190,7 +191,69 @@ static void bounds(int compute) {
     source_free(pages);
 }
 
+// A recording of count scissors, each with a distinct x; checks every record of the copy.
+static void record_scissors(NVNcommandBuffer *cmd, int count, uint64_t *handle) {
+    CALL(nvnCommandBufferBeginRecording, U(cmd));
+    for (int i = 0; i < count; i++) CALL(nvnCommandBufferSetScissor, U(cmd), (uint64_t)i, 1, 2, 3);
+    *handle = CALL(nvnCommandBufferEndRecording, U(cmd));
+}
+static int scissors_ok(uint64_t handle, int count) {
+    int i = 0;
+    for (const op_hdr *h = nvn_op_next(nvn_op_first(handle)); h->op != OP_END; h = nvn_op_next(h)) {
+        const p_scissor *s = nvn_op_payload(h);
+        if (h->op != OP_SCISSOR || s->x != i || s->y != 1 || s->w != 2 || s->h != 3) return 0;
+        i++;
+    }
+    return i == count;
+}
+
+// Large recordings are handed over as the copy; two of them on one buffer, and a small one after, must all read back.
+static void large_recordings(void) {
+    NVNcommandBuffer cmd = {0};
+    _Alignas(16) uint8_t control[0x4000];
+    uint64_t big1, big2, mid, small;
+    CALL(nvnCommandBufferInitialize, U(&cmd), 0);
+    CALL(nvnCommandBufferAddCommandMemory, U(&cmd), 0, 0, 0x10000);
+    CALL(nvnCommandBufferAddControlMemory, U(&cmd), U(control), sizeof control);
+    record_scissors(&cmd, 4400, &big1);     // about 103 KiB: the buffer grows to 128 KiB and is handed over
+    record_scissors(&cmd, 4400, &big2);
+    record_scissors(&cmd, 1700, &mid);      // about 41 KiB: past the handover size, another class than the buffer's
+    record_scissors(&cmd, 3, &small);       // after a large one: copied, the buffer stays with the command buffer
+    CHECK(big1 != big2 && big2 != small, "recordings get distinct copies");
+    CHECK(scissors_ok(big1, 4400), "first large recording survives the second");
+    CHECK(scissors_ok(big2, 4400), "second large recording reads back");
+    CHECK(scissors_ok(mid, 1700), "mid-size recording after a large one reads back");
+    CHECK(scissors_ok(small, 3), "small recording after a large one reads back");
+    CALL(nvnCommandBufferFinalize, U(&cmd));
+    CHECK(scissors_ok(big1, 4400) && scissors_ok(big2, 4400), "copies outlive the recorder");
+    CALL(nvnCommandBufferAddControlMemory, U(&cmd), U(control), sizeof control);
+}
+
+// A cmd_t copied mid-recording shares the buffer; once the owner has handed it over as a copy, the twin must not write
+// into it.
+static void twin_recording(void) {
+    NVNcommandBuffer cmd = {0}, twin;
+    _Alignas(16) uint8_t control[0x4000];
+    uint64_t h;
+    CALL(nvnCommandBufferInitialize, U(&cmd), 0);
+    CALL(nvnCommandBufferAddCommandMemory, U(&cmd), 0, 0, 0x10000);
+    CALL(nvnCommandBufferAddControlMemory, U(&cmd), U(control), sizeof control);
+    CALL(nvnCommandBufferBeginRecording, U(&cmd));
+    for (int i = 0; i < 2000; i++) CALL(nvnCommandBufferSetScissor, U(&cmd), (uint64_t)i, 1, 2, 3);
+    memcpy(&twin, &cmd, sizeof twin);
+    for (int i = 2000; i < 4400; i++) CALL(nvnCommandBufferSetScissor, U(&cmd), (uint64_t)i, 1, 2, 3);
+    h = CALL(nvnCommandBufferEndRecording, U(&cmd));
+    CALL(nvnCommandBufferSetScissor, U(&twin), 999999, 1, 2, 3);
+    CHECK(scissors_ok(h, 4400), "a copied command buffer does not write into a handed-over recording");
+    CALL(nvnCommandBufferFinalize, U(&twin));
+    CHECK(scissors_ok(h, 4400), "finalizing the twin does not free the handed-over recording");
+    CALL(nvnCommandBufferFinalize, U(&cmd));
+    CALL(nvnCommandBufferAddControlMemory, U(&cmd), U(control), sizeof control);
+}
+
 int main(void) {
+    large_recordings();
+    twin_recording();
     for (int compute = 0; compute <= 1; compute++) {
         deferred_snapshot(compute);
         bounds(compute);

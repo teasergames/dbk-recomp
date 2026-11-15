@@ -95,6 +95,7 @@ static int bigger(void) {
 }
 
 uint64_t res_heap_extra_kib(void) {
+    if (!rt_game_version) return dkb_wide_heap_extra_kib();   // Bananza: dkb_wide.c
     if (!bigger()) return 0;
     double grow = fmax(0.0, (double)R.ow * R.oh / (BASE_W * BASE_H) - 1.0) +
                   fmax(0.0, (double)R.sw * R.sh / (SCENE_W * SCENE_H) - 1.0);
@@ -143,6 +144,10 @@ static size_t heap_size_field(const Byml *b, uint32_t heaps, const char *heap) {
 
 int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n) {
     uint64_t extra = res_heap_extra_kib();
+    // TotK: agl's DynamicTextureAllocatorMem and its parent Graphics. Bananza: GSys, which holds the render-target pool
+    // (dkb_wide.c); its parent Stationed takes what is left (-1), and memory.c adds the amount to the application pool.
+    const char *tex_heap = rt_game_version ? "DynamicTextureAllocatorMem" : "GSys";
+    const char *parent_heap = rt_game_version ? "Graphics" : NULL;
     *out = NULL;
     if (!extra) return 0;
     if (ZSTD_getDictID_fromFrame(in, n)) {
@@ -163,21 +168,21 @@ int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n) {
     size_t heaps_at = 0, dta_at = 0, gfx_at = 0;
     if (ver >= 2 && ver <= 7 && !memcmp(b.p, "YB", 2) && u32_at(&b, 4, &b.keys) && u32_at(&b, 12, &root) &&
         (heaps_at = field(&b, root, "Heaps", 0xc1)) && u32_at(&b, heaps_at, &heaps)) {
-        dta_at = heap_size_field(&b, heaps, "DynamicTextureAllocatorMem");
-        gfx_at = heap_size_field(&b, heaps, "Graphics");
+        dta_at = heap_size_field(&b, heaps, tex_heap);
+        gfx_at = parent_heap ? heap_size_field(&b, heaps, parent_heap) : 0;
     }
-    if (!dta_at || !gfx_at) {
-        rt_log("resolution: the HeapDef table has no DynamicTextureAllocatorMem / Graphics sizes; the game keeps its own "
-               "resolution");
+    if (!dta_at || (parent_heap && !gfx_at)) {
+        rt_log("resolution: the HeapDef table has no %s%s%s size; the game keeps its own resolution", tex_heap,
+               parent_heap ? " / " : "", parent_heap ? parent_heap : "");
         free(b.p);
         return 0;
     }
-    int32_t dta, gfx;
+    int32_t dta, gfx = 0;
     memcpy(&dta, b.p + dta_at, 4);
-    memcpy(&gfx, b.p + gfx_at, 4);
+    if (gfx_at) memcpy(&gfx, b.p + gfx_at, 4);
     int32_t dta2 = dta + (int32_t)extra, gfx2 = gfx + (int32_t)extra;
     memcpy(b.p + dta_at, &dta2, 4);
-    memcpy(b.p + gfx_at, &gfx2, 4);
+    if (gfx_at) memcpy(b.p + gfx_at, &gfx2, 4);
     size_t cap = ZSTD_compressBound(b.n);
     void *z = malloc(cap);
     size_t zn = z ? ZSTD_compress(z, cap, b.p, b.n, 9) : 0;
@@ -188,11 +193,17 @@ int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n) {
     }
     *out = z;
     *out_n = zn;
-    rt_log("resolution: HeapDef DynamicTextureAllocatorMem %d -> %d KiB, Graphics %d -> %d KiB", dta, dta2, gfx, gfx2);
+    if (gfx_at) rt_log("resolution: HeapDef %s %d -> %d KiB, %s %d -> %d KiB", tex_heap, dta, dta2, parent_heap, gfx, gfx2);
+    else rt_log("resolution: HeapDef %s %d -> %d KiB", tex_heap, dta, dta2);
     return 1;
 }
 
 void res_heapdef_served(void) { R.heapdef_ok = 1; }
+int res_heapdef_grown(void) { return R.heapdef_ok; }
+const char *res_heapdef_path(void) {
+    return rt_game_version ? "System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs"
+                           : "System/HeapSize/Product.Nin_Ounce_NVN2.HeapDef.byml.zs";
+}
 
 // ---- start: the patch page and the sets
 static uint64_t pack(unsigned w, unsigned h) { return (uint64_t)h << 32 | w; }
