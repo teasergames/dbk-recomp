@@ -489,6 +489,68 @@ __asm__(".text\n"
         "    leaq 8(%rsp), %rsp\n"
         "    jmpq *-8(%rsp)\n"
         ".seh_endproc\n");
+#elif defined(__aarch64__) && !defined(__APPLE__)
+#error "kern_ap_stub: the AArch64 version is written for Mach-O (macOS symbol names, plat_intr_return)"
+#elif defined(__aarch64__)
+// The AArch64 version, macOS. Apple's arm64 ABI keeps a 128-byte red zone below sp (Clang puts the locals of leaf functions
+// there, and lifted functions are leaves), so the frame goes below it. The frame is a PlatIntrCtx: every general
+// register, sp, the interrupted pc, NZCV, FPCR, FPSR and all 32 SIMD registers at their full 128 bits. AArch64 has no
+// jump through memory and the interrupted code may have any register live, x30 included (a leaf keeps its return
+// address there), so the stub does not jump back itself: plat_intr_return has the OS load the whole frame.
+_Static_assert(offsetof(PlatIntrCtx, sp) == 248 && offsetof(PlatIntrCtx, pc) == 256 &&
+                   offsetof(PlatIntrCtx, nzcv) == 264 && offsetof(PlatIntrCtx, fpcr) == 272 &&
+                   offsetof(PlatIntrCtx, q) == 288 && sizeof(PlatIntrCtx) == 800,
+               "kern_ap_stub frame layout");
+__asm__(".text\n"
+        ".globl _kern_ap_stub\n"
+        ".p2align 4\n"
+        "_kern_ap_stub:\n"
+        "    sub sp, sp, #928\n"       // 128 red zone + 800 PlatIntrCtx
+        "    stp x0, x1, [sp, #0]\n"
+        "    stp x2, x3, [sp, #16]\n"
+        "    stp x4, x5, [sp, #32]\n"
+        "    stp x6, x7, [sp, #48]\n"
+        "    stp x8, x9, [sp, #64]\n"
+        "    stp x10, x11, [sp, #80]\n"
+        "    stp x12, x13, [sp, #96]\n"
+        "    stp x14, x15, [sp, #112]\n"
+        "    stp x16, x17, [sp, #128]\n"
+        "    stp x18, x19, [sp, #144]\n"
+        "    stp x20, x21, [sp, #160]\n"
+        "    stp x22, x23, [sp, #176]\n"
+        "    stp x24, x25, [sp, #192]\n"
+        "    stp x26, x27, [sp, #208]\n"
+        "    stp x28, x29, [sp, #224]\n"
+        "    str x30, [sp, #240]\n"
+        "    add x9, sp, #928\n"
+        "    str x9, [sp, #248]\n"     // the interrupted sp
+        "    mrs x9, nzcv\n"
+        "    str x9, [sp, #264]\n"
+        "    mrs x9, fpcr\n"
+        "    mrs x10, fpsr\n"
+        "    stp x9, x10, [sp, #272]\n"
+        "    stp q0, q1, [sp, #288]\n"
+        "    stp q2, q3, [sp, #320]\n"
+        "    stp q4, q5, [sp, #352]\n"
+        "    stp q6, q7, [sp, #384]\n"
+        "    stp q8, q9, [sp, #416]\n"
+        "    stp q10, q11, [sp, #448]\n"
+        "    stp q12, q13, [sp, #480]\n"
+        "    stp q14, q15, [sp, #512]\n"
+        "    stp q16, q17, [sp, #544]\n"
+        "    stp q18, q19, [sp, #576]\n"
+        "    stp q20, q21, [sp, #608]\n"
+        "    stp q22, q23, [sp, #640]\n"
+        "    stp q24, q25, [sp, #672]\n"
+        "    stp q26, q27, [sp, #704]\n"
+        "    stp q28, q29, [sp, #736]\n"
+        "    stp q30, q31, [sp, #768]\n"
+        "    bl _kern_ap_rip\n"
+        "    str x0, [sp, #256]\n"     // the interrupted pc
+        "    bl _kern_ap_yield\n"
+        "    mov x0, sp\n"
+        "    bl _plat_intr_return\n"
+        "    brk #0x1\n");
 #else
 // The System V version: rsi and rdi are volatile there too, and the interrupted code may keep data in the 128 bytes
 // below its stack pointer (the red zone), so the return slot and the saves go below that. Without a red zone in the
@@ -917,7 +979,13 @@ static void core_kick(void) {
         if (v < 0) continue;
         claimed |= 1 << v;
         RtThread *o = g_core_owner[v];
+        // A waiter that found no owner to interrupt sleeps without a timeout in core_take; it only calls ap_try again
+        // when woken. So a waiter whose target changes, or whose target is marked just now, is woken to interrupt it:
+        // otherwise an owner in game code with no SVC or indirect call (a long loop) keeps its core and the waiter
+        // sleeps for good.
+        int wake = g_ap_int && (w[k]->target != o || !o->preempt);
         w[k]->target = o;
+        if (wake) plat_cond_signal(&w[k]->cv);
         if (o->preempt) continue;
         if (rt_trace & RT_TRACE_SCHED) {
             o->pre_since = kern_now_ns();

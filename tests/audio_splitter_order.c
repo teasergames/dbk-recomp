@@ -6,7 +6,7 @@
 enum { FRAMES = 240, MAX_MIXES = 256, MAX_DESTINATIONS = 8, MAX_SPLITTERS = 2, MIX_UNUSED = 0x7fffffff };
 static unsigned checks, failures, cases, output_calls;
 static const char *case_name;
-static float captured[FRAMES * 2];
+static float captured[FRAMES * 6];
 static jmp_buf fatal_jump;
 static int expect_fatal;
 static char fatal_message[128];
@@ -24,7 +24,7 @@ static void level_note(AudioRenderer *r,Mixer *m,const float *lr,int frames) {
 }
 static void output_push(Mixer *m,const float *lr,int frames) {
     (void)m; CHECK(frames==FRAMES); if(frames!=FRAMES)abort();
-    memcpy(captured,lr,sizeof captured); output_calls++;
+    memcpy(captured,lr,(size_t)m->channels*FRAMES*sizeof(float)); output_calls++;
 }
 static void mix_aux(AudioRenderer *r,int mix,const AudrenEffectIn *e) { (void)r;(void)mix;(void)e;unexpected(); }
 static void mix_capture(AudioRenderer *r,int mix,const AudrenEffectIn *e) { (void)r;(void)mix;(void)e;unexpected(); }
@@ -69,7 +69,7 @@ static void init(Fixture *f,int count,const char *name) {
     f->r.param=(AudrenParameter){.sample_rate=48000,.sample_count=FRAMES,.mix_buffer_count=count,
         .submix_count=count-1,.voice_count=2,.sink_count=1,.splitter_count=MAX_SPLITTERS,
         .splitter_destination_count=MAX_DESTINATIONS,.revision=AUDREN_REV(15)};
-    f->r.revision=AUDREN_REV(15);f->m->frame=FRAMES;f->m->nbuf=count;
+    f->r.revision=AUDREN_REV(15);f->m->frame=FRAMES;f->m->nbuf=count;f->m->channels=2;
     f->m->nsplit=MAX_SPLITTERS;f->m->ndest=MAX_DESTINATIONS;
     f->m->offset=owned(f,(size_t)count*sizeof *f->m->offset);
     f->m->buf=owned(f,(size_t)count*FRAMES*sizeof(float));
@@ -181,8 +181,26 @@ static void cycle_case(int splitter) {
     else CHECK(!strcmp(fatal_message,"audio submix routing cycle"));
     expect_fatal=0;CHECK(output_calls==before);guards(&f);done(&f);
 }
+static void surround_case(int out_channels) {
+    Fixture f;int oc=out_channels;
+    init(&f,6,oc==6?"surround-passthrough":"surround-downmix");
+    f.m->channels=oc;voice(&f,0,2,.25f);voice(&f,1,4,.5f);   // center and rear left; the rest is silent
+    f.r.sinks[0].input_count=6;for(int c=0;c<6;c++)f.r.sinks[0].inputs[c]=(int8_t)c;
+    if(oc==2){f.r.sinks[0].downmix_enabled=1;
+        f.r.sinks[0].downmix[0]=1;f.r.sinks[0].downmix[1]=.5f;f.r.sinks[0].downmix[2]=.25f;f.r.sinks[0].downmix[3]=.125f;}
+    routing(&f);unsigned calls=output_calls;audio_mixer_render(&f.r,FRAMES/48000.0);CHECK(output_calls==calls+1);
+    for(int i=0;i<FRAMES;i++) {
+        if(oc==6) {
+            const float want[6]={0,0,.25f,0,.5f,0};
+            for(int c=0;c<6;c++)CHECK(captured[6*i+c]==want[c]);
+        } else {   // center x downmix[1], rear x downmix[3] (Eglantine DownMix6chTo2chCommand::Process)
+            CHECK(captured[2*i]==.5f*.25f+.125f*.5f);CHECK(captured[2*i+1]==.5f*.25f);
+        }
+    }
+    guards(&f);done(&f);
+}
 int main(void) {
-    simple_cases();cycle_case(0);cycle_case(1);
+    simple_cases();cycle_case(0);cycle_case(1);surround_case(6);surround_case(2);
     printf("%u checks, %u failures, %u cases (actual routing/render; no audio device)\n",checks,failures,cases);
     return failures?1:0;
 }

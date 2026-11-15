@@ -16,6 +16,7 @@
 #include "host.h"
 #include "input.h"
 #include "input_map.h"
+#include "input_script.h"
 #include "input_wsys.h"
 #include "nvn_api.h"
 #include "ui/menu.h"
@@ -56,16 +57,35 @@ static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
 // and its hold are milliseconds of the world clock (frame_step_world_us, game time since the loaded save's first
 // frame), so it lands at the same game time at any frame rate and load length. A timed event shorter than a frame is
 // applied once. In a script with timed lines (a recording) the untimed ones belong before the world clock: they stop
-// when it starts, as the load ends at another tick in each run.
-// at, hold: ticks, or microseconds of the world clock when timed.
-typedef struct { uint64_t at, hold; int bit, stick, timed; int32_t x, y; int logged; char text[48]; } ScriptEv;
-static const struct { const char *name; int bit; } script_buttons[] = {
-    {"A", B_A}, {"B", B_B}, {"X", B_X}, {"Y", B_Y}, {"LCLICK", B_STICK_L}, {"RCLICK", B_STICK_R}, {"L", B_L}, {"R", B_R},
-    {"ZL", B_ZL}, {"ZR", B_ZR}, {"PLUS", B_PLUS}, {"MINUS", B_MINUS}, {"LEFT", B_LEFT}, {"UP", B_UP}, {"RIGHT", B_RIGHT}, {"DOWN", B_DOWN},
-};
+// when it starts, as the load ends at another tick in each run. A line "[<time>] wait world|file <name> [timeout_ms]"
+// holds the lines after it until the condition holds (or the timeout runs out), then shifts their clocks so they read
+// <time> there. Parser and scheduler: input_script.c.
 static ScriptEv *script_ev;
 static int script_n, script_state;   // 0 not loaded, 1 loaded
 static int script_mixed;             // the script has timed lines: its untimed ones end where the world clock starts
+static int script_done;              // the summary line is out: no event can land any more
+static int wait_armed = -1;          // the wait line being waited for, -1 none
+// "wait file": the name each file open is matched against (NULL while no such wait is armed), and whether one matched.
+// input_file_opened runs on the game's file-open thread, wait_met and script_apply on the input thread: the pointer is
+// published with release and read with acquire.
+static const char *wait_file;
+static volatile int32_t wait_file_hit;
+
+void input_file_opened(const char *path) {
+    const char *want = __atomic_load_n(&wait_file, __ATOMIC_ACQUIRE);
+    if (want && path && strstr(path, want)) plat_xchg32(&wait_file_hit, 1);
+}
+
+// Whether wait line i's condition holds now. The first call for a line arms it: a file opened before does not count
+// (the hit is cleared before the name is published, so only an open that sees the name can set it).
+static int wait_met(const ScriptEv *e, int i, int64_t w) {
+    if (wait_armed != i) {
+        wait_armed = i;
+        plat_xchg32(&wait_file_hit, 0);
+        __atomic_store_n(&wait_file, e->wait == SCRIPT_WAIT_FILE ? e->arg : NULL, __ATOMIC_RELEASE);
+    }
+    return e->wait == SCRIPT_WAIT_WORLD ? w >= 0 : e->wait == SCRIPT_WAIT_FILE && wait_file_hit;
+}
 
 static void script_load(void) {
     script_state = 1;
@@ -77,39 +97,21 @@ static void script_load(void) {
     int cap = 0, ln = 0;
     while (fgets(line, sizeof line, f)) {
         ln++;
-        char *h = strchr(line, '#');
-        if (h) *h = 0;
-        char name[32];
-        double at;
-        int off = 0, timed = line[0] == '@';
-        if (sscanf(line + timed, "%lf %31s%n", &at, name, &off) < 2 || at < 0) continue;
-        off += timed;
-        double unit = timed ? 1000.0 : 1.0;   // ms to us, or presents
-        ScriptEv e = {.at = (uint64_t)(at * unit + 0.5), .hold = timed ? 66667 : 4, .bit = -1, .timed = timed};
-        long a, b;
-        double c;
-        if (!strcmp(name, "LSTICK") || !strcmp(name, "RSTICK")) {
-            int n = sscanf(line + off, "%ld %ld %lf", &a, &b, &c);
-            if (n < 2) { rt_log("input: script line %d: %s needs x y [hold]", ln, name); continue; }
-            e.stick = name[0] == 'L' ? 1 : 2; e.x = (int32_t)a; e.y = (int32_t)b;
-            if (n >= 3 && c > 0) e.hold = (uint64_t)(c * unit + 0.5);
-            snprintf(e.text, sizeof e.text, "%s %d %d", name, e.x, e.y);
-        } else {
-            for (size_t i = 0; i < sizeof script_buttons / sizeof *script_buttons; i++)
-                if (!strcmp(name, script_buttons[i].name)) e.bit = script_buttons[i].bit;
-            if (e.bit < 0) { rt_log("input: script line %d: unknown button %s", ln, name); continue; }
-            if (sscanf(line + off, "%lf", &c) == 1 && c > 0) e.hold = (uint64_t)(c * unit + 0.5);
-            snprintf(e.text, sizeof e.text, "%s", name);
-        }
+        ScriptEv e;
+        char err[64];
+        int r = script_parse_line(line, &e, err, sizeof err);
+        if (r < 0) rt_log("input: script line %d: %s", ln, err);
+        if (r <= 0) continue;
         if (script_n == cap) {
             cap = cap ? cap * 2 : 32;
             script_ev = realloc(script_ev, (size_t)cap * sizeof *script_ev);
             if (!script_ev) { script_n = 0; fclose(f); return; }
         }
         script_ev[script_n++] = e;
-        script_mixed |= timed;
+        script_mixed |= e.timed && !e.wait;
     }
     fclose(f);
+    script_link(script_ev, script_n);
     rt_log("input: script %s, %d events", path, script_n);
 }
 
@@ -153,17 +155,53 @@ static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     int64_t w = frame_step_world_us();
     for (int i = 0; i < script_n; i++) {
         ScriptEv *e = &script_ev[i];
-        if (e->timed ? w < 0 : script_mixed && w >= 0) continue;
-        uint64_t now = e->timed ? (uint64_t)w : tick;
-        if (now < e->at || (now >= e->at + e->hold && (e->logged || !e->timed))) continue;
-        if (!e->logged) {
-            e->logged = 1;
-            if (e->timed) rt_log("input: script frame %llu at %.1f ms: %s", (unsigned long long)fr, w / 1000.0, e->text);
-            else rt_log("input: script frame %llu tick %llu: %s", (unsigned long long)fr, (unsigned long long)tick, e->text);
+        uint64_t t = tick;
+        int64_t sw = w;
+        if (!script_clock(script_ev, i, &t, &sw)) continue;
+        if (e->wait) {
+            int r = e->logged ? 0 : script_wait(script_ev, i, tick, w, wait_met(e, i, w));
+            if (!r) continue;
+            __atomic_store_n(&wait_file, NULL, __ATOMIC_RELEASE);
+            // In ms on its clock; the difference is the shift the lines after it get (later in this run: positive).
+            double unit = e->timed ? 1e-3 : 1000.0 / 60, at = e->at * unit, got = e->landed * unit;
+            if (e->timed && !e->off_w && !e->landed)   // held before the world clock: nothing to shift by
+                rt_log("input: script frame %llu: %s %s before the world clock (asked %.1f ms)", (unsigned long long)fr,
+                       e->text, r == 1 ? "held" : "timed out", at);
+            else
+                rt_log("input: script frame %llu: %s %s at %.1f ms (asked %.1f): the lines after it move by %+.1f ms",
+                       (unsigned long long)fr, e->text, r == 1 ? "held" : "timed out", got, at, got - at);
+            continue;
         }
+        int due = script_due(e, t, sw, script_mixed);
+        if (!due) continue;
+        // The landing log: the clock reading against the time asked, so two replays can be compared line by line.
+        if (due == 2 && e->timed)
+            rt_log("input: script frame %llu at %.1f ms (asked %.1f): %s", (unsigned long long)fr, sw / 1000.0,
+                   e->at / 1000.0, e->text);
+        else if (due == 2)
+            rt_log("input: script frame %llu tick %llu (asked %llu): %s", (unsigned long long)fr, (unsigned long long)t,
+                   (unsigned long long)e->at, e->text);
         if (e->stick) { int32_t *s = e->stick == 1 ? sl : sr; s[0] = e->x; s[1] = e->y; }
         else *b |= 1ull << e->bit;
     }
+    if (script_done) return;
+    ScriptSummary s = script_summary(script_ev, script_n, tick, w, script_mixed);
+    if (s.pending) return;
+    script_done = 1;
+    rt_log("input: script done at frame %llu: %d of %d events landed, latest %llu ticks and %.1f ms after the time asked",
+           (unsigned long long)fr, s.landed, s.total, (unsigned long long)s.max_late_ticks, s.max_late_ms);
+    if (s.waits) rt_log("input: script waits: %d, %d of them timed out", s.waits, s.timeouts);
+}
+
+// Exit path (boot.c): the run ended before every event landed, so the done line never came. Logs once.
+void input_script_report(void) {
+    if (script_state != 1 || !script_n || script_done) return;
+    script_done = 1;
+    uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    ScriptSummary s = script_summary(script_ev, script_n, frame_step_ticks(), frame_step_world_us(), script_mixed);
+    rt_log("input: script ended at frame %llu: %d of %d events landed, %d pending", (unsigned long long)fr, s.landed,
+           s.total, s.pending);
+    if (s.waits) rt_log("input: script waits: %d, %d of them timed out", s.waits, s.timeouts);
 }
 
 // TOTK_INPUT_RECORD=<file>: writes the merged input as TOTK_INPUT_SCRIPT lines, one per button press and per stick
@@ -503,12 +541,20 @@ static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
 static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     uint64_t b = 0;
     int32_t sl[2] = {0, 0}, sr[2] = {0, 0};
+    static int guide_held;
+    int guide_toggle = 0;
     plat_mutex_lock(&lock);
     mouse_direct_mode();
     if (!state) start();
     if (state > 0) {
         binds_refresh();
-        if (state == 1) pad_read(&b, sl, sr);
+        if (state == 1) {
+            pad_read(&b, sl, sr);
+            // The guide button (Xbox, PS) opens or closes the menu on its press edge and is no game input (TotK Recomp #826).
+            int g = pad && SDL_GamepadConnected(pad) && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_GUIDE);
+            guide_toggle = g && !guide_held;
+            guide_held = g;
+        }
         if (ikb_foreground()) {
             uint8_t down[KEY_COUNT] = {0};
             // Mouse buttons count only while the cursor is captured, and a button already held when the capture began
@@ -544,7 +590,7 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
     int overlay = input_overlay_gate(&overlay_held, &b);
     sl[0] = st[0], sl[1] = st[1], sr[0] = st[2], sr[1] = st[3];
     plat_mutex_unlock(&lock);
-    if (toggle) menu_toggle();
+    if (toggle || guide_toggle) menu_toggle();
     if (overlay) menu_perf_cycle();
     stick_bits(&b, sl[0], sl[1], B_SL_LEFT);
     stick_bits(&b, sr[0], sr[1], B_SR_LEFT);

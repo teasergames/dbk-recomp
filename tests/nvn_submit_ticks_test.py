@@ -62,6 +62,8 @@ def main():
     record = function(execute, 'int vk_exec_record(')
     if 'static int record_impl(' in execute:
         record = function(execute, 'static int record_impl(') + '\n' + record
+    if 'static void views_to_fence(' in execute:   # the view list of a command buffer, shared with the part split
+        record = function(execute, 'static void views_to_fence(') + '\n' + record
     replacements = {'@API@': str(int(api)), '@GLOBALS@': globals_, '@REPLAY_TYPES@': types,
                     '@COUNTERS@': callback + function(xfer, 'static void report_counter('),
                     '@RECORD@': record,

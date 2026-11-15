@@ -1,4 +1,4 @@
-// Bananza 1.0.0 manual mouse orbit (recomp/patches-dkb100.txt, mousecamera). Callbacks surround
+// Bananza manual mouse orbit (recomp/patches-dkb100.txt for 1.0.0, recomp/patches-dkb458752.txt for 3.2.0, mousecamera). Callbacks surround
 // CameraPoserFollowLimit's yaw update and CameraAngleVerticalCtrl::exeUserCtrl. The native
 // poser still computes the orbit, target and collision; other camera modes keep stick input.
 #include <math.h>
@@ -56,7 +56,7 @@ static void camera_update(Cpu *c, unsigned site, uint64_t obj) {
         uint64_t timing = PTR(service, 0x10), options = PTR(service, 0x60);
         mouse.vertical = PTR(obj, 0x168);
         if (!timing || !options || !mouse.vertical || !(FLOAT(timing, 4) > 0)) return;
-        // CameraPoserFollowLimit exits its manual path at main+0x41b370 for either flag.
+        // CameraPoserFollowLimit exits its manual path at main+0x41b370 (1.0.0; main+0x438610 in 3.2.0) for either flag.
         // Leave the raw counts for stick fallback and do not arm pitch activity in that mode.
         if (BYTE(options, 0xb) || BYTE(obj, 0x2d4)) return;
         float unused;

@@ -1,7 +1,7 @@
 // The SDL3 back end of the window (gfx_wsys.h), for hosts without Win32: the window on a thread of its own that also
 // runs SDL's event loop, F11 fullscreen (borderless, the desktop's mode), the settings TOTK_WINDOW_SIZE and
 // TOTK_FULLSCREEN, the display's refresh rate, focus, the Vulkan surface. The swapchain and the present are
-// gfx_present.c's. Keyboard and mouse events go to input_sdl.c and to the menu (ui/menu_sdl.cpp).
+// vk_present.c's. Keyboard and mouse events go to input_sdl.c and to the menu (ui/menu_sdl.cpp).
 //
 // SDL wants its video calls on the thread that initialised video, so this thread does them all: the others hand it
 // work through run_on_window (a user event and a wait) or post a user event. Video is initialised before the window
@@ -14,6 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#include <pthread.h>   // pthread_main_np: SDL's video calls belong on the process's main thread
+#endif
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -30,7 +33,7 @@
 static SDL_Window *g_win;
 static uint32_t g_ev_base;               // SDL_RegisterEvents: the user events below
 enum { EV_RUN, EV_SETTINGS, EV_CLOSE, EV_COUNT };
-static PlatEvent g_video_ready;          // manual-reset: SDL video is up (or failed)
+static PlatEvent g_video_ready = {.m = PLAT_MUTEX_INIT, .c = PLAT_COND_INIT, .manual = 1};   // SDL video is up
 static int g_video_ok;
 static PlatOnce g_thread_once = PLAT_ONCE_INIT;
 static uint32_t g_window_tid;            // the window thread, which runs the video calls
@@ -66,11 +69,11 @@ SDL_Window *gfx_window_sdl(void) { return g_win; }
 
 // ---- settings: size and fullscreen
 static char g_applied_size[32];
-static int g_applied_fs;
+static int g_applied_mode;
 
 static void note_applied(void) {
     snprintf(g_applied_size, sizeof g_applied_size, "%s", cfg_value("TOTK_WINDOW_SIZE"));
-    g_applied_fs = gfx_cfg_fullscreen();
+    g_applied_mode = gfx_cfg_window_mode();
 }
 
 static int is_fullscreen(void) { return (SDL_GetWindowFlags(g_win) & SDL_WINDOW_FULLSCREEN) != 0; }
@@ -88,27 +91,50 @@ static void set_pixel_size(int w, int h) {
     SDL_SetWindowSize(g_win, (int)(w / scale + 0.5f), (int)(h / scale + 0.5f));
 }
 
-static void set_fullscreen(int on) {
+// Window mode 0 windowed, 1 borderless (the desktop's mode, over the display), 2 fullscreen (the display's current
+// size at its highest refresh rate; a null mode is the desktop's).
+static int last_fs = 1;   // the full-screen mode F11 returns to: the last one chosen anywhere
+
+static void set_mode(int mode) {
+    if (mode) last_fs = mode;
     input_cursor_suspend(1);
-    SDL_SetWindowFullscreen(g_win, on);   // the desktop's mode: borderless over the display
+    if (mode == 0) {
+        if (is_fullscreen()) SDL_SetWindowFullscreen(g_win, false);
+    } else {
+        const SDL_DisplayMode *best = NULL;
+        int n = 0;
+        SDL_DisplayID d = SDL_GetDisplayForWindow(g_win);
+        SDL_DisplayMode **modes = mode == 2 ? SDL_GetFullscreenDisplayModes(d, &n) : NULL;
+        const SDL_DisplayMode *cur = modes ? SDL_GetDesktopDisplayMode(d) : NULL;
+        for (int i = 0; cur && i < n; i++)
+            if (modes[i]->w == cur->w && modes[i]->h == cur->h && (!best || modes[i]->refresh_rate > best->refresh_rate))
+                best = modes[i];
+        static int warned;
+        if (mode == 2 && !best && !warned) {
+            warned = 1;
+            rt_log("gfx: no matching display mode for fullscreen; using borderless");
+        }
+        SDL_SetWindowFullscreenMode(g_win, best);
+        if (!is_fullscreen()) SDL_SetWindowFullscreen(g_win, true);
+        SDL_free(modes);
+    }
     SDL_SyncWindow(g_win);
     input_cursor_suspend(0);
 }
 
-// Window thread: the window takes the size and fullscreen state of the settings when they changed. A window resized by
-// hand keeps its size when another setting changes.
+// Window thread: the window takes the size and mode of the settings when they changed. A window resized by hand keeps
+// its size when another setting changes.
 static void apply_settings(void) {
-    int size_changed = strcmp(cfg_value("TOTK_WINDOW_SIZE"), g_applied_size) != 0, fs = gfx_cfg_fullscreen();
-    int fs_changed = fs != g_applied_fs;
+    int size_changed = strcmp(cfg_value("TOTK_WINDOW_SIZE"), g_applied_size) != 0, mode = gfx_cfg_window_mode();
+    int mode_changed = mode != g_applied_mode;
     note_applied();
     if (size_changed) {
         int w, h;
         gfx_cfg_window_size(&w, &h);
         if (is_fullscreen()) SDL_SetWindowFullscreen(g_win, false);
         set_pixel_size(w, h);
-        if (is_fullscreen() || (fs && !fs_changed)) SDL_SetWindowFullscreen(g_win, true);
     }
-    if (fs_changed && fs != is_fullscreen()) set_fullscreen(fs);
+    if (size_changed || mode_changed) set_mode(mode);
 }
 
 void gfx_window_apply_settings(void) {
@@ -160,9 +186,14 @@ static void handle(const SDL_Event *e) {
     menu_sdl_event(e);
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
+        if (e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) gfx_backend()->dump_request();   // TOTK_DUMP=key
         if (e->key.scancode == SDL_SCANCODE_F11 && !e->key.repeat) {
-            set_fullscreen(!is_fullscreen());
-            cfg_set("TOTK_FULLSCREEN", is_fullscreen() ? "1" : "0");   // the menu shows it; the next start keeps it
+            // the real window decides, so a mode forced by the environment cannot stick F11
+            int cur = is_fullscreen() ? (g_applied_mode ? g_applied_mode : 1) : 0, mode = cur ? 0 : last_fs;
+            set_mode(mode);
+            // the menu shows these; the next start keeps them
+            cfg_set("TOTK_WINDOW_MODE", mode == 2 ? "fullscreen" : mode == 1 ? "borderless" : "windowed");
+            cfg_set("TOTK_FULLSCREEN", mode ? "1" : "0");
             cfg_save();
             note_applied();
         }
@@ -191,8 +222,8 @@ static void handle(const SDL_Event *e) {
     }
 }
 
-static void window_main(void *arg) {
-    (void)arg;
+// SDL video, on the thread that also runs the event loop below. Sets g_video_ready either way.
+static void video_init(void) {
     g_window_tid = plat_thread_id();
     SDL_SetHint(SDL_HINT_APP_ID, "totk-recomp");   // Wayland's app id: the desktop file and the taskbar match it
     SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "0");
@@ -209,6 +240,11 @@ static void window_main(void *arg) {
                SDL_VERSIONNUM_MINOR(SDL_GetVersion()), SDL_VERSIONNUM_MICRO(SDL_GetVersion()), SDL_GetCurrentVideoDriver());
     }
     plat_event_set(&g_video_ready);
+}
+
+// The event loop of the window thread. A window close request does not end it: the guest is told (gfx_window_closed)
+// and the process ends from whichever thread reaches the end of the game.
+static void window_loop(void) {
     if (!g_video_ok) return;
     for (;;) {
         SDL_Event e;
@@ -217,11 +253,42 @@ static void window_main(void *arg) {
     }
 }
 
+#if !defined(__APPLE__)
+static void window_main(void *arg) {
+    (void)arg;
+    video_init();
+    window_loop();
+}
+#endif
+
+#ifdef __APPLE__
+// macOS runs AppKit, and with it SDL's video, on the process's main thread only; SDL's Cocoa driver fails to start on
+// any other. So the main thread initialises video and runs the event loop, and the game runs on a thread of its own
+// (boot.c rt_boot). This is called on the main thread and does not return while the process lives.
+void gfx_window_main_thread(void) {
+    video_init();
+    window_loop();
+    // No video (a headless run with TOTK_GPU=null, or a session without a display): the game thread ends the process.
+    for (;;) plat_sleep_ms(1000);
+}
+
+static int on_main_thread(void) { return pthread_main_np() != 0; }
+#endif
+
 static void video_start(void *arg) {
     (void)arg;
-    plat_event_init(&g_video_ready, 1, 0);
+#ifdef __APPLE__
+    // A probe runs on the main thread and initialises video itself, without an event loop (it drives events through
+    // wsys_probe_*). The game thread has no such right and waits for gfx_window_main_thread.
+    if (on_main_thread()) {
+        video_init();
+        return;
+    }
+    plat_event_wait(&g_video_ready);
+#else
     if (!plat_thread_spawn(window_main, NULL, "window", 0)) rt_fatal("gfx: cannot start the window thread");
     plat_event_wait(&g_video_ready);
+#endif
 }
 
 static int video_up(void) {
@@ -263,7 +330,7 @@ static void open_window(void *arg) {
     note_applied();
     refresh_rate_update();
     if (cfg_get("TOTK_BACKGROUND_WINDOW")) rt_log("gfx: TOTK_BACKGROUND_WINDOW has no effect with SDL windows");
-    if (gfx_cfg_fullscreen()) SDL_SetWindowFullscreen(g_win, true);
+    if (gfx_cfg_fullscreen()) set_mode(gfx_cfg_window_mode());
     SDL_SyncWindow(g_win);
     input_sdl_window(g_win);
     open_ok = 1;
@@ -291,12 +358,39 @@ VkSurfaceKHR wsys_surface(VkInstance inst) {
     return r.surface;
 }
 
-void wsys_client_size(int *w, int *h) {
-    *w = *h = 0;
-    if (g_win) SDL_GetWindowSizeInPixels(g_win, w, h);
+typedef struct { int w, h; } ClientSize;
+
+static void query_client_size(void *arg) {
+    ClientSize *s = arg;
+    SDL_GetWindowSizeInPixels(g_win, &s->w, &s->h);
 }
 
-int wsys_minimized(void) { return g_win && (SDL_GetWindowFlags(g_win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)); }
+void wsys_client_size(int *w, int *h) {
+    *w = *h = 0;
+    if (!g_win) return;
+#ifdef __APPLE__
+    // SDL's Cocoa window calls belong on the thread that initialises video (the process's main thread here), and the
+    // present path runs on the game thread: ask the window thread, which is that one.
+    ClientSize s = {0, 0};
+    run_on_window(query_client_size, &s);
+    *w = s.w, *h = s.h;
+#else
+    SDL_GetWindowSizeInPixels(g_win, w, h);
+#endif
+}
+
+static void query_minimized(void *arg) { *(int *)arg = (SDL_GetWindowFlags(g_win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0; }
+
+int wsys_minimized(void) {
+    if (!g_win) return 0;
+#ifdef __APPLE__
+    int min = 0;
+    run_on_window(query_minimized, &min);
+    return min;
+#else
+    return (SDL_GetWindowFlags(g_win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0;
+#endif
+}
 
 static void resize_window(void *arg) {
     const int *wh = arg;

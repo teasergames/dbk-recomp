@@ -25,14 +25,20 @@ typedef unsigned VkPipeline;
 typedef struct { uint32_t x, y, z; } VkDispatchIndirectCommand;
 typedef struct { uint64_t srcOffset, dstOffset, size; } VkBufferCopy;
 typedef struct { VkBuffer buffer; uint64_t offset; int cls; } VkMemSpan;
-typedef struct { void *prog; int cb; unsigned recorded; } VkExec;
+// The draw context fields op_dispatch_ind reaches (vk_exec_draw.c DrawCtx).
+typedef struct DrawCtx {
+    const Nvn2C0Layout *c0_lay;
+    uint32_t c0_dim[3];
+    int twin_dispatch;
+    struct { int c0_valid[3]; uint64_t c0_off[3]; VkBuffer c0_buf[3]; } B;
+} DrawCtx;
+typedef struct { void *prog; int cb; unsigned recorded; DrawCtx *draw; } VkExec;
+#define DC_OF(ex) ((ex)->draw)   // a translator that takes its context from VkExec.draw
 typedef int GfxShader;
 typedef int VkPipeInfo;
 enum { W_PROGRAM, W_INDIRECT, W_PIPELINE, NVN_STAGE_CS=5, VK_PIPELINE_BIND_POINT_COMPUTE=1, VK_MUSE_IND=1 };
-static const Nvn2C0Layout *c0_lay;
-static uint32_t c0_dim[3];
-static int twin_dispatch, vk_dump_armed, bind_c0 = 1;
-static struct { int c0_valid[3]; uint64_t c0_off[3]; VkBuffer c0_buf[3]; } B;
+static DrawCtx ctx;
+static int vk_dump_armed, bind_c0 = 1;
 static uint8_t bank[NVN2_C0_BYTES];
 static uint32_t arguments[4] = {0xdeadbeef,3,5,7}, groups[3];
 static unsigned copies, dispatches, barriers;
@@ -49,7 +55,7 @@ static void note_work(const VkExec *ex, int kind, uint64_t work) {
     noted.work = work;
     noted.recorded = ex->recorded;
     noted.dispatches = dispatches;
-    noted.twin_dispatch = twin_dispatch;
+    noted.twin_dispatch = ex->draw->twin_dispatch;
     noted.calls++;
 }
 static void warn_once(int code, const char *format, ...) { (void)code; (void)format; abort(); }
@@ -70,8 +76,8 @@ static void vk_exec_barrier(VkExec *ex) { (void)ex; barriers++; }
 static void bind_pipeline(VkExec *ex, unsigned point, VkPipeline pipe) { (void)ex; (void)point; (void)pipe; }
 static void c0_lay_set(VkExec *ex, const GfxShader *shader) { (void)ex; (void)shader; }
 static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
-    (void)ex; (void)info; if (!twin_dispatch) abort();
-    B.c0_valid[2] = bind_c0; B.c0_off[2] = 0; B.c0_buf[2] = bank;
+    (void)info; if (!ex->draw->twin_dispatch) abort();
+    ex->draw->B.c0_valid[2] = bind_c0; ex->draw->B.c0_off[2] = 0; ex->draw->B.c0_buf[2] = bank;
 }
 static void vkCmdCopyBuffer(int cb, VkBuffer src, VkBuffer dst, unsigned count, const VkBufferCopy *copy) {
     (void)cb;
@@ -91,16 +97,16 @@ static void vk_dump_dispatch(VkExec *ex, const GfxShader *shader, VkPipeline pip
 static unsigned checks, failures;
 #define CHECK(c, message) do { checks++; if (!(c)) { failures++; fprintf(stderr, "FAIL: %s\n", message); } } while (0)
 static void run(const Nvn2C0Layout *layout, unsigned expected_copies) {
-    VkExec ex = {.prog=&ex};
+    VkExec ex = {.prog=&ex, .draw=&ctx};
     p_dispatch_ind d = {0,0};
-    c0_lay = layout;
+    ctx.c0_lay = layout;
     copies = dispatches = barriers = 0;
     memset(&noted, 0, sizeof noted);
     op_dispatch_ind(&ex, &d);
     CHECK(dispatches == 1 && !memcmp(groups, arguments + 1, sizeof groups), "indirect dispatch keeps actual GPU arguments");
     CHECK(copies == expected_copies, "only the NVN 1 bank receives the legacy dimension copy");
     CHECK(ex.recorded == 1 + expected_copies && barriers == 1 + expected_copies, "copy bookkeeping follows the selected ABI");
-    CHECK(B.c0_valid[2] == (bind_c0 && !expected_copies), "the NVN 2 packed bank stays reusable");
+    CHECK(ctx.B.c0_valid[2] == (bind_c0 && !expected_copies), "the NVN 2 packed bank stays reusable");
     CHECK(noted.calls == 1 && noted.ex == &ex, "indirect dispatch profiles its executor exactly once");
     CHECK(noted.kind == 3 && noted.work == 0, "indirect profiling keeps the GPU-only work count unknown");
     CHECK(noted.recorded == 1 + expected_copies && noted.dispatches == 1 && !noted.twin_dispatch,

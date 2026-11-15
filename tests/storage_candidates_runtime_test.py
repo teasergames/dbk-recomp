@@ -8,6 +8,7 @@ import argparse
 from pathlib import Path
 import subprocess
 
+from nvn2_compute_c0_test import draw_context
 from nvn2_shader_control_test import function
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,17 +20,21 @@ def source():
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "nvn_hmap.h"
 #include "vk_exec.h"
+#include "vk_spec.h"
+int vk_spec_fail(int why) { (void)why; abort(); }
 #define ZERO_BYTES 65536u
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
+#define NVN_STAGE_GS 2
 #define NVN_STAGE_CS 5
 enum { W_SSBO_ALIGN, W_SSBO_SLOT };
-static const Nvn2C0Layout *c0_lay;
-static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
-static uint32_t c0_dim[3], c0_binst;
-static struct { VkBuffer zbuf; } Z;
-static struct { int volatile_; } RS;
+@CTX@
+// The replay thread's draw context: the compute layout, the inline updates and the build's flags are in it.
+static DrawCtx ctx = {.frame = &vk_exec_frame};
+VkExecFrame vk_exec_frame;
+static struct { VkBuffer zbuf; } standins;
 static int c0_enabled = 1;
 static int c0_on(void) { return c0_enabled; }
 VkCaps vk_caps;
@@ -41,7 +46,7 @@ static uint64_t last_note_addr, last_note_size;
 void rt_fatal(const char *fmt, ...) { (void)fmt; abort(); }
 static void warn_once(int id, const char *fmt, ...) { (void)id; (void)fmt; }
 void vk_mem_count(int cls, int use, uint64_t bytes) { (void)cls; (void)use; (void)bytes; }
-static void count_use(int cls, int use, uint64_t bytes) { vk_mem_count(cls, use, bytes); }
+static void count_use(DrawCtx *dc, int cls, int use, uint64_t bytes) { (void)dc; vk_mem_count(cls, use, bytes); }
 // Profiling is disabled in this CPU fixture; reaching either profiling-only hook is an unexpected dependency.
 int vk_sync_noting(void) { return 0; }
 uint64_t nvn2_origin(const uint8_t *code) { (void)code; abort(); }
@@ -52,6 +57,8 @@ void vk_mem_use(VkMemSpan *span) { (void)span; }
 void vk_mem_bound_note(void *pool) { (void)pool; }
 void vk_mem_gpu_wrote(const VkMemSpan *span, uint64_t n) { (void)span; (void)n; wrote++; }
 void vk_usnap_drop(uint64_t addr, uint64_t n) { (void)addr; (void)n; dropped++; }
+int vk_usnap_covers(uint64_t addr, uint64_t n) { (void)addr; (void)n; return 0; }
+void vk_exec_par_order_hazard(void) {}
 static void note_written(VkExec *ex, uint64_t addr, uint64_t n) {
     (void)ex; noted++; last_note_addr=addr; last_note_size=n;
 }
@@ -86,25 +93,26 @@ int vk_mem_resolve(uint64_t addr, uint64_t n, VkMemSpan *span) {
     limits += '''static void limits_init(void) {
     LIM.ubo_max=65536; LIM.ubo_align=256; LIM.sbo_max=65536; LIM.sbo_align=256;
 }\n'''
-    updates = draw[draw.index('#define UPD_N '):draw.index('static void upd_note(')]
     pieces = [function(draw, start) for start in (
         'static VkDescriptorBufferInfo zero_info(', 'static int bind_range(',
-        'static void c0_table(', 'void vk_c0_fill(', 'static int find_stage_scan(',
+        'static void c0_fill(', 'static int find_stage_scan(',
         'static int ssbo_slot(', 'static int ubo_ptr_res(')]
-    pieces += [updates, function(draw, 'static void upd_note('), function(draw, 'static int upd_read('),
+    pieces += [function(draw, 'static void upd_note('), function(draw, 'static int upd_read('),
                function(draw, 'static uint64_t ubo_ptr('),
-               '#define find_stage find_stage_scan\n',
+               '#define find_stage(dc, p, st, ctl, code, len) ((void)(dc), find_stage_scan(p, st, ctl, code, len))\n',
+               # bind_range asks for a stage origin only when vk_sync_noting(), which is 0 in this fixture
+               '#define find_stage_origin(dc, p, st, ctl, code, len, o) ((void)(dc), find_stage_scan(p, st, ctl, code, len) && (*(o) = 0, 1))\n',
                function(draw, 'static p_bind_buf guarded_storage_binding('),
                function(draw, 'static VkDescriptorBufferInfo ssbo_info(')]
     after = r'''
 int main(void) {
     const uint64_t a=UINT64_C(0x200000000), b=UINT64_C(0x500000000);
     pool(a,512); pool(b,256);
-    Z.zbuf=(VkBuffer)(uintptr_t)77;
+    standins.zbuf=(VkBuffer)(uintptr_t)77;
     limits_init(); vk_caps.sbuf_align=256;
-    VkExec ex={0}; ex.fence=10;
+    VkExec ex={0}; ex.fence=10; ex.draw=&ctx;
     Nvn2C0Layout layout={.ubos=1,.ssbos=1,.roots={8}};
-    c0_lay=&layout; c0_push=ex.push[1];
+    ctx.c0_lay=&layout; ctx.c0_push=ex.push[1];
     memcpy(&ex.push[1][0][0],&a,8);
     ex.ubo[NVN_STAGE_CS][0]=(p_bind_buf){.addr=a,.size=16};
     ex.ssbo[NVN_STAGE_CS][0]=(p_bind_buf){.addr=b,.size=32};
@@ -120,18 +128,18 @@ int main(void) {
     CHECK(info.buffer==(VkBuffer)(uintptr_t)2 && info.range==32,"typed SSBO keeps its declared byte extent");
     uint64_t scalar=32; memcpy(&ex.push[1][0][0],&scalar,8);
     info=ssbo_info(&ex,NVN_STAGE_CS,&root,0);
-    CHECK(info.buffer==Z.zbuf && info.range==1,"unbacked scalar candidate exposes zero uint elements");
+    CHECK(info.buffer==standins.zbuf && info.range==1,"unbacked scalar candidate exposes zero uint elements");
     GfxShaderRes legacy=root; legacy.flags=0;
     info=ssbo_info(&ex,NVN_STAGE_CS,&legacy,0);
-    CHECK(info.buffer==Z.zbuf && info.range==ZERO_BYTES,"unguarded invalid resource retains the 64-KiB fallback");
+    CHECK(info.buffer==standins.zbuf && info.range==ZERO_BYTES,"unguarded invalid resource retains the 64-KiB fallback");
     memcpy(&ex.push[1][0][0],&a,8);
     c0_enabled=0;
     CHECK(ssbo_info(&ex,NVN_STAGE_CS,&root,0).range==1,"disabled c0 candidate stays invalid");
     c0_enabled=1;
     CHECK(ssbo_info(&ex,NVN_STAGE_FS,&root,0).range==1,"guarded resolution requires compute stage");
-    c0_lay=NULL;
+    ctx.c0_lay=NULL;
     CHECK(ssbo_info(&ex,NVN_STAGE_CS,&root,0).range==1,"guarded resolution requires the NVN2 layout");
-    c0_lay=&layout;
+    ctx.c0_lay=&layout;
     GfxShaderRes outside=root; outside.handle=VK_C0_BYTES/4-1;
     CHECK(ssbo_info(&ex,NVN_STAGE_CS,&outside,0).range==1,"last c0 word cannot supply an eight-byte pointer");
 
@@ -192,22 +200,22 @@ int main(void) {
     memcpy(&ex.push[1][0][0],&alias_addr,8);
     copies=wrote=dropped=noted=0;
     info=ssbo_info(&ex,NVN_STAGE_CS,&root,0);
-    CHECK(info.buffer==Z.zbuf && info.range==1 && !copies,
+    CHECK(info.buffer==standins.zbuf && info.range==1 && !copies,
           "misaligned guarded input never fabricates an independent scratch alias");
     info=ssbo_info(&ex,NVN_STAGE_CS,&root,1);
-    CHECK(info.buffer==Z.zbuf && info.range==1 && !copies && !wrote && !dropped && !noted,
+    CHECK(info.buffer==standins.zbuf && info.range==1 && !copies && !wrote && !dropped && !noted,
           "misaligned guarded output cannot publish a lost scratch write");
     legacy.cbuf_slot=3; legacy.handle=0;
     uint64_t alias_pointer=alias_addr;
     ex.ubo[NVN_STAGE_CS][0]=(p_bind_buf){.addr=(uint64_t)(uintptr_t)&alias_pointer,.size=8};
-    UPD.fence=ex.fence; UPD.n=1;
-    UPD.u[0]=(typeof(UPD.u[0])){(uint64_t)(uintptr_t)&alias_pointer,
+    ctx.UPD.fence=ex.fence; ctx.UPD.n=1;
+    ctx.UPD.u[0]=(typeof(ctx.UPD.u[0])){(uint64_t)(uintptr_t)&alias_pointer,
         (uint64_t)(uintptr_t)&alias_pointer+8,(const uint8_t *)&alias_pointer};
     copies=0;
     info=ssbo_info(&ex,NVN_STAGE_CS,&legacy,0);
     CHECK(info.buffer==(VkBuffer)(uintptr_t)99 && info.range==256 && copies==1,
           "legacy imported input retains its transient copy fallback");
-    UPD.n=0;
+    ctx.UPD.n=0;
     memcpy(&ex.push[1][0][0],&a,8);
 
     // User-UBO pointers retain the newest whole inline update from this fence.
@@ -260,7 +268,7 @@ int main(void) {
     return failures!=0;
 }
 '''
-    return before + limits + '\n'.join(pieces) + after
+    return before.replace('@CTX@', draw_context(draw)) + limits + '\n'.join(pieces) + after
 
 
 def main():
@@ -275,7 +283,8 @@ def main():
     for opt in ('-O0', '-O2'):
         exe = out / ('runtime' + opt + '.exe')
         command = [args.cc, opt, '-Wall', '-Wextra', '-Werror', '-I', str(ROOT / 'runtime'),
-                   '-I', str(args.deps / 'include'), '-I', str(args.deps / 'include/vma'), str(src), '-o', str(exe)]
+                   '-I', str(args.deps / 'include'), '-I', str(args.deps / 'include/vma'), str(src),
+                   str(ROOT / 'runtime/gfx_c0.c'), '-o', str(exe)]   # vk_c0_fill's bank is gfx_c0_fill's
         run = subprocess.run(command, capture_output=True, text=True)
         (out / (opt + '-compile.log')).write_text(run.stdout + run.stderr)
         if run.returncode:

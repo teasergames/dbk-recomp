@@ -404,6 +404,30 @@ class Search:
         return [g for g in (self.region(T, bes) for T, bes in sorted(self.candidates().items())) if g]
 
 
+def lock_waits(img, start, end, touched):
+    """Heads of the guest's recursive spin locks: `mov xR, xzr; casa xR, xA, [xB]; cmp xR, #0; b.eq ok; cmp xR, xA;
+    b.ne head`. The loop takes the lock when the word is 0 and leaves when it already holds this thread's id, so only
+    another thread's release ends a pass: it is a spin wait, but the search above cannot show it (the cas stores). A
+    thread that spins here with every virtual core taken starves the owner, which needs a core to release it."""
+    words = struct.unpack_from(f'<{(end - start) // 4}I', img, start)
+    found = []
+    for i in range(len(words) - 5):
+        a = start + 4 * i
+        r = words[i] & 0x1F
+        if words[i] != (0xAA1F03E0 | r) or a in touched:
+            continue
+        cas, cmp0, beq, cmp_, bne = words[i + 1:i + 6]
+        x = cas & 0x1F
+        if (cas & 0xFFE07C00) != 0xC8E07C00 or (cas >> 16 & 0x1F) != r or x == r or x == 31:
+            continue
+        if cmp0 != 0xF100001F | r << 5 or (beq & 0xFF00001F) != 0x54000000 or cmp_ != 0xEB00001F | x << 16 | r << 5:
+            continue
+        off = (bne >> 5 & 0x7FFFF) - (1 << 19 if bne >> 23 & 1 else 0)
+        if (bne & 0xFF00001F) == 0x54000001 and a + 20 + 4 * off == a:
+            found.append(a)
+    return found
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--exefs', type=Path, required=True)
@@ -424,6 +448,11 @@ def main():
             what = ', '.join(g['kinds']) or 'loads'
             print(f'spin {name} {g["T"]:x} {bes}   # {g["size"]} instructions; {what}')
         print(f'{name}: {len(found)} spin waits', file=sys.stderr)
+        locks = lock_waits(img, n.text[0], n.text[0] + n.text[1], touched)
+        print(f'# {name}: {len(locks)} recursive spin locks')
+        for a in locks:
+            print(f'spin {name} {a:x} {a + 20:x}   # recursive spin lock')
+        print(f'{name}: {len(locks)} recursive spin locks', file=sys.stderr)
     return 0
 
 

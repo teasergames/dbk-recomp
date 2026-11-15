@@ -34,6 +34,9 @@ void prof_write(void);                          // idempotent; boot.c calls it b
 uint64_t perf_begin(void);                      // start time of a wait; pair with perf_end
 void perf_end(int kind, uint64_t t0);           // counts render-thread time only
 void perf_replay(uint64_t t0);                  // replay (NVN -> Vulkan recording) time on any thread, waits inside it included
+// Running totals after a replay: draws and dispatches recorded, descriptor pools taken and created (the per-draw cost
+// and pool line of TOTK_TRACE=perf).
+void perf_replay_totals(uint64_t draws, uint64_t pools_taken, uint64_t pools_created);
 void perf_replay_thread(void);                  // the calling thread replays for the render thread: perf_end counts its waits
 void perf_main_thread(void);                    // the calling thread is the guest main thread (TOTK_PROFILE_MAIN)
 // Events per 60-frame window: graphics pipelines finished by the background workers, draws skipped while pending,
@@ -66,7 +69,7 @@ extern void (*perf_gpu_stats)(PerfGpu *out);
 void perf_set_overlay(int mode);
 int perf_gpu_timing(void);                      // GPU timestamps wanted: TOTK_TRACE=perf or the full overlay
 void perf_gpu_busy(uint64_t ns);                // GPU busy time of a timed submission part (vk_sync.c, any thread)
-void perf_present_gpu(uint64_t ns);             // GPU time of one present submission (gfx_present.c), for the perf line
+void perf_present_gpu(uint64_t ns);             // GPU time of one present submission (vk_present.c), for the perf line
 uint64_t perf_gpu_busy_total(void);             // its running total (the overlay's GPU time per frame)
 #define RT_RESULT(module, desc) ((uint32_t)(module) | ((uint32_t)(desc) << 9))
 void rt_sha256(const void *p, size_t n, uint8_t out[32]);   // BCrypt; fatal if the provider fails
@@ -100,9 +103,12 @@ typedef struct { const char *name; GuestFn fn; } RtHostEntry;
 // File-scope declarations; fn must be declared before. The loader binds them by symbol name. The entries of every
 // object file meet in one section per kind, which hostfn.c walks: on PE/COFF ".ovr$m", which the linker sorts between
 // hostfn.c's ".ovr$a" and ".ovr$z" markers; on ELF "totk_ovr", which the linker brackets with __start_totk_ovr and
-// __stop_totk_ovr.
+// __stop_totk_ovr; on Mach-O "__DATA,__totk_ovr", which ld64 brackets with section$start$__DATA$__totk_ovr and
+// section$end$__DATA$__totk_ovr.
 #ifdef _WIN32
 #define RT_HOST_SECTION(kind) section("." #kind "$m")
+#elif defined(__APPLE__)
+#define RT_HOST_SECTION(kind) section("__DATA,__totk_" #kind)
 #else
 #define RT_HOST_SECTION(kind) section("totk_" #kind)
 #endif
@@ -167,6 +173,9 @@ int mem_frozen(uint64_t a);                                // the 2 MiB region o
                                                            // since its freeze
 void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
                                                            // before a kernel write (file read) into guest memory
+void mem_touch(uint64_t a, uint64_t n);                    // commits the lazy guest heap (TOTK_HEAP_LAZY) over [a, a+n)
+                                                           // before a kernel or driver access; no-op otherwise
+void mem_commit_report(const char *when);                  // logs where the process's commit goes (TOTK_MEM_REPORT)
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);
                                                            // regions frozen now; freezes and thaws since the last call
 void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse after thread exit
@@ -182,6 +191,19 @@ const RtLoaded *ldr_module(int i);                         // order: main, subsd
 uint64_t ldr_symbol(const char *name);                     // exported definition, 0 if none
 uint64_t ldr_plt_stub(const char *module, const char *name); // PLT stub whose GOT slot holds name, 0 if none
 const char *ldr_describe(uint64_t a, char *buf, int n);    // "main+0x1234 (symbol+0x10)", "host <name>", or the address
+// DKB_HDR_TRACE=1 (ov_gfx.c): hdr_trace_on is the setting. hdr_trace_hit counts a call of the named HDR/colour-space
+// API and, for the first 20 and then every 600th, logs "hdr-trace: <name> #<count> from <caller>" and returns 1 so the
+// caller may log its arguments; 0 when off.
+int hdr_trace_on(void);
+int hdr_trace_hit(const Cpu *c, const char *name);
+// Logs the first 64 bytes at p (a guest metadata struct) as hex, "null" or "not readable"; call after a hdr_trace_hit
+// that returned 1.
+void hdr_trace_dump(const char *name, const void *p);
+// DKB_HDR_NATIVE=1 in effect (ov_gfx.c): the setting, on game 3.2.0 with hdr = 1. Read once.
+int hdr_native_on(void);
+// The peak in nits the game last said its HDR picture reaches (SetLayerNextHdrExtendedContentLuminanceRangeMetadata),
+// 0 before it said one (ov_gfx.c). Any thread.
+int hdr_game_content_peak(void);
 uint8_t *ldr_read_verified(const char *dir, const char *file, size_t *len);   // whole file, SHA-256 checked against
                                                            // modules.c (fatal on mismatch); free() it
 
@@ -191,6 +213,8 @@ extern const RtFileHash rt_exefs_sha256[];                 // tools/data/expecte
 extern const int rt_exefs_sha256_count;
 extern const char rt_default_exefs[], rt_default_romfs[], rt_default_profile[];
 extern const int rt_game_version;                          // the game build: 111 (1.1.1), 121 (1.2.1) or 143 (1.4.3)
+extern const char rt_game_target[];                        // build target, including dkb100 and dkb458752
+extern const char rt_game_display[];                       // the same version as a release name: 1.4.3, 1.0.0+458752
 extern const char rt_port_version[];                       // VERSION at the build's root: 0.1.0, 0.1.0+973c626 in a release
 #define RT_V111 (rt_game_version == 111)                    // 1.1.1: its own boot constants and data slots
 #define RT_V143 (rt_game_version >= 143)
@@ -260,8 +284,12 @@ void res_heapdef_served(void);                             // romfs.c serves the
 void res_init(void);                                       // after rt_patches_init: the patch page and the sets
 void dkb_wide_init(void);                                  // Bananza-only virtual display and camera patch values
 int dkb_wide_output(unsigned out[2]);                      // active mode; optional output gets its size or the stock size
-void res_sizes(unsigned out[2], unsigned scene[2]);      // the output and scene sizes in effect (the game's own
-                                                           // until res_init switched the sets on)
+int res_sizes(unsigned out[2], unsigned scene[2]);         // the output and scene sizes in effect (the game's own
+                                                           // until res_init switched the sets on). Bananza: the game's
+                                                           // upscaler output and input; 0 (both zero) when none ran
+                                                           // in the last 120 presents
+void res_note_upscaler(unsigned in_w, unsigned in_h, unsigned out_w, unsigned out_h);   // Bananza: a dispatch of the
+                                                           // game's upscaler (vk_exec_draw.c op_dispatch)
 int res_is_16x9(unsigned w, unsigned h);                   // within 1% of 16:9 (the test res_init and romfs.c share)
 int res_wants_wide_overlay(const unsigned out[2]);         // not 16:9 on a game version with the camera aspect patch
 void res_wanted(unsigned out[2]);                          // the output size TOTK_OUTPUT_RES asks for
@@ -300,6 +328,8 @@ typedef struct { const char *exefs, *romfs, *profile; int boot; double seconds; 
                                                            // frames: --frames N (0 = no limit); shot: --shot
                                                            // PATH; gpu: TOTK_GPU
 const RtConfig *rt_config(void);
+// 8-bit RGBA PNG with stored deflate blocks (boot.c); stops with rt_fatal when the file cannot be written.
+void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);
 void rt_boot_event(const char *what, Cpu *c, const char *detail);   // checkpoint log; "nvn" ends --boot
 void rt_boot(void);                                        // boot.c
 // Modes of totk.exe. main.c has run mem_init and parsed the paths; each mode calls ldr_load itself if it needs the

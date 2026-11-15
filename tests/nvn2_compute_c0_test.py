@@ -22,6 +22,28 @@ def function(source, start):
     return source[begin:end]
 
 
+def draw_context(source):
+    """vk_exec_draw.c's DrawCtx with the bounds and types it is built from, for fixtures that run its draw functions.
+
+    The functions reach the draw state as dc->X with dc = DC_OF(ex), so a fixture defines a DrawCtx, points its
+    VkExec at it and sets the members its cases need. A fixture that defines a bound itself keeps its own. DC_OF,
+    IS_HELPER, IN_SLICE and ON_HELPER are those of a translator that takes its context from VkExec.draw and is not a
+    helper's nor a slice thread's;
+    the entry points' hand-over to the helpers' copy (vk_exec_draw_h_*) is declared and never taken.
+    """
+    bounds = []
+    for name in ('MAX_BINDINGS', 'MAX_DESC', 'SUPPORT_BYTES'):
+        line = next(line for line in source.splitlines() if line.startswith(f'#define {name} '))
+        bounds.append(f'#ifndef {name}\n{line}\n#endif')
+    res = source[source.index('typedef struct { VkBuffer buf; VmaAllocation alloc;'):
+                 source.index('} CbRes;') + len('} CbRes;')]
+    ctx = source[source.index('// ---- the draw context'):source.index('} DrawCtx;') + len('} DrawCtx;')]
+    copy = ['#define DC_OF(ex) ((ex)->draw)', '#define IS_HELPER(dc) ((void)(dc), 0)', '#define IN_SLICE(dc) ((void)(dc), 0)',
+            '#define ON_HELPER(ex) 0',
+            '#include "vk_exec_draw_helper.h"']
+    return '\n'.join(bounds + [res, ctx] + copy) + '\n'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cc', default=os.environ.get('CC') or shutil.which('clang') or shutil.which('gcc'))

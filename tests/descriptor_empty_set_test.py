@@ -13,16 +13,16 @@ from pathlib import Path
 import shutil
 import subprocess
 
-from nvn2_compute_c0_test import function
+from nvn2_compute_c0_test import draw_context, function
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def source(draw):
     recorder = (ROOT / 'runtime/vk_rec.c').read_text()
-    context_start = draw.index('static struct {', draw.index('// State of the command buffer being recorded'))
-    context_end = draw.index('// The bound-slot bytes of VkExec', context_start)
-    context = draw[context_start:context_end]
+    # The draw context carries the switches of the descriptor memos, most of which bind_resources does not ask.
+    context = ('#pragma GCC diagnostic push\n#pragma GCC diagnostic ignored "-Wunused-function"\n' +
+               draw_context(draw) + '\n#pragma GCC diagnostic pop\n')
     declarations = '\n'.join(function(recorder, prefix) + suffix for prefix, suffix in (
         ('typedef struct { PFN_vkCmdPushDescriptorSetWithTemplateKHR fn;', ' A_PushTpl;'),
         ('typedef struct { PFN_vkCmdPushDescriptorSetKHR fn;', ' A_Push;')))
@@ -64,7 +64,8 @@ def main():
     for opt in ('-O0', '-O2'):
         exe = out / ('fixture' + opt + ('.exe' if os.name == 'nt' else ''))
         command = [args.cc, '-std=gnu11', opt, '-Wall', '-Wextra', '-Werror',
-                   '-Wno-missing-field-initializers',  # unchanged production BS/RS initializers
+                   '-Wno-missing-field-initializers',  # unchanged production initializers
+                   '-Wno-unused-variable', '-Wno-unused-const-variable',  # context statics the binder does not read
                    '-I', str(ROOT / 'runtime'), '-I', str(args.deps / 'include'),
                    '-I', str(args.deps / 'include/vma'), str(src), '-o', str(exe)]
         compiled = subprocess.run(command, capture_output=True, text=True, timeout=60)

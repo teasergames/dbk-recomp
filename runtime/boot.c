@@ -17,9 +17,8 @@
 #include "cfg.h"
 #include "fs.h"
 #include "gfx.h"
+#include "input.h"
 #include "nvn_api.h"
-#include "platform/platform.h"
-#include "vk.h"
 #include "platform/platform.h"
 
 #define SYM_INIT_START "_ZN2nn4init5StartEmmPFvvES2_S2_"
@@ -154,7 +153,7 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
 
 // ---- --seconds S
 // A PNG with stored (uncompressed) deflate blocks: no compression library, and the shot is only read by tools.
-// rt_write_png (declared in vk.h) is shared with the TOTK_DUMP frame dump (vk_dump.c).
+// rt_write_png (declared in host.h) is shared with the TOTK_DUMP frame dump (vk_dump.c).
 static uint32_t crc32_update(uint32_t crc, const uint8_t *p, size_t n) {
     static uint32_t table[256];
     if (!table[1])
@@ -318,9 +317,11 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     fflush(stdout);
     fflush(stderr);
     fs_save_flush();
-    vk_pipeline_save();   // no-op without the Vulkan back end
+    gfx_backend()->save();   // the pipeline cache and keys; nothing on a back end without a device
+    input_script_report();
     prof_write();
     fflush(stderr);
+    gfx_exit_release();
     plat_exit(0);
 }
 
@@ -340,7 +341,7 @@ static void guest_main(Cpu *c) {
 
 static void prewarm_main(void *arg) {
     (void)arg;
-    vk_pipeline_prewarm();
+    gfx_backend()->boot_prewarm();
     const char *prep = cfg_get("TOTK_TEST_PREPARE_SHADERS");   // Task 2.3 test hook; Task 2.6 builds the preparation
     if (prep && !strcmp(prep, "1")) {
         int cpus = (int)plat_cpu_usable();
@@ -349,9 +350,10 @@ static void prewarm_main(void *arg) {
     return;
 }
 
-void rt_boot(void) {
+static void boot_main(void *arg) {
+    (void)arg;
     check_npdm();
-    if (!rt_config()->shot) vk_pipeline_async_enable();   // a --shot image must not depend on build timing
+    if (!rt_config()->shot) gfx_backend()->boot_async();   // a --shot image must not depend on build timing
     // Shaders and pipelines recorded in earlier runs are made ready while the modules load; the guest waits for them.
     PlatThread *warm = plat_thread_new(prewarm_main, NULL, "prewarm");
     ldr_load(rt_config()->exefs);
@@ -365,11 +367,23 @@ void rt_boot(void) {
     hostfn_seal();
     uint64_t held = plat_now_ms();
     if (warm) plat_thread_join(warm);
-    else vk_pipeline_prewarm();
+    else gfx_backend()->boot_prewarm();
     held = plat_now_ms() - held;
     rt_log("boot: guest starts %llu ms after process start (%llu ms of it waiting for the prewarm)",
            (unsigned long long)(plat_process_uptime_ns() / 1000000), (unsigned long long)held);
     rt_guest_start_ns = kern_now_ns();
     kern_run_on_guest_main(guest_main);
     rt_fatal("boot: the guest main thread ended");
+}
+
+void rt_boot(void) {
+#ifdef __APPLE__
+    // macOS runs AppKit, and with it SDL's video and window events, on the process's main thread only: the guest boot
+    // moves to a thread of its own and the caller runs the window's event loop until the guest ends the process.
+    if (!plat_thread_spawn(boot_main, NULL, "game", 0)) rt_fatal("boot: cannot start the game thread");
+    gfx_window_main_thread();
+    return;   // not reached: the main thread only leaves with the process
+#else
+    boot_main(NULL);
+#endif
 }

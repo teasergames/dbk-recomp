@@ -13,7 +13,7 @@ from pathlib import Path
 import shutil
 import subprocess
 
-from nvn2_compute_c0_test import function
+from nvn2_compute_c0_test import draw_context, function
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,6 +27,7 @@ def source():
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include "nvn_hmap.h"
 #include "vk_exec.h"
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
@@ -50,6 +51,9 @@ void rt_log(const char *format,...) {
     else other_logs++;
 }
 #define gfx_shader_is_nvn2 original_is_nvn2
+''' + draw_context(draw) + r'''
+// The replay thread's draw context: the logger's switch and record cap (GCL) are in it.
+static DrawCtx ctx={.GCL.on=-1};
 '''
     classifier = function(shader, "int gfx_shader_is_nvn2(")
     providers = r'''
@@ -62,8 +66,8 @@ int gfx_shader_is_nvn2(const uint8_t *control) {
 }
 // Stage discovery is an explicit provider. The actual logger must reject raw
 // compact controls before this legacy-shaped metadata lookup is called.
-static int find_stage(const prog_t *program,int stage,const uint8_t **control,const uint8_t **code,uint32_t *length) {
-    stage_lookups++;
+static int find_stage(DrawCtx *dc,const prog_t *program,int stage,const uint8_t **control,const uint8_t **code,uint32_t *length) {
+    (void)dc;stage_lookups++;
     CHECK(program && program->nstage<=6,"legacy stage provider requires a bounded program");
     if(!program || program->nstage>6)return 0;
     for(uint32_t i=0;i<program->nstage;i++) {
@@ -99,7 +103,7 @@ int vk_mem_inspect(uint64_t address,uint64_t size,VkMemInspect *out) {
 static void initialize(VkExec *ex,prog_t *program) {
     memset(ex,0,sizeof *ex);memset(program,0,sizeof *program);
     memset(controls,0,sizeof controls);memset(compact,0,sizeof compact);
-    program->nstage=3;program->serial=17;ex->prog=program;ex->prog_stages=31;
+    program->nstage=3;program->serial=17;ex->prog=program;ex->prog_stages=31;ex->draw=&ctx;
     for(unsigned i=0;i<3;i++) {
         uint32_t stage=(uint32_t)stages[i];memcpy(controls[i]+0x714,&stage,4);
         program->sd[i]=(NVNshaderData){(NVNbufferAddress)(uintptr_t)(code_tokens+i),controls[i]};

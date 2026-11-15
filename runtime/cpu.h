@@ -47,7 +47,15 @@ static inline uint64_t rt_get_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0,
 static inline uint64_t rt_get_fpsr(void) { uint64_t v; __asm__ volatile("mrs %0, fpsr" : "=r"(v)); return v; }
 static inline void rt_set_fpcr(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
 static inline void rt_set_fpsr(uint64_t v) { __asm__ volatile("msr fpsr, %0" :: "r"(v)); }
-static inline void rt_fpcr_sync(const Cpu *c) { (void)c; }
+// Code lifted with --simd=c keeps the guest FPCR in c->fpcr and never writes the hardware register itself, so the host
+// FPCR of a thread running guest code is made equal to it here (FZ, DN, AHP and RMode are the bits the guest can set).
+// The FP helpers of runtime/simd.h then flush denormals, propagate NaNs and round as the instruction does, with no
+// switching around one operation. Called wherever FPCR or the host FP context changes: MSR FPCR (recomp/lifter.py),
+// thread and fiber entry, host code calling guest code, fiber resume (the same places as on x86-64).
+static inline void rt_fpcr_sync(const Cpu *c) {
+    uint64_t want = c->fpcr & 0x7c00000ull;
+    if (rt_get_fpcr() != want) rt_set_fpcr(want);
+}
 #else
 // Host FP state is not the guest's here: code lifted with --simd=c keeps FPCR/FPSR in Cpu (c->fpcr, zeroed
 // with the Cpu), so the host-side reset in thread start-up has nothing to do.

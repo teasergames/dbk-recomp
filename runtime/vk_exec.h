@@ -2,12 +2,17 @@
 // handles of a submission, keeps render targets, passes, clears and fixed-function state; draws, binds and dispatches
 // (vk_exec_draw.c) and copies, counters, events and conditional rendering (vk_exec_xfer.c) plug in through the two
 // hooks at the bottom.
-// Runs on the submitting thread under vk_sync_submit's lock: no locking inside.
+// Runs on the submitting thread under vk_sync_submit's lock: no locking inside. The only other threads that walk ops
+// are the helpers (vk_spec.h): each translates a part of a long run of draws with a VkExec of its own and the helpers'
+// copy of the draw translator (vk_exec_draw_helper.c) with a draw context of its own, reads the shared tables without
+// changing them and gives its part up where it would have to.
 // The op loop follows MacNativeGames nvn_mtl.m (MIT, Copyright (c) 2026 jhaizhou) and the pass handling LAS Recomp
 // (MIT, Copyright (c) 2026 Peiikai); vk_exec.c names the sources.
 #pragma once
 #include <stdint.h>
 
+#include "gfx.h"
+#include "gfx_c0.h"
 #include "nvn_api.h"
 #include "vk.h"
 
@@ -107,6 +112,9 @@ typedef struct VkExec {
     const void *fb_fs;                   // feedback_scan's memo: fragment shader, texture bind serial, pass serial
     uint32_t fb_serial, fb_pass, fb_sampled;
     uint32_t tex_serial, pass_serial;    // bumped by every texture or image bind and pass begin
+    // The draw context of the thread recording into this VkExec (vk_exec_draw.c DrawCtx): the replay thread's for X,
+    // helper k's for its part's copy. Last, so the part copies and compares of vk_exec.c (par_join, par_same) skip it.
+    struct DrawCtx *draw;
 } VkExec;
 
 typedef void (*VkExecWorkFn)(VkExec *ex, void *context);
@@ -134,8 +142,19 @@ VkCommandBuffer vk_exec_inline_begin(int *reopen);
 int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out);
 void vk_exec_inline_end(int reopen);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
-// buffers): the replay continues in a new one (vk_sync_split).
-void vk_exec_draw_new_cb(void);
+// buffers) in ex's draw context: the replay continues in a new one (vk_sync_split).
+void vk_exec_draw_new_cb(VkExec *ex);
+// Parallel passes (vk_exec.c par_start): vk_exec_par_hazard, on a thread recording a slice, marks that the slice
+// needed something only the primary may do (the call is then dropped and the pass's targets are not sliced again).
+void vk_exec_par_hazard(void);
+// As vk_exec_par_hazard for a draw whose effect depends on the order of draws across slices (a storage buffer write):
+// the pass's targets are not sliced again from the next pass on.
+void vk_exec_par_order_hazard(void);
+// vk_exec_xfer.c: 1 while occlusion queries count draws (a sliced pass is not started then).
+int vk_exec_oq_counting(void);
+int vk_exec_oq_begin_outside(VkExec *ex, VkQueryControlFlags *flags, int *open);   // vk_exec_xfer.c, sliced passes
+int vk_exec_oq_sliceable(void);   // vk_exec_xfer.c: no query counting, or the device inherits queries
+void vk_exec_oq_pass_ended(VkExec *ex);
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
 // vk_exec.c: the stand-in a 3D BC render target is drawn through goes with its image (vk_exec_image_gone).
 void vk_exec_bc_gone(VkImage image);
@@ -148,17 +167,40 @@ int vk_exec_targets_recent(VkExec *ex, int any);
 // The current pass's targets with their formats, extents and the frames they were last rendered in (diagnostics).
 void vk_exec_targets_describe(VkExec *ex, char *buf, size_t cap);
 
-// TOTK_TRACE=gfx: replay counters of the current frame, logged and reset at each present (vk_exec_frame_log).
-typedef struct {
-    uint64_t passes, draws_seen, draws, clears, copies, dispatches, submits;
-    uint64_t fb_draws, fb_barriers, fb_restarts, fb_layouts;   // feedback loops: draws sampling a written target of
-                                                               // their pass, in-pass barriers, pass restarts, layout
-                                                               // transitions
-} VkExecFrame;
+// upscaler = dlss (vk_dlss.c), from vk_exec_draw.c. vk_dlss_scene_draw: a draw about to be recorded with a depth
+// target; it notes the scene's depth and camera for the frame's evaluation. vk_dlss_jitter: sets j (pixels) to the
+// viewport offset of draws into depth when it is the scene depth DLSS last ran on; j stays as it is otherwise.
+// vk_dlss_image_gone: image is being destroyed (vk_exec_image_gone). On a helper thread (vk_spec.h) the first two
+// note into a slot of that helper's part: vk_dlss_part_begin empties helper k's when the replay thread launches its
+// part, and vk_dlss_part_taken makes its notes the frame's when the part is taken (vk_exec.c par_launch, par_join).
+void vk_dlss_scene_draw(const VkExec *ex);
+void vk_dlss_jitter(VkImage depth, float j[2]);
+void vk_dlss_part_begin(int k);
+void vk_dlss_part_taken(int k);
+void vk_dlss_image_gone(VkImage image);
+
+// TOTK_TRACE=gfx: replay counters of the current frame, logged and reset at each present (vk_exec_frame_log). The
+// struct is the back end's (gfx.h GfxExecFrame), since the flight recorder reads it through GfxBackend.exec_frame.
+typedef GfxExecFrame VkExecFrame;
 extern VkExecFrame vk_exec_frame;
+// TOTK_REPLAY_PAR=check: a digest per draw of what a translator bound and recorded for it, VK_EXEC_DIG_W words: the
+// image views, their samplers, their layouts, the ranges of the uniform buffers, those buffers and their offsets where
+// both translators resolve to the same one, the bytes of the ones each translator filled itself, the ranges and the
+// buffers of the storage buffers, the pipeline with its layout and dynamic state, the vertex and index buffers, the
+// commands recorded.
+// _begin starts the list, _draw closes a draw's entry (called before the next draw), _end closes the last and returns
+// the list. Each draw context has its own: the list of ex->draw.
+#define VK_EXEC_DIG_W 11
+void vk_exec_draw_digest_begin(const VkExec *ex);
+void vk_exec_draw_digest_draw(const VkExec *ex);
+uint32_t vk_exec_draw_digest_end(const VkExec *ex, const uint64_t **d);
 void vk_exec_frame_written(const tex_t *t);                    // vk_texture_gpu_written: t rendered or copied into
 uint64_t vk_exec_recording_fence(void);                        // fence of the submission this thread records, else 0
 void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
+// Running totals since the start: draws and dispatches the replay walked, and descriptor pools taken by command buffers
+// (spare or new) and created. Replay thread (TOTK_TRACE=perf, vk_sync.c).
+uint64_t vk_exec_draws_total(void);
+void vk_exec_pool_counts(uint64_t *created, uint64_t *taken);
 
 // TOTK_DUMP=<frame> (vk_dump.c): between presents frame-1 and frame, every pass's targets and every dispatch's storage
 // images are copied out and written as PNGs to TOTK_DUMP_DIR (default "dump"), with passes.txt (targets, pipelines,
@@ -173,7 +215,7 @@ void vk_dump_present(uint64_t frame);    // vk_be_present: waits for the dump fr
 
 // c0, the NVN driver constant bank of one stage (vk_exec_draw.c; TOTK_FIX_C0=0 binds zeros instead): bank is
 // VK_C0_BYTES, stage an NVN stage (0 vertex, 1 fragment, 5 compute), ssbo and ubo the 16 bound slots of that stage.
-#define VK_C0_BYTES NVN2_C0_BYTES
+#define VK_C0_BYTES GFX_C0_BYTES
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance);
 
@@ -192,3 +234,34 @@ void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload);
 // when counting and none is active), and the open pass about to end (ends the active query).
 void vk_exec_oq_draw(VkExec *ex);
 void vk_exec_oq_pass_end(VkExec *ex);
+int vk_exec_oq_idle(void);   // no draw is being counted: a helper part records no query
+
+// ---- the helper threads' draws (vk_spec.h)
+// A helper thread runs vk_exec_op_draw and the vk_exec_draw_digest_* calls like the replay thread, on a VkExec whose
+// draw context is its own (VkExec.draw; vk_exec_draw.c, the end of the file); these entry points pass such a VkExec
+// on to the helpers' copy of the translator (vk_exec_draw_helper.c). What exists once is the replay thread's: a
+// helper makes no stand-in (vk_exec_draw_storage_standin with create 0 only looks one up), but a view of a registered
+// texture that is missing is created in the one cache, under the texture lock, as the replay thread would at the same
+// draw.
+VkImageView vk_exec_draw_storage_standin(int di, VkFormat fmt, int create);
+// Forgets every shortcut that assumes the VkExec the translator saw last: the replay goes on from another one (the
+// helper's state at a join, the replay thread's at a launch), in ex's draw context. Includes vk_exec_draw_new_cb.
+void vk_exec_draw_rebase(VkExec *ex);
+// The replay thread's draw context, which VkExec.draw of its state points at.
+struct DrawCtx *vk_exec_draw_main(void);
+// Replay thread, helper k idle: readies helper k's draw context for a part (made the first time; it takes the inline
+// uniform updates noted so far) and returns it, for the VkExec.draw of the helper's copy. NULL: no part now (no
+// stand-ins yet).
+struct DrawCtx *vk_exec_draw_helper_begin(int k);
+// Helper k's counters of its part (its context's), added to vk_exec_frame when the part is taken.
+VkExecFrame *vk_exec_draw_helper_frame(int k);
+
+// ---- the threads that record slices of parallel passes (vk_exec.c par_record)
+// Recording thread k (0 the submitting thread, 1 and up the workers) replays its slices into a VkExec whose draw context
+// is vk_exec_draw_slice_ctx(k), so they run the helpers' copy of the translator. _begin, on the submitting thread at a
+// sliced pass's start while no slice is recorded, makes the contexts of threads 0 to threads-1 and gives them the
+// inline uniform updates noted so far; _end, once every slice of the pass is recorded, adds their frame counters to
+// vk_exec_frame.
+void vk_exec_draw_slices_begin(int threads);
+struct DrawCtx *vk_exec_draw_slice_ctx(int k);
+void vk_exec_draw_slices_end(int threads);

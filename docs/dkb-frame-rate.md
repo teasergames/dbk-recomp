@@ -1,9 +1,10 @@
 # Experimental Bananza frame timing
 
 Bananza 1.0.0 can adjust game timing to measured frame duration. This is
-experimental and off by default. Enable the existing **Game speed follows the
-clock** option (`DKB_REALTIME=1`, or `realtime = 1` in `dkb.ini`; `TOTK_REALTIME` is still accepted) and restart
-once. With it enabled, the existing frame-rate selector, including Monitor rate,
+experimental and off by default. In **Display → Frame rate**, enable **Allow higher frame rates**
+and restart once. The same setting is `DKB_REALTIME=1` (or `TOTK_REALTIME=1`)
+in the environment, or `realtime = 1` in `dkb.ini`.
+With it enabled, the frame rate limit, including **Monitor refresh**,
 applies cap changes without restarting. The default cap remains 60 FPS. TotK
 retains its existing on-by-default timing setting.
 No new frame-rate choices are added. Numeric caps in configuration accept 30
@@ -37,7 +38,7 @@ At the rate hook `1ead24`, `x8` is dead: the next call at `1ead28` targets
 - Review revision, Windows, Ryzen 7 9800X3D, RTX 5090, 240 Hz display:
   a 60-second save-load and scripted cave run with no timing opt-in exited
   successfully; the log confirmed `realtime off` and original game timing.
-- A 72-second opt-in run switched 60 → 120 → 240 → 30 → 45 → 60 → Monitor rate
+- A 72-second opt-in run switched 60 → 120 → 240 → 30 → 45 → 60 → Monitor refresh
   (239.984 Hz) → 60 through the live settings API without restarting and exited
   successfully. At the 240 cap, short cave samples achieved about 184–193 FPS;
   settled simulation/wall-time ratios there were 0.996–1.002. The native present

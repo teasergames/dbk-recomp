@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "nvn_hmap.h"
 #include "vk_exec.h"
 #define MAX_BINDINGS 128
 #define MAX_DESC 1024
@@ -13,7 +14,9 @@
 #define NVN_STAGE_GS 2
 #define NVN_STAGE_CS 5
 #define A8(x) (((x) + 7) & ~(size_t)7)
+#define DP_MARK(i) ((void)(i))   // the draw profile's marks time nothing here
 @CONTEXT@
+static DrawCtx ctx;   // the replay thread's draw context; TOTK_REPLAY_PAR=check's digest (DIG) is off
 
 static unsigned checks, failures, pushed[2], written[2], allocated[2], bound[2];
 static const char *case_name;
@@ -22,7 +25,7 @@ static VkCtx context;
 static VkDescSlot expected[2][8];
 static uint32_t expected_count[2], expected_bindings[2];
 static VkDescriptorBufferInfo buffers[6][32];
-static struct { VkBufferView zview; } Z;
+static struct { VkBufferView zview; } standins;
 #define TOKEN(type,n) ((type)(uintptr_t)(n))
 #define CHECK(c,message) do { checks++; if (!(c)) { failures++; \
     fprintf(stderr,"FAIL %s template=%d push=%d validation=%d: %s\n", \
@@ -30,13 +33,15 @@ static struct { VkBufferView zview; } Z;
 
 void rt_fatal(const char *fmt,...) { (void)fmt; abort(); }
 VkCtx *vk_ctx(void) { return &context; }
-static void bind_stats(const VkPipeInfo *info) { (void)info; }
-static int bind_skip_on(void) { return 0; } // exercise every descriptor build
+int rt_knob(const char *name,const char *def) { (void)name; (void)def; return 0; } // dynamic uniform buffers off
+int rt_ab(void) { return 0; }
+static void bind_stats(DrawCtx *dc,const VkPipeInfo *info) { (void)dc; (void)info; }
+static int bind_skip_on(DrawCtx *dc) { (void)dc; return 0; } // exercise every descriptor build
 static int push_skip_on(void) { return 0; } // exercise every push
 static int bind_sig(const VkExec *ex,const VkPipeInfo *info) { (void)ex; (void)info; abort(); }
 void vk_mem_count(int cls,int use,uint64_t bytes) { (void)cls; (void)use; (void)bytes; abort(); }
 static void support_in(const VkExec *ex,float in[3]) { (void)ex; (void)in; abort(); }
-static void support_fill(uint8_t *out,float x,float y,float z) { (void)out; (void)x; (void)y; (void)z; abort(); }
+void gfx_support_fill(uint8_t *out,float x,float y,float z) { (void)out; (void)x; (void)y; (void)z; abort(); }
 static void *scratch(VkExec *ex,uint32_t n,VkBuffer *buffer,VkDeviceSize *offset) {
     (void)ex; (void)n; (void)buffer; (void)offset; abort();
 }
@@ -49,8 +54,21 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex,int stage,const GfxShaderRes 
 }
 void vk_texture_lock(void) { abort(); }
 void vk_texture_unlock(void) { abort(); }
-static void tex_info(VkExec *ex,const GfxShaderRes *r,uint64_t h,int image,int separate,VkDescriptorImageInfo *out) {
-    (void)ex; (void)r; (void)h; (void)image; (void)separate; (void)out; abort();
+static void tex_info(VkExec *ex,const GfxShaderRes *r,uint64_t h,int image,int separate,uint32_t gen,uint32_t ep,
+                     uint32_t sg,int *locked,VkDescriptorImageInfo *out) {
+    (void)ex; (void)r; (void)h; (void)image; (void)separate; (void)gen; (void)ep; (void)sg; (void)locked; (void)out;
+    abort();
+}
+// The descriptor memos' keys: one unchanged descriptor context for every case.
+static void descriptor_state(VkExec *ex) { (void)ex; }
+uint32_t vk_texture_slots_gen(void) { return 0; }
+uint32_t vk_texture_epoch(void) { return 0; }
+uint32_t vk_sampler_gen(void) { return 0; }
+// TOTK_REPLAY_PAR=check's digest of what a draw bound: off.
+static void dig_bound(DrawCtx *dc) { (void)dc; abort(); }
+static void dig_desc(DrawCtx *dc,const VkPipeInfo *info,const VkDescSlot *d) { (void)dc; (void)info; (void)d; abort(); }
+static int tex_info_hit(VkExec *ex,const GfxShaderRes *r,uint64_t h,int separate,VkDescriptorImageInfo *out) {
+    (void)ex; (void)r; (void)h; (void)separate; (void)out; abort();
 }
 
 // Bounded malloc storage supplies alignment without imposing an array's declared
@@ -163,13 +181,13 @@ static void consume(void) {
 }
 static void run(const char *name,uint32_t vs,uint32_t fs,int compute,int default_sets) {
     case_name=name;
-    memset(&B,0,sizeof B); memset(&DS,0,sizeof DS); memset(&RS,0,sizeof RS);
+    memset(&ctx,0,sizeof ctx);
     memset(pushed,0,sizeof pushed); memset(written,0,sizeof written);
     memset(allocated,0,sizeof allocated); memset(bound,0,sizeof bound);
     memset(expected,0,sizeof expected); memset(expected_count,0,sizeof expected_count);
     memset(expected_bindings,0,sizeof expected_bindings); packet_count=0; pending=consuming=NULL;
     context.validation=validation;
-    VkExec ex={.cb=TOKEN(VkCommandBuffer,71)}; rec_cb=ex.cb;
+    VkExec ex={.cb=TOKEN(VkCommandBuffer,71),.draw=&ctx}; rec_cb=ex.cb;
     GfxShaderRes resources[4]={{0}}; VkPipeBinding bindings[4]={{0}};
     VkPipeInfo info={.layout=TOKEN(VkPipelineLayout,91),.set_layout=TOKEN(VkDescriptorSetLayout,81),
         .set_layout1=TOKEN(VkDescriptorSetLayout,82),.bind_point=compute?VK_PIPELINE_BIND_POINT_COMPUTE:VK_PIPELINE_BIND_POINT_GRAPHICS,

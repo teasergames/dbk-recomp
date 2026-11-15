@@ -3,11 +3,36 @@
 For the Windows release's headless Easy Setup, settings and save backup integration,
 see [RecompLauncher](recomplauncher.md).
 
-## Bananza base 1.0.0
+## Bananza 1.0.0 and 3.2.0
 
-The folder installer accepts an already dumped base 1.0.0 ExeFS (`main`, `sdk`, `rtld`, `main.npdm`) and either a
-loose RomFS folder or a folder containing `romfs.bin` and `index.json`. No keys or update are requested. An update
-ExeFS fails the pinned SHA-256 checks in `tools/data/expected-dkb100.json` before the installer creates output or logs.
+The installer takes the game as one `.nup` file, or as an already dumped ExeFS (`main`, `sdk`, `rtld`, `main.npdm`)
+and either a loose RomFS folder or a folder containing `romfs.bin` and `index.json`. No keys are requested. Two builds
+are supported, each pinned by the SHA-256 of its ExeFS: base 1.0.0 (`dkb100`, `tools/data/expected-dkb100.json`) and
+update 3.2.0 (`dkb458752`, title version 458752, `tools/data/expected-dkb458752.json`). The `main` hash picks the
+target; any other ExeFS, or a mix of the two, fails these checks before the installer creates output or logs.
+
+### .nup input
+
+A `.nup` is the container Eglantine and Eden load: loose ExeFS and RomFS trees for the base, its updates and add-on
+content, every file raw or zstd-compressed and listed with its size and SHA-256 in a table of contents whose own
+SHA-256 is in the superblock. `tools/extract_nup.py` reads it (an independent reader of Eglantine's
+`core/file_sys/nup_container.cpp` format).
+
+- What is installed follows Eglantine's loader (`core/loader/nup.cpp`, `AppLoader_NUP`): with `--nup-package latest`,
+  the default, the ExeFS of the newest update package (the base's when the update has none) and the base RomFS with
+  the update's RomFS laid over it, a file of the update replacing the one at the same path and folders merging
+  (`NupContainer::MergeShadowDirs`). A standalone update package without a base gives its own trees.
+  `--nup-package base` installs 1.0.0 from a container that also holds an update. Add-on content is ignored.
+- Preflight reads only the table of contents: the target by the recorded SHA-256 of `main`, every pinned ExeFS hash
+  against its record, and the RomFS file list (path, size, SHA-256) in the form a loose folder gives, so the identity
+  of the data step is the same as for the same files in a folder. An update that is neither target stops with
+  `dkb.nup_version`, which names its version. When a selected file is zstd-compressed, the Python that runs the
+  tools must decompress zstd (`compression.zstd` of Python 3.14, which the Windows release ships, the `zstandard`
+  module or a `zstd` program), or setup stops with `dkb.nup_zstd`.
+- The data step runs `extract_nup.py --select <latest|base> --pack`, which writes the ExeFS and packs the RomFS straight
+  from the container into `romfs.bin` and `index.json` in `tools/dkb_pack_romfs.py`'s layout (no loose 19 GB copy),
+  checking every file against its SHA-256 record. The image is then read back against the preflight list as for loose
+  input. The container is not hashed as a whole; a change after preflight shows up as a failed record check.
 
 Run from this checkout with Python 3.12 or later, with the generator's dependencies (`tools/requirements.txt`). The
 window also needs tkinter. The source checkout must contain the full runtime; the older TotK prebuilt runtime
@@ -24,6 +49,7 @@ into the installer. `--toolchain`, `--deps`, `--ninja` and `--dll-dir` override 
 the installer checks this checkout's existing toolchain layout. It never installs tools globally.
 
 ```
+python -m installer --game bananza --nup "<dump>/game.nup" --dest "<install folder>" --package "<tools>" --jobs 6
 python -m installer --game bananza --exefs "<dump>/base/exefs" --romfs "<dump>/base/romfs" --dest "<install folder>" --package "<tools>" --jobs 6
 ```
 
@@ -39,21 +65,24 @@ The native window uses the same CLI, steps and cancellation mechanism:
 python -m installer.gui --package "<tools>"
 ```
 
-Its pickers select ExeFS, RomFS, the optional tool package, language and destination. The individual tool overrides,
+Its pickers select a `.nup` file or the ExeFS and RomFS folders, the optional tool package, language and destination.
+The window always installs the newest supported content of a `.nup`; `--nup-package base` is a command-line option. The individual tool overrides,
 including `--translator` and `--dotnet`, also work on this command. `--game totk` selects the inherited TotK window.
 
 The Bananza steps are:
 
-1. Hash the supported ExeFS and all loose RomFS input files, reject overlapping or linked input/output paths,
+1. Hash the supported ExeFS and all loose RomFS input files (for a `.nup`, read their records from its table of
+   contents), reject overlapping or linked input/output paths,
    validate the tool paths and translator identity, then check disk space, AVX2 and Vulkan 1.3.
-2. Stage ExeFS and run `tools/dkb_pack_romfs.py` for loose input. Read the packed image back, check its image checksum
+2. Stage ExeFS and run `tools/dkb_pack_romfs.py` for loose input, or `tools/extract_nup.py --pack` for a `.nup`. Read the packed image back, check its image checksum
    and every file against the initial content snapshot, then copy verified files into the destination. A prepacked
    input's checksum and bounds are checked too. This verifies packing integrity; a loose dump has no NCA hash tree
    to authenticate its original contents.
 3. Prepare the matching shader translator.
-4. Generate `main,sdk` into the temporary folder with the required `recomp/patches-dkb100.txt`. Missing applied patches
-   stop the build. `subsdk0` is not generated.
-5. Build `dkb100` from the current runtime sources with `tools/build_game.py`, without `--runtime-lib`, then copy the
+4. Generate `main,sdk` into the temporary folder with the target's patch table: `recomp/patches-dkb100.txt`, whose
+   missing applied patches stop the build, or the deliberately empty `recomp/patches-dkb458752.txt`. `subsdk0` is not
+   generated.
+5. Build the target (`dkb100` or `dkb458752`) from the current runtime sources with `tools/build_game.py`, without `--runtime-lib`, then copy the
    executable, runtime libraries and RomFS index into place. The default worker limit is six; `--jobs` changes it.
 6. Translate the game's shaders: `tools/dkb_shader_census.py` lists the shader stages in the packed RomFS into
    `seed-nvn2.bin`, `dkb.exe --translate-shaders` lowers and translates them into the shader cache beside the executable
@@ -138,7 +167,8 @@ keeps `profile/`. Saves carry over both ways: 1.4.3 converts a 1.2.1 save on loa
 1. **Check** before writing anything: the files open with the keys, the update is 1.2.1 or 1.4.3 (by hash, as
    `tools/extract.py`), the keys are new enough for the update, enough space is free on the target disk (about 36 GiB at the peak of a
    first install, 20 GiB after it), the CPU has
-   AVX2 (`-march=x86-64-v3`), a Vulkan 1.3 GPU exists. Each failure is one clear message.
+   AVX2 (`-march=x86-64-v3`), a Vulkan 1.3 GPU exists. Each failure is one clear message. On Windows the Bananza
+   installer also warns, without stopping, when the commit limit (RAM plus page file, from `hostcheck.c`) is under 24 GiB.
 2. **Extract** ExeFS and RomFS into the install folder and verify the hashes.
 3. **Lift** the ExeFS to C (`recomp/gen.py`, `recomp/patches-v121.txt` or `patches-v143.txt`) into a temp folder next
    to the installer.
@@ -178,6 +208,8 @@ python -m installer --base FILE --update FILE --keys FILE --lang CODE --dest DIR
   finish screen with Open folder. English or Russian, chosen from the Windows display language, switchable in the
   window; every sentence is an id in `installer/text/<en|ru>.json`. A folder with `totk-install.json` needs only the
   folder. `--selftest [--shots DIR]` builds every screen in both languages and closes itself.
+  The look follows the in-game menu (bark browns, banana yellow, cream text, red and green accents) as a ttk theme on
+  clam with a drawn banana-bunch header; no game art or fonts. Text colours keep at least 4.5:1 on their background.
 - `tests/installer_gui_test.py`: event model, form, catalogs, cancel, the self-closing window and one end-to-end run
   of the CLI in `--verify` mode (needs `build/install-test` and `build/extracted/v121`; see its docstring).
 - `tests/installer_test.py`: bookkeeping with fake steps. `tests/installer_e2e.py`: a dev-mode run with the files of
@@ -203,8 +235,8 @@ totk.ini.example, VERSION  the default ini; the release string (the repository's
 `make_release.py --game dkb` makes the Bananza folder (`DKB-Setup-<version>-windows.zip` with `--zip`) from the
 same layout, with these differences: the launcher is `DKB-Setup.exe` (its two messages are the `dkb.launcher.*` ids);
 `runtime/` holds every runtime source instead of `libtotkrt.a`, because the installer compiles the whole runtime at
-install time; `bin/` has no `hactool.exe` (Bananza reads plain ExeFS and RomFS folders); `tools/` adds
-`build_xlate.py`, `dkb_pack_romfs.py`, `dkb_shader_census.py`, `vendor/ryujinx` and `xlate` (the translator is built
+install time; `bin/` has no `hactool.exe` (Bananza reads plain ExeFS and RomFS folders or a `.nup`); `tools/` adds
+`build_xlate.py`, `dkb_pack_romfs.py`, `dkb_shader_census.py`, `extract_nup.py`, `vendor/ryujinx` and `xlate` (the translator is built
 at install); the lifted tree is `dkb100` instead of `v121`/`v143`.
 
 - SDL3 comes from the upstream release, not MSYS2: MSYS2's DLL imports the LGPL libiconv.
@@ -214,7 +246,26 @@ at install); the lifted tree is `dkb100` instead of `v121`/`v143`.
 
 ## Linux release
 
-TotK only. There is no Linux release of Bananza yet; its release is the Windows `DKB-Setup-<version>-windows.zip`.
+TotK only. The AppImage described here is TotK's; Bananza has the source packages below.
+
+### Bananza Linux and macOS packages
+
+Preview. `DKB-Setup-<version>-linux-x86_64.tar.gz` and `DKB-Setup-<version>-macos-arm64.zip` are built by
+`tools/make_release_posix.py --platform linux|macos --zip` in `.github/workflows/dkb-release.yml`, next to the Windows
+zip. They carry no binaries and no game data: the player already has the system packages, and the build runs on their
+machine. The folder holds `installer/`, `recomp/`, `tools/` (with the translator and its vendored sources), every
+`runtime/` source and header, `data/`, `licenses/`, `THIRD_PARTY_NOTICES.md`, `LICENSE*`, `VERSION` (version and commit, as
+on Windows), `dkb.ini.example`, `README-SETUP.txt` and `setup.sh` (Linux) or `setup.command` (macOS).
+
+The flow: unzip (the executable bit is kept), run `./setup.sh --check` to list what is missing (clang, lld, ninja, SDL3,
+Opus, libvpx, zstd, Vulkan headers, spirv-tools, .NET 10 SDK, uv, Git; Linux 6.7 or later, or macOS 14.4 or later on
+arm64) with the apt, dnf, pacman or brew command that installs it, then `./setup.sh --exefs DIR --romfs DIR --dest DIR`.
+Without `--check` the script creates `.venv` with uv (Python 3.12), installs `tools/requirements-installer.txt` and runs
+`python -m installer --game bananza` with the same arguments. It never uses sudo. The CI jobs run `--check` and
+`python -m installer --help` inside the assembled folder; they never see game files. The folder has no `python/`, so the
+installer runs in its repository mode: system clang, ninja and libraries, temp folder `build/install-temp`. Status: on
+Linux the build from source is verified on AMD and NVIDIA; macOS boots to the mode select without the destructible
+terrain ([building.md](building.md)).
 
 `tools/make_release_linux.py` builds the same setup for Linux and packs it as `TotK-Setup-x86_64.AppImage` (the static
 type-2 runtime: no libfuse2 needed on the host). The player makes it executable and starts it; on a Steam Deck, from

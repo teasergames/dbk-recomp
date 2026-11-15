@@ -4,8 +4,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include "vk_exec.h"
+#include "vk_spec.h"
 
 VkExecFrame vk_exec_frame;
+_Thread_local int vk_spec_here;   // 0: the clears run as the replay thread records them
+int vk_spec_fail(int why) { (void)why; return 1; }
+void vk_spec_event(void) {}
 enum { W_CLEAR_TARGET, W_CLEAR_MASK, W_STENCIL_MASK };
 static int failures, checks, masked, barriers, forgotten, gpu_written, attachment, transfer;
 static uint32_t layers[8], masks[8], values[8], samples_seen[8];
@@ -19,8 +23,10 @@ static void warn_once(int key, const char *fmt, ...) { (void)key; (void)fmt; }
 VkRect2D vk_exec_scissor(const VkExec *ex) { (void)ex; return rect; }
 void vk_exec_barrier(VkExec *ex) { barriers++; ex->in_pass = 0; }
 void vk_exec_pass_begin(VkExec *ex) { ex->in_pass = 1; }
-void vk_exec_draw_new_cb(void) { forgotten++; }
+void vk_exec_draw_new_cb(VkExec *ex) { (void)ex; forgotten++; }
 void vk_texture_gpu_written(const tex_t *t) { (void)t; gpu_written++; }
+// The replay thread's side of vk_exec.c target_written; a checkout from before it calls vk_texture_gpu_written itself.
+static void target_written(const VkExecTarget *t, uint64_t stamp) { (void)stamp; vk_texture_gpu_written(t->tex); }
 static VkImageView view_of(VkExec *ex, const VkExecTarget *t) {
     (void)ex;
     CHECK(t->layers == 1 && t->view_type == VK_IMAGE_VIEW_TYPE_2D);

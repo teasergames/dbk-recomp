@@ -20,7 +20,8 @@ uint64_t perf_begin(void) { return 0; }
 void perf_end(int kind, uint64_t start) { (void)kind; (void)start; }
 void perf_count(int kind) { (void)kind; }
 void rt_log(const char *format, ...) { (void)format; }
-const char *cfg_get(const char *name) { (void)name; abort(); }
+// gfx_spirv_final reads the FMZ switches; every other key stays forbidden.
+const char *cfg_get(const char *name) { if (!strcmp(name, "TOTK_FMZ") || !strcmp(name, "TOTK_FMZ_SEL")) return NULL; abort(); }
 int cfg_int(const char *name) { (void)name; abort(); }
 int tex_vk_format(int format, TexVkFormat *out) { (void)format; (void)out; abort(); }
 VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice device,
@@ -129,7 +130,7 @@ static void cull_tests(const char *dir) {
     for(unsigned k=0;k<sizeof uses/sizeof *uses;k++) {
         char name[64]; snprintf(name,sizeof name,"cull-%s",uses[k]);
         GfxShader s; load_shader(&s,dir,name,GFX_STAGE_GS);
-        uint64_t count=0; uint32_t *fixed=spirv_fixup(s.spirv,s.words,&count);
+        uint64_t count=0; uint32_t *fixed=spirv_fixup(s.spirv,s.words,&count,clip_cull_limit());
         if(!k || k==5 || k==8 || k==10) { CHECK(fixed && count<s.words); }
         else CHECK(!fixed); // Static, aliased or whole-struct use retains CullDistance.
         if(fixed && (!k || k==5 || k==10)) {
@@ -358,7 +359,7 @@ int main(int argc,char **argv) {
     load_shader(&gs,argv[1],"gs",GFX_STAGE_GS); load_shader(&fs,argv[1],"ps",GFX_STAGE_FS);
     // The plain wrapper keeps the legacy VS Clip[8] declaration. The GS-chain
     // create path below must trim it without changing this default behavior.
-    capture_plain_module=1; CHECK(make_module(vs.spirv,vs.words)); capture_plain_module=0;
+    capture_plain_module=1; CHECK(make_module(&vs,vs.spirv,vs.words)); capture_plain_module=0;
     CHECK(captured_clip_declarations[1]==1 && captured_cull_declarations[1]==0);
     VkPipeState s={.vs=&vs,.fs=&fs,.gs=&gs,.prim=NVN_DRAW_PRIMITIVE_POINTS,.samples=1};
     s.poly.mode=NVN_POLYGON_MODE_FILL;
@@ -368,7 +369,7 @@ int main(int argc,char **argv) {
     const char *mismatch=geometry_validate(&s,&fixture_context.props.limits);
     CHECK(mismatch && strstr(mismatch,"built-in block mismatch"));
     made=destroyed=pipeline_calls=fail_module=0;
-    CHECK(make_module_linked(live_vs.spirv,live_vs.words,1));
+    CHECK(make_module_linked(&live_vs,live_vs.spirv,live_vs.words,1));
     CHECK(captured_clip_declarations[1]==1 && captured_cull_declarations[1]==0);
     s.vs=&vs;free(live_vs.spirv);
     GfxShader reordered; load_shader(&reordered,argv[1],"gs_reordered",GFX_STAGE_GS);

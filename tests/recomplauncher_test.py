@@ -17,7 +17,7 @@ from installer import recomplauncher as rl
 
 class LauncherTest(unittest.TestCase):
     def test_manifest_command_forwards_unicode_paths_as_arguments(self):
-        profile = json.loads((ROOT / 'recomplauncher.json').read_text())
+        profile = json.loads((ROOT / 'recomplauncher.json').read_text(encoding='utf-8'))
         with tempfile.TemporaryDirectory(prefix='DKB café ') as directory:
             root = Path(directory)
             tokens = {'{install}': str(root), '{input:exefs}': str(root / 'dump ExeFS'),

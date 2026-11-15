@@ -9,6 +9,7 @@
 #include "vk.h"
 #include "tex.h"
 #include "nvn_hmap.h"
+#include "vk_spec.h"
 #include "platform/platform.h"
 
 #define vkGetSemaphoreCounterValue synthetic_counter
@@ -48,9 +49,20 @@ _Noreturn void rt_fatal(const char *format, ...) {
     fputc('\n', stderr); ExitProcess(21);
 }
 void rt_log(const char *format, ...) { (void)format; }
+unsigned rt_trace;
+static void wb_async_forget(const void *e) { (void)e; }
+void vk_dlss_image_gone(VkImage image) { (void)image; }
 void perf_count(int kind) { (void)kind; }
 uint64_t perf_begin(void) { return 0; }
 void perf_replay(uint64_t start) { (void)start; }
+void perf_replay_totals(uint64_t d, uint64_t t, uint64_t c) { (void)d; (void)t; (void)c; }
+uint64_t vk_exec_draws_total(void) { return 0; }
+void vk_exec_pool_counts(uint64_t *c, uint64_t *t) { *c = *t = 0; }
+// No helper translator runs (vk_spec.c): every texture call is the replay thread's, and no part is out to give up.
+_Thread_local int vk_spec_here;
+int vk_spec_fail(int why) { rt_fatal("unexpected helper failure %d in the frontier fixture", why); }
+void vk_spec_world_changed(void) {}
+void vk_spec_event(void) {}
 // The actual shared split helper also contains the ordered-readback branch. Retirement scenarios must keep using
 // the nonwaiting branch; reaching any of these new dependencies is a fixture failure, not a simulated success.
 void perf_end(int kind, uint64_t start) { (void)kind; (void)start; check(0, "retirement never times a prefix wait"); }
@@ -99,7 +111,7 @@ typedef struct { int unused; } PoolRec;
 static struct { int n; struct { PoolRec *buf; } *e; } pool_index;
 static PlatMutex pool_lock, shadow_lock, gen_lock;
 static VmaPool stg_pool;
-static int stg_pool_tried, nm, npend, nwbl, nstouch, nspend, s_live_n, nretiring, nphys;
+static int stg_pool_tried, nm, npend, nwbl, nstouch, nspend, nsblocked, spend_dirty, s_live_n, nretiring, nphys;
 static uint64_t s_live_bytes;
 static PoolRec **retiring;
 static uint32_t pool_gen;
@@ -196,6 +208,10 @@ static void ts_end(VkCommandBuffer cb, uint64_t fence) { (void)cb; check(fence =
 static void ts_drop(void) {}
 void rec_begin(VkCommandBuffer cb) { (void)cb; }
 int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t fence) { (void)cb; (void)crumb; (void)fence; return 0; }
+// The recorder ends no command buffer above, so split_impl submits every part itself and never hands one over.
+int rec_submit(VkCommandBuffer pro, VkCommandBuffer cb, uint64_t fence) {
+    (void)pro; (void)cb; (void)fence; rt_fatal("unexpected recorder-side submit in the frontier fixture");
+}
 void rec_stats_log(void) {}
 static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) { (void)c; check(fence == 2, "prologue fence"); return VK_NULL_HANDLE; }
 void vk_crumb(VkCommandBuffer cb, int kind, uint64_t value) { (void)cb; (void)kind; check(value == 2, "command crumb fence"); }
@@ -208,6 +224,16 @@ static VkResult synthetic_begin(VkCommandBuffer cb, const VkCommandBufferBeginIn
     in_recording = 1; return VK_SUCCESS;
 }
 static VkResult synthetic_end(VkCommandBuffer cb) { check(cb && in_recording, "synthetic command recording ends"); in_recording = 0; return VK_SUCCESS; }
+// vk_sync.c part_begin with TOTK_REC_BEGIN=0, the default: the submitting thread begins the part, writes the submit
+// crumb and the start timestamp, then hands the part to the recorder, the same calls the split made before it existed.
+static void part_begin(VkCommandBuffer cb, uint64_t fence) {
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(cb, &bi);
+    vk_crumb(cb, VK_CRUMB_SUBMIT, fence);
+    ts_begin(cb);
+    rec_begin(cb);
+}
 static VkResult synthetic_allocate(VkDevice d, const VkCommandBufferAllocateInfo *info, VkCommandBuffer *cb) {
     check(d == context.device && info->commandBufferCount == 1, "synthetic command allocation"); *cb = (VkCommandBuffer)(uintptr_t)++next_cb; return VK_SUCCESS;
 }

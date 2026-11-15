@@ -454,7 +454,7 @@ static void buf_snap(VkExec *ex, int pass) {
 
 static int active(void) {
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    return !finished && (f == dump_frame || (log_from && f >= log_from && f < dump_frame));
+    return !finished && (f == dump_frame || (log_from && f >= log_from && dump_frame != UINT64_MAX && f < dump_frame));   // TOTK_DUMP=key logs only once F9 chose the frame
 }
 static uint64_t frame_now(void) { return __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1; }
 
@@ -561,6 +561,54 @@ static const char *wrap_name(int w) {
 static uint64_t handle_of(const VkExec *ex, int st, int slot, int img) {
     if (img) return slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
     return slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
+}
+
+// The vertex inputs of the entry's first draw: each attribute the vertex shader reads (NVN format, the Vulkan format
+// it is read as, offset, stream), its stream (stride, divisor, the bound buffer range) and the first 4 vertices of the
+// attribute as raw words and as floats. A mesh drawn with long sheets across the screen shows here whether its
+// positions arrive as data the transform can turn into those sheets.
+static void describe_vertex(Str *b, const VkExec *ex, const VkPipeState *s, const VkPipeInfo *info) {
+    // The fixed-function state the entry was drawn with, in NVN's numbering (nvn.h): which faces are culled, the depth
+    // test and clamp, and target 0's blend and channel mask. A mask built by drawing a volume the camera sits in
+    // depends on all of them.
+    sp(b, "    state: cull %u front %u fill %u | depth test %u write %u func %u clamp %u | stencil %u | blend en %#x "
+          "t0 src %u/%u dst %u/%u eq %u/%u mask %#x | prim %u restart %u\n",
+       (unsigned)s->poly.cull, (unsigned)s->poly.front, (unsigned)s->poly.mode, (unsigned)s->ds.dt, (unsigned)s->ds.dw,
+       (unsigned)s->ds.df, (unsigned)s->depth_clamp, (unsigned)s->ds.st, (unsigned)s->color.blend_en,
+       (unsigned)s->blend[0].src_rgb, (unsigned)s->blend[0].src_a, (unsigned)s->blend[0].dst_rgb,
+       (unsigned)s->blend[0].dst_a, (unsigned)s->blend[0].eq_rgb, (unsigned)s->blend[0].eq_a, s->chmask.mask & 15,
+       (unsigned)s->prim, (unsigned)s->prim_restart);
+    for (int i = 0; i < 16; i++) {
+        if (!(info->vs_inputs >> i & 1)) continue;
+        va_st a;
+        memcpy(&a, &s->vattr[i], sizeof a);
+        if (!a.fmt) {
+            sp(b, "    vertex a%d: no attribute (zero buffer)\n", i);
+            continue;
+        }
+        int type = 0;
+        VkFormat vf = vk_vertex_format((int)a.fmt, &type);
+        const vs_st *st = &s->vstream[a.stream & 15];
+        const NVNbufferRange *r = &ex->vbuf[a.stream & 15];
+        sp(b, "    vertex a%d: nvn fmt %#x -> vk %d type %d offset %#x stream %u stride %u divisor %u buf %#llx+%#llx", i,
+           (unsigned)a.fmt, (int)vf, type, (unsigned)a.offset, (unsigned)a.stream, st->stride, st->divisor,
+           (unsigned long long)r->address, (unsigned long long)r->size);
+        VkMemSpan ms;
+        if (r->address && vk_mem_resolve(r->address, 1, &ms) && !ms.alloc) {
+            uint64_t avail = r->size && r->size < ms.avail ? r->size : ms.avail;
+            for (uint32_t v = 0; v < 4; v++) {
+                uint64_t off = (uint64_t)a.offset + (uint64_t)v * st->stride;
+                if (off + 16 > avail) break;
+                const uint32_t *w = (const uint32_t *)(uintptr_t)(r->address + off);
+                float f[4];
+                memcpy(f, w, sizeof f);
+                sp(b, "\n      v%u: %08x %08x %08x %08x | %g %g %g %g", v, w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3]);
+            }
+        } else {
+            sp(b, " (not host-readable)");
+        }
+        sp(b, "\n");
+    }
 }
 
 // The textures, images and samplers of info's bindings; 3D textures are queued for a copy.
@@ -682,6 +730,14 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
     if (!active()) goto out;
     pass_draws++;
     uint64_t th = bindings_hash(ex, info);
+    // Cull, depth and blend are dynamic state on most hosts, so draws with one pipeline can still differ in them: they
+    // get entries of their own.
+    uint64_t fixed[4] = {0};
+    memcpy(&fixed[0], &s->poly, sizeof s->poly);
+    memcpy(&fixed[1], &s->ds, sizeof s->ds);
+    memcpy(&fixed[2], &s->blend[0], sizeof s->blend[0]);
+    fixed[3] = (uint64_t)s->depth_clamp << 32 | s->color.blend_en << 8 | (s->chmask.mask & 15);
+    for (int k = 0; k < 4; k++) th = (th ^ fixed[k]) * 0x100000001b3ull;
     for (int i = 0; i < nents; i++)
         if (ents[i].p == p && ents[i].th == th) {
             ents[i].draws++;
@@ -699,6 +755,7 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
         if (o) sp(&b, " nvn2 %016llx", (unsigned long long)o);
     }
     sp(&b, "\n");
+    describe_vertex(&b, ex, s, info);
     describe_bindings(&b, ex, info);
     ents[nents++] = (Ent){p, th, 1, b.s};
 out:
@@ -877,9 +934,21 @@ out:
 
 static void make_dirs(char *path) { plat_file_mkdir_p(path); }
 
+// TOTK_DUMP=key: no frame is dumped until F9 is pressed in the game window; then the frame after next is (one dump per
+// run). A frame number is hard to hit on a screen the player opens by hand, such as Bananza's map.
+static int dump_on_key;
+
+void vk_dump_request(void) {
+    if (!dump_on_key || finished) return;
+    uint64_t want = frame_now() + 2, none = UINT64_MAX;
+    if (__atomic_compare_exchange_n(&dump_frame, &none, want, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        rt_log("vk_dump: F9: frame %llu goes to %s", (unsigned long long)want, dir);
+}
+
 void vk_dump_init(void) {
     const char *e = cfg_get("TOTK_DUMP");
-    if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
+    if (e && !strcmp(e, "key")) dump_on_key = 1, dump_frame = UINT64_MAX;
+    else if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
     const char *lf = cfg_get("TOTK_DUMP_LOG");
     if (lf && *lf) log_from = strtoull(lf, NULL, 10);
     const char *sr = cfg_get("TOTK_DUMP_SKIP_RUNS");
@@ -915,7 +984,8 @@ void vk_dump_init(void) {
         if (bd_size && !(bufs_f = fopen(path, "w"))) bd_size = 0;
     }
     vk_dump_armed = 1;
-    rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
+    if (dump_on_key) rt_log("vk_dump: press F9 in the game window to dump the frame after next to %s", dir);
+    else rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
 }
 
 void vk_dump_present(uint64_t frame) {

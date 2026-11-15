@@ -252,6 +252,11 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
             }
         } else
             memcpy(&v, voices + i * voice_stride, sizeof v);
+        // A record that is not in use can be all zero, id included (Bananza leaves the records of voices it never used
+        // untouched). Its id then names voice 0 and the reset below would wipe that voice on every update, silencing
+        // the left half of a stereo pair (#63). Eglantine audio_core/renderer/behavior/info_updater.cpp,
+        // InfoUpdater::UpdateVoices, skips such a record; here it applies to the slot it occupies.
+        if (!v.in_use) v.id = (uint32_t)i;
         update_voice(r, &v);
         ServerVoice *server = &r->voices[v.id];
         server->use_float_biquads = (uint8_t)float_voices;

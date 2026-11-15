@@ -5,6 +5,7 @@ surrounding memory, and pixel proportions at five output shapes. This exercises
 the actual replacement words from the patch table through the portable lifter.
 """
 import argparse
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -14,15 +15,35 @@ sys.path.insert(0, str(ROOT / 'recomp'))
 from lifter import Lifter
 
 
+def check_mouse_calls(table):
+    """Every mousecamera BL reaches patch page +0x200..0x240 (step 0x10), and the page the table's comment assumes
+    (main+0x...) is the one those BL immediates imply."""
+    text = (ROOT / table).read_text()
+    pages = set()
+    for line in text.splitlines():
+        f = line.split('#', 1)[0].split()
+        if len(f) < 6 or f[:3] != ['site', 'mousecamera', 'main']:
+            continue
+        w = int(f[-1], 16)
+        assert w >> 26 == 0x25, f'{f[3]}: last replacement word is not a BL'
+        target = int(f[3], 16) + ((((w & 0x3FFFFFF) ^ 0x2000000) - 0x2000000) << 2)
+        assert target & 0xFFF in range(0x200, 0x250, 0x10), f'{f[3]}: BL target {target:#x} is not a dispatch slot'
+        pages.add(target & ~0xFFF)
+    assert len(pages) == 1, f'mousecamera BLs name several pages: {sorted(map(hex, pages))}'
+    assumed = re.findall(r'patch page is at main\+(0x[0-9a-f]+)', text)
+    assert assumed and {int(a, 16) for a in assumed} == pages, f'comment assumes {assumed}, BLs imply {list(map(hex, pages))}'
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--cc', default='clang')
     ap.add_argument('--out', type=Path, default=ROOT / 'build/dkb-wide-projection-test')
+    ap.add_argument('--table', type=Path, default=Path('recomp/patches-dkb100.txt'), help='patch table (relative to the repo root)')
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     lifter = Lifter(0x7000000000, simd='c')
     bodies = []
-    for line in (ROOT / 'recomp/patches-dkb100.txt').read_text().splitlines():
+    for line in (ROOT / args.table).read_text().splitlines():
         f = line.split('#', 1)[0].split()
         if len(f) < 6 or f[:3] != ['site', 'dkbwide', 'main']:
             continue
@@ -41,6 +62,7 @@ def main():
                 code.append(lifted.code)
         bodies.append('void patch%d(Cpu *c, void *page) {\n%s\n}' % (len(bodies), '\n'.join(code)))
     assert len(bodies) == 4
+    check_mouse_calls(args.table)
     source = '#include "cpu.h"\n#include <math.h>\n#include <stdio.h>\n' + '\n'.join(bodies)
     source += '\nvoid (*patches[])(Cpu*,void*) = {' + ','.join(f'patch{i}' for i in range(len(bodies))) + '};\n'
     source += r'''

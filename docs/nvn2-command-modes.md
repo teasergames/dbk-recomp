@@ -26,5 +26,21 @@ up potential overlap performance. The observation covers this call in the tutori
 validation of the explicit handler still required; it does not establish behavior for every game scene or SDK.
 
 This evidence applies only to compute overlap. `SetGeometryProcessingMode` changes mesh-pipeline state, and
-`SetRecordingMode` also selects engine-specific synchronization paths in the SDK. They remain separately tracked
-in issue 6.
+`SetRecordingMode` also selects engine-specific synchronization paths in the SDK. They remain tracked in issue 6,
+with the values seen in play handled and every other value reported.
+
+## Recording mode and geometry processing mode
+
+`runtime/nvn_api_nvn2.c`, `NVN2_MODE_HANDLED`, accepts the values the game has been seen to use and logs the first
+call with any other value, with its number (`nvn2: ... mode N is not supported`), so a scene that needs more shows up
+in the log instead of being ignored.
+
+- `SetRecordingMode` 0 and 1 are handled. A tutorial-cave capture (issue 6, PR 61) saw 0 in 1,380 calls and 1 in 60.
+  Mode 1 selects the SDK's compute synchronization path, the same kind of scheduling choice as the compute overlap
+  mode above, and the replay's barriers around dispatches and passes already order that work. Modes 2 (copy-fence
+  path) to 4 (packing) are not handled.
+- `SetGeometryProcessingMode` 0 is handled: the traditional vertex pipeline, the only one the replay builds. Every
+  capture so far called it with 0 (1,260 calls). A nonzero value selects the mesh pipeline and is reported.
+
+These values come from one tutorial-cave capture, not from every scene; the report for any other value is what shows
+the next gap.

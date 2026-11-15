@@ -53,15 +53,15 @@ Without the folder (an install made by an older setup, or one where the setup co
 
 | Key | Gamepad | Action |
 |---|---|---|
-| F1 or Esc | Minus and Plus together | open or close the settings menu; the game gets no input while it is open |
+| F1 or Esc | Guide (Xbox, PS) button, or Minus and Plus together | open or close the settings menu; the game gets no input while it is open |
 | F10 | L3 + R3 (both stick clicks) | performance overlay: off, frame rate, full panel |
-| F11 | | borderless fullscreen on or off, saved to `totk.ini` |
+| F11 | | windowed, or back to the last full-screen mode (`window_mode`), saved to `totk.ini` |
 
 The Minus+Plus combo never reaches the game. In the menu the arrow keys, the D-pad or the left stick move, Enter or A selects, Q and E or L and R switch tabs, Esc or B goes back (Switch button names, as in the table above).
 
 ## Remapping
 
-The *Controls* tab of the settings menu lists, under the button layout, every Switch button and the eight stick directions the keys drive (movement and camera), each with two key cells and a controller cell. Select a cell, press A or Enter, then press the new key, mouse button or controller button; Esc or five seconds without a press cancel, and a controller button cancels a key cell. Delete, Backspace or X clears the selected cell. A key another action has moves to the new one (the description names the action it left); a controller button swaps with the one it replaces. A remapped controller button is physical: from then on the face buttons (A B X Y) stay where they are in both layouts, until the buttons are put back as the layout in use has them or *Reset all buttons* is chosen. F1, F8, F10, F11 and Esc cannot be bound (the menu, the flight recorder and the window keep them). Punctuation keys are named by their place on a US keyboard; the menu shows the character the keyboard layout in use puts there.
+Under *Controls*, open *Controller* to remap controller buttons or *Mouse & Keyboard* to assign up to two keys or mouse buttons per action, including movement and camera directions. Click a binding or activate it with A or Enter, then press the new input. Esc or five seconds without a press cancels, and a controller button cancels a key binding. Delete, Backspace or X clears the selected binding. A key already in use moves to the new action, and a controller button swaps with the one it replaces. Remapped face buttons (A B X Y) stay in the same physical positions when changing the button layout. *Reset all bindings* restores both devices to their defaults. F1, F8, F10, F11 and Esc are reserved. The menu displays punctuation keys using the current keyboard layout.
 
 The tab writes `totk.ini` lines, one per Switch button or stick direction: `bind_<button> = <entry>, <entry>, ...`. The button is `A B X Y L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN LCLICK RCLICK`, or a stick direction `LSTICK_LEFT LSTICK_UP LSTICK_RIGHT LSTICK_DOWN` (movement, W A S D by default) and `RSTICK_...` (camera, the arrow keys). An entry is `pad:<name>` or `key:<name>`:
 
@@ -108,11 +108,29 @@ Bridges that output a ViGEm DualShock 4 (ProCon2Windows, connectyourpro as teste
 <frame> LSTICK|RSTICK <x> <y> [hold_frames]   # -32767..32767, up is +y
 @<ms> <button> [hold_ms]                  # timed on the world clock
 @<ms> LSTICK|RSTICK <x> <y> [hold_ms]
+[@<ms>|<frame>] wait world|file <name> [timeout_ms]   # hold the lines after it until the game gets there
 ```
 
-`<frame>` counts 60 Hz ticks of game time since the first frame (presented frames at 60 fps), so the title menus get the presses at the same game time at any frame limit. `@<ms>` counts milliseconds of the world clock: game time stepped since the end of the first save load (the player leaves the title screen's origin), so a timed event lands at the same game time at any frame rate and load length. A later load, such as fast travel, still shifts what follows. In a script with timed lines the untimed ones stop when the world clock starts, as the load ends at another tick in each run. Each event logs once (`input: script frame N tick T: A`). `tools/input/load_save.txt` loads the first save from the title screen.
+`<frame>` counts 60 Hz ticks of game time since the first frame (presented frames at 60 fps), so the title menus get the presses at the same game time at any frame limit. `@<ms>` counts milliseconds of the world clock: game time stepped since the end of the first save load (TotK: the player leaves the title screen's origin; Bananza: the first frame), so a timed event lands at the same game time at any frame rate and load length. Both clocks add the game time each frame stepped (the real-time step, or whole vsyncs of the game's present interval without it), never the display time, so a load or a shader-compile stall does not move the events that follow. A later load, such as fast travel, still shifts what follows when the game presents a different number of frames during it. In a script with timed lines the untimed ones stop when the world clock starts, as the load ends at another tick in each run. Each event logs once with the time it asked for (`input: script frame N tick T (asked A): X`, `input: script frame N at T ms (asked A): X`), so two replays compare line by line; once no event can land any more a summary follows (`input: script done at frame N: L of M events landed, latest K ticks and D ms after the time asked`): fewer events than M, or a large lateness, mark a run whose input did not land as written. If the run ends first (the game quits, `--seconds` runs out), the exit path logs `input: script ended at frame N: L of M events landed, P pending` instead, so an early end shows how much of the script never ran. `tools/input/load_save.txt` loads the first save from the title screen.
 
-`TOTK_INPUT_RECORD=<file>` (`input_record` in `totk.ini`, or Input recording in the menu) writes the merged input in the same format, one line per button press and per stick segment: events before the world clock starts by tick, the rest timed; a button or stick held when the world clock starts is cut there and goes on as a timed event. The file replays as a script, which makes it the repro to attach to a bug report.
+Game time alone does not cover a load that runs in the background while the game keeps presenting frames, as the level load after the save-select screen does: on a slower machine it takes more game time, and a press timed for the end of it lands on the loading screen. A wait line holds every line after it until the game reaches a state the host can see, then shifts the clocks of those lines so they read the wait's time at that moment: the lines keep their spacing from the condition, earlier or later than in the recorded run. The conditions:
+
+- `wait file <name>`: the game opens a file (RomFS or save) whose path contains `<name>`. Opens before the wait is reached do not count. A stream the game starts when a screen appears (the title music, the music of a level) marks that screen; `TOTK_TRACE=fs` logs each open with the world clock (`fs <s> @<ms> rom <path>`), which gives both the name and the time to write.
+- `wait world`: the world clock has started (TotK: the first save load ended; Bananza: the first frame).
+
+A wait is reached once the wait before it held (or at the start); the lines before it are not held back. Its time is optional (a bare `wait` is tick 0, so the lines after it count from the moment it held, and its timeout runs from the moment it was reached) and names the moment the condition held in the recorded run. A timed wait that holds before the world clock starts logs `held before the world clock` and does not shift the lines after it. If it has not held when its clock reaches its time plus `timeout_ms` (60000 by default, also for 0; always milliseconds of game time, and for a timed wait not counted before the world clock starts) it falls through as if it had held then. Each wait logs once: `input: script frame N: wait file X held at T ms (asked A): the lines after it move by +D ms` (or `timed out`); T, and the times logged for the lines after it, are on the script's clock, the world clock less the shifts of the earlier waits. The summary adds `input: script waits: W, K of them timed out`. For example, before the first press on the title screen and before the first press in the level (the times from the `TOTK_TRACE=fs` log of the recorded run):
+
+```
+@14567.0 wait file <title music stream>
+@14952.2 A 133.3
+...
+@28367.2 wait file <level music stream>
+@30171.8 PLUS 866.7
+```
+
+For A/B and image tests, `TOTK_FIXED_STEP=1` (or `DKB_FIXED_STEP=1`) with the real-time step on (`TOTK_REALTIME=1`) steps the game 1/60 s per presented frame whatever the frame took, so game time is frames / 60 in every run: the game runs slower than real time when frames take longer than 1/60 s. Without the real-time step the game already steps whole vsyncs of its own present interval, which its controller can raise when a frame runs late.
+
+`TOTK_INPUT_RECORD=<file>` (`input_record` in `totk.ini`, or Input recording in the menu) writes the merged input in the same format, one line per button press and per stick segment: events before the world clock starts by tick, the rest timed; a button or stick held when the world clock starts is cut there and goes on as a timed event. The file replays as a script, which makes it the repro to attach to a bug report. The recording writes no wait lines: add them by hand where a press must follow a screen, with a `TOTK_TRACE=fs` log of the recorded run for the file and its time.
 
 `TOTK_TEST_PAD=<lx>,<ly>,<rx>,<ry>` attaches an SDL virtual gamepad at start whose sticks rest at these raw SDL axis values (-32768 to 32767, down is +y), so a drifting or held stick can be tested without a controller: the values go through the gamepad mapping and `TOTK_STICK_DEADZONE` like a real pad's, and `TOTK_INPUT_RECORD` shows what reached the game.
 

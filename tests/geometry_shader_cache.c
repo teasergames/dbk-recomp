@@ -20,6 +20,8 @@ extern __typeof__(fixture_atomic_write) plat_file_write_atomic;
 #include <stdarg.h>
 
 static void forbidden(const char *name) { fprintf(stderr, "forbidden fixture provider: %s\n", name); abort(); }
+// The NVN 2 lowering lives in nvn2_lower.cpp, which this fixture does not link: no stage has an origin here.
+uint64_t nvn2_origin(const uint8_t *code) { (void)code; return 0; }
 static char failed_migration_path[PATH_CAP+40];
 static int migration_attempts, injected_failures;
 int fixture_atomic_write(const char *path,const void *data,size_t n) {

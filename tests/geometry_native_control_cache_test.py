@@ -34,7 +34,9 @@ def fixture(source):
 #include "nvn_geometry_control.h"
 struct GfxShader { uint32_t locations; };
 static struct GfxShader vertex,fragment;
-static const GfxShader *native_gs_vs=&vertex,*native_gs_fs=&fragment;
+// The draw context members native_gs_control reads: the shaders the native GS links between.
+typedef struct DrawCtx { const GfxShader *native_gs_vs,*native_gs_fs; } DrawCtx;
+static DrawCtx ctx={&vertex,&fragment};
 static uint64_t shader_origin=17;
 static struct { int amd_sc; } vk_caps={1};
 uint32_t gfx_shader_inputs(const GfxShader *s,GfxShaderIo io[32]) {
@@ -112,69 +114,69 @@ static void verify(const uint8_t *copy,unsigned context,uint32_t mask,const char
 }
 static void memo(const char *name) {
     for(unsigned i=0;i<CONTEXTS;i++) {
-        copies[i]=native_gs_control(controls[i],code,CODE_BYTES);
+        copies[i]=native_gs_control(&ctx,controls[i],code,CODE_BYTES);
         verify(copies[i],i,0x80000015u,name);
         if(i)CHECK(copies[i]!=copies[i-1]);
     }
     CHECK(successful_copies==CONTEXTS);CHECK(free_calls==0);
     unsigned allocations=malloc_calls,growth=realloc_calls;
-    for(unsigned i=0;i<CONTEXTS;i++)CHECK(native_gs_control(controls[i],code,CODE_BYTES)==copies[i]);
-    for(unsigned i=0;i<8;i++)CHECK(native_gs_control(controls[256],code,CODE_BYTES)==copies[256]);
+    for(unsigned i=0;i<CONTEXTS;i++)CHECK(native_gs_control(&ctx,controls[i],code,CODE_BYTES)==copies[i]);
+    for(unsigned i=0;i<8;i++)CHECK(native_gs_control(&ctx,controls[256],code,CODE_BYTES)==copies[256]);
     CHECK(malloc_calls==allocations);CHECK(realloc_calls==growth);
     vertex.locations=0xff;fragment.locations=2;
-    const uint8_t *other=native_gs_control(controls[256],code,CODE_BYTES);
+    const uint8_t *other=native_gs_control(&ctx,controls[256],code,CODE_BYTES);
     verify(other,256,2,name);CHECK(other!=copies[256]);
-    CHECK(native_gs_control(controls[256],code,CODE_BYTES)==other);
+    CHECK(native_gs_control(&ctx,controls[256],code,CODE_BYTES)==other);
     vertex.locations=0x80000115u;fragment.locations=0x80000217u;
-    CHECK(native_gs_control(controls[256],code,CODE_BYTES)==copies[256]);
+    CHECK(native_gs_control(&ctx,controls[256],code,CODE_BYTES)==copies[256]);
     vertex.locations=0;fragment.locations=UINT32_MAX;
-    const uint8_t *empty=native_gs_control(controls[256],code,CODE_BYTES);
+    const uint8_t *empty=native_gs_control(&ctx,controls[256],code,CODE_BYTES);
     verify(empty,256,0,name);CHECK(empty!=other&&empty!=copies[256]);
-    CHECK(native_gs_control(controls[256],code,CODE_BYTES)==empty);
+    CHECK(native_gs_control(&ctx,controls[256],code,CODE_BYTES)==empty);
     // Different reflected sets with the same intersection reuse the same context.
     vertex.locations=2;fragment.locations=UINT32_MAX;
-    allocations=malloc_calls;CHECK(native_gs_control(controls[256],code,CODE_BYTES)==other);
+    allocations=malloc_calls;CHECK(native_gs_control(&ctx,controls[256],code,CODE_BYTES)==other);
     CHECK(malloc_calls==allocations);CHECK(free_calls==0);CHECK(successful_copies==259);
     CHECK(live_blocks==260); // 259 stable controls plus one process-owned memo allocation.
     verify(copies[0],0,0x80000015u,name);verify(copies[256],256,0x80000015u,name);
 }
 static void allocation_failure(const char *name,int growth) {
-    if(growth)for(unsigned i=0;i<256;i++)copies[i]=native_gs_control(controls[i],code,CODE_BYTES);
+    if(growth)for(unsigned i=0;i<256;i++)copies[i]=native_gs_control(&ctx,controls[i],code,CODE_BYTES);
     unsigned allocations=malloc_calls,frees=free_calls,live=live_blocks;
     if(!strcmp(name,"copy-failure"))fail_malloc=1;else fail_realloc=1;
     unsigned index=growth?256:0;
-    CHECK(native_gs_control(controls[index],code,CODE_BYTES)==NULL);
+    CHECK(native_gs_control(&ctx,controls[index],code,CODE_BYTES)==NULL);
     CHECK(malloc_calls==allocations+1);
     CHECK(free_calls==frees+(!strcmp(name,"copy-failure")?0:1));
     CHECK(live_blocks==live);CHECK(!memcmp(original,controls,sizeof controls));
-    if(growth)for(unsigned i=0;i<256;i++)CHECK(native_gs_control(controls[i],code,CODE_BYTES)==copies[i]);
-    const uint8_t *retry=native_gs_control(controls[index],code,CODE_BYTES);
+    if(growth)for(unsigned i=0;i<256;i++)CHECK(native_gs_control(&ctx,controls[i],code,CODE_BYTES)==copies[i]);
+    const uint8_t *retry=native_gs_control(&ctx,controls[index],code,CODE_BYTES);
     verify(retry,index,0x80000015u,name);
     allocations=malloc_calls;unsigned resizes=realloc_calls;
-    CHECK(native_gs_control(controls[index],code,CODE_BYTES)==retry);
+    CHECK(native_gs_control(&ctx,controls[index],code,CODE_BYTES)==retry);
     CHECK(malloc_calls==allocations);CHECK(realloc_calls==resizes);
     if(growth)verify(copies[0],0,0x80000015u,name);
 }
 static void packing_failure(const char *name) {
     controls[0][0x800]=0x7f;memcpy(original,controls,sizeof controls);
-    CHECK(native_gs_control(controls[0],code,CODE_BYTES)==NULL);
+    CHECK(native_gs_control(&ctx,controls[0],code,CODE_BYTES)==NULL);
     CHECK(malloc_calls==1&&free_calls==1&&realloc_calls==0&&live_blocks==0);
     CHECK(!memcmp(original,controls,sizeof controls));
-    const uint8_t *valid=native_gs_control(controls[1],code,CODE_BYTES);
+    const uint8_t *valid=native_gs_control(&ctx,controls[1],code,CODE_BYTES);
     verify(valid,1,0x80000015u,name);CHECK(successful_copies==2&&free_calls==1);
 }
 static void voxel_mask(const char *name) {
     shader_origin=UINT64_C(0x3dbaaf649cb5f927);
     vertex.locations=UINT32_C(0x00080001);fragment.locations=0;
-    const uint8_t *copy=native_gs_control(controls[0],code,CODE_BYTES);
+    const uint8_t *copy=native_gs_control(&ctx,controls[0],code,CODE_BYTES);
     verify(copy,0,UINT32_C(0x00080001),name);
     CHECK(successful_copies==1&&free_calls==0&&live_blocks==2);
-    CHECK(native_gs_control(controls[0],code,CODE_BYTES)==copy);
+    CHECK(native_gs_control(&ctx,controls[0],code,CODE_BYTES)==copy);
     vk_caps.amd_sc=0;
-    const uint8_t *other=native_gs_control(controls[0],code,CODE_BYTES);
+    const uint8_t *other=native_gs_control(&ctx,controls[0],code,CODE_BYTES);
     verify(other,0,0,name);CHECK(other!=copy);
     CHECK(successful_copies==2&&free_calls==0&&live_blocks==3);
-    CHECK(native_gs_control(controls[0],code,CODE_BYTES)==other);
+    CHECK(native_gs_control(&ctx,controls[0],code,CODE_BYTES)==other);
 }
 int main(int argc,char **argv) {
     if(argc!=2)return 2;const char *name=argv[1];setup();(void)spy_realloc;

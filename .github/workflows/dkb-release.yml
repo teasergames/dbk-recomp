@@ -1,8 +1,9 @@
 name: DKB setup zip
 
-# Builds DKB-Setup-<version>-windows.zip: the portable tools, the source and the installer GUI, with no game data.
-# A manual run or a push to a tag only uploads the zip as a workflow artifact; a tag named v* also publishes it as a
-# GitHub pre-release (0.x is experimental, see docs/installer.md and issue #85).
+# Builds DKB-Setup-<version>-windows.zip (the portable tools, the source and the installer GUI) and the Linux and macOS
+# source packages DKB-Setup-<version>-linux-x86_64.tar.gz and -macos-arm64.zip (tools/make_release_posix.py), with no game data.
+# A manual run or a push to a tag only uploads the zips as workflow artifacts; a tag named v* also publishes them as a
+# GitHub release with the notes of .github/release-notes.md (0.x is experimental, see issue #85).
 
 on:
   workflow_dispatch:
@@ -35,11 +36,91 @@ jobs:
           name: DKB-Setup-windows
           path: build/release/DKB-Setup-*-windows.zip
           if-no-files-found: error
-      - name: Publish the pre-release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
+
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld ninja-build make cmake libopus-dev libvpx-dev libzstd-dev libvulkan-dev spirv-tools
+      - name: Install SDL3 (not in Ubuntu 24.04)
+        run: |
+          # outside the checkout: check_content scans the working tree and the SDL sources hold files over its size limit
+          cd "$RUNNER_TEMP"
+          curl -fsSL https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz | tar xz
+          cmake -S SDL3-3.4.18 -B sdl-build -G Ninja -DSDL_TESTS=OFF -DSDL_UNIX_CONSOLE_BUILD=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build sdl-build
+          sudo cmake --install sdl-build
+      - run: python tools/check_content.py
+      - run: python tools/make_release_posix.py --platform linux --pack
+      - name: Check the package from its own folder
+        run: |
+          cd build/release/DKB-Setup-*-linux
+          ./setup.sh --check
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -r tools/requirements-installer.txt
+          .venv/bin/python -m installer --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DKB-Setup-linux
+          path: build/release/DKB-Setup-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest   # Apple silicon; macos-14 is not offered to this repository
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Install the build dependencies
+        run: brew install llvm ninja sdl3 molten-vk vulkan-headers vulkan-loader opus libvpx zstd spirv-tools
+      - run: python tools/check_content.py
+      - run: python tools/make_release_posix.py --platform macos --pack
+      - name: Check the package from its own folder
+        run: |
+          cd build/release/DKB-Setup-*-macos
+          ./setup.command --check
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -r tools/requirements-installer.txt
+          .venv/bin/python -m installer --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DKB-Setup-macos
+          path: build/release/DKB-Setup-*-macos-arm64.zip
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [zip, linux, macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4   # for .github/release-notes.md
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" build/release/DKB-Setup-*-windows.zip \
-            --prerelease --title "$GITHUB_REF_NAME" --generate-notes
+          gh release create "$GITHUB_REF_NAME" dist/DKB-Setup-* --repo "$GITHUB_REPOSITORY" --latest --title "DKB Recomp $GITHUB_REF_NAME" --notes-file .github/release-notes.md --generate-notes

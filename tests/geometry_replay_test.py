@@ -15,19 +15,15 @@ from nvn2_compute_c0_test import function
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def record(text, name):
-    end = text.index('} ' + name + ';') + len('} ' + name + ';')
-    return text[text.rfind('typedef struct {', 0, end):end]
-
-
 def source():
     draw = (ROOT / 'runtime/vk_exec_draw.c').read_text()
     shader = (ROOT / 'runtime/gfx_shader.c').read_text()
     replay = (ROOT / 'runtime/vk_exec.c').read_text()
     pipeline = (ROOT / 'runtime/vk_pipeline.c').read_text()
     base = descriptor.source().replace('int main(void)', 'static int descriptor_checks(void)', 1)
-    base = base.replace('#include "vk_exec.h"', '#include "vk_exec.h"\n#include "nvn_hmap.h"\n#include "nvn_geometry_control.h"')
-    base = base.replace('uint8_t body[16];', 'uint8_t body[8192]; int volatile_;')
+    base = base.replace('#include "vk_exec.h"', '#include "vk_exec.h"\n#include "vk_spec.h"\n#include "nvn_hmap.h"\n#include "nvn_geometry_control.h"')
+    # The draw context's frame counters are vk_exec_frame, as draw_main's.
+    base = base.replace('.SM.on=-1};', '.SM.on=-1,.frame=&vk_exec_frame};', 1)
     old_stage = function(base, 'int gfx_shader_stage(')
     old_res = function(base, 'int gfx_shader_resources(')
     providers = r'''
@@ -48,6 +44,8 @@ int cfg_bool(const char *name) { return !strcmp(name,"TOTK_NATIVE_GS")?0:!strcmp
 static int c0_on(void) { return fix_c0; }
 static void warn_once(int key,const char *format,...) { (void)key;(void)format;warnings++; }
 uint64_t nvn2_origin(const uint8_t *code) { return code==native_code?17:0; }
+int vk_geometry_supported(void) { return 1; }
+GfxStats gfx_counters;
 int vk_pipeline_async_on(void) { return async_on; }
 uint32_t gfx_shader_slot_mask(const GfxShader *s) {(void)s;return last_answers.geometry_input==GFX_GEOMETRY_POINTS?0:1;}
 const GfxShader *gfx_shader_get(int stage,const uint8_t *ctl,const uint8_t *code,uint64_t len,
@@ -68,34 +66,29 @@ const GfxShader *gfx_shader_await(int stage,const uint8_t *ctl,const uint8_t *co
     warning = draw.index('enum { W_PROGRAM')
     providers = providers.replace('@WARNINGS@', draw[warning:draw.index(';', warning) + 1])
     base = base.replace(old_stage, '').replace(old_res, providers)
-    stage_start = draw.index('#define SHADER_SETS ')
-    stage_end = draw.index('// Texture and image types of a stage', stage_start)
-    slot_start = draw.index('#define SLOTM_N ')
-    slot_end = draw.index('static uint8_t type_of_handle(', slot_start)
+    # The stage lookup and the slot masks; their tables are draw context members.
+    stages = '\n'.join(function(draw, prefix) for prefix in (
+        'static int find_stage_scan(', 'static int find_stage_origin(', 'static int find_stage(', 'static uint64_t stage_origin(',
+        'static uint32_t slotm_idx(', 'static int slot_mask_stage(', 'static uint32_t slot_mask_of(',
+        'static void slot_mask_learn(')) + '\n'
     where = base.index('static int nvn_stage_of(')
-    base = base[:where] + draw[stage_start:stage_end] + draw[slot_start:slot_end] + base[where:]
+    base = base[:where] + stages + base[where:]
     # The native path stays off here: tests/geometry_feature_flags_test.py and geometry_native_control_cache_test.py cover it.
-    native = (function(draw, 'static int native_gs_on(') + '\nstatic const GfxShader *native_gs_vs,*native_gs_fs;\n'
-              'static const uint8_t *native_gs_control(const uint8_t *c,const uint8_t *code,uint32_t len) '
-              '{(void)c;(void)code;(void)len;abort();}\n')
+    native = (function(draw, 'static int native_gs_on(') + '\n'
+              'static const uint8_t *native_gs_control(DrawCtx *dc,const uint8_t *c,const uint8_t *code,uint32_t len) '
+              '{(void)dc;(void)c;(void)code;(void)len;abort();}\n')
     extra = [function(shader, 'int gfx_shader_is_nvn2('), function(pipeline, 'uint8_t vk_geometry_input('), native,
              function(draw, 'static const GfxShader *shader_for('), function(draw, 'static int experimental_geometry_on('),
              function(draw, 'static int geometry_draw('), function(draw, 'static int geometry_feedback_safe(')]
 
     # Use actual resource-range discovery and pointer resolution, not a stage-specific replacement signature.
-    upd_start = draw.index('#define UPD_N ')
-    upd_end = draw.index('static void upd_note(', upd_start)
-    base = base.replace(function(base, 'static uint64_t ubo_ptr('), draw[upd_start:upd_end] +
+    base = base.replace(function(base, 'static uint64_t ubo_ptr('),
                         function(draw, 'static int upd_read(') + '\n' + function(draw, 'static uint64_t ubo_ptr('))
     old_list = function(base, 'static const RsList *rs_list(')
     ranges = '\n'.join((
-        '#define MAX_DESC 1024\n#define MAX_BINDINGS 128\n' +
-        next(line for line in draw.splitlines() if line.startswith('#define RS_BYTES ')),
-        'static nvn_hmap rs_lists; static const VkPipeInfo *rs_last; static const RsList *rs_last_l;',
         'static int nvn_stage_of(int);', function(draw, 'static int ssbo_slot('), function(draw, 'static int ubo_ptr_res('),
         function(draw, 'static void rs_add('), function(draw, 'static const RsList *rs_list(')))
     base = base.replace(old_list, ranges)
-    write_types = '\n'.join(record(draw, name) for name in ('Chunk', 'Range', 'CbRes'))
     write_providers = r'''
 _Alignas(256) static uint64_t pointer_words[4];
 _Alignas(256) static uint32_t output_words[64];
@@ -104,9 +97,7 @@ static unsigned uses,gpu_writes,drops,pending_writes,counts,barriers,passes;
 static uint64_t expected_count_bytes=sizeof output_words;
 static uint64_t pending_addr,pending_size;
 static int last_use;
-static struct {VkBuffer zbuf;} Z;
-static const Nvn2C0Layout *c0_lay;
-static uint32_t c0_dim[3];
+static struct {VkBuffer zbuf;} standins;
 int vk_mirror_on=1;
 uint32_t rt_trace;
 static void *grow(void *p,int *cap,size_t bytes) {
@@ -127,19 +118,22 @@ void vk_mem_gpu_wrote(const VkMemSpan *span,uint64_t bytes) {CHECK((uintptr_t)sp
 void vk_usnap_drop(uint64_t addr,uint64_t bytes) {CHECK(addr==(uintptr_t)output_words && bytes==sizeof output_words,"write drops exact output snapshot");drops++;}
 void vk_mem_gpu_pending(uint64_t addr,uint64_t bytes) {pending_writes++;pending_addr=addr;pending_size=bytes;}
 int vk_sync_noting(void) {return 0;}
+void vk_exec_par_order_hazard(void) {}
+int vk_usnap_covers(uint64_t a,uint64_t n) {(void)a;(void)n;return 0;}
 void vk_sync_note_write(uint64_t a,uint64_t b,uint64_t c) {(void)a;(void)b;(void)c;abort();}
 void vk_mem_count(int cls,int use,uint64_t bytes) {(void)cls;(void)use;(void)bytes;}
 void vk_mem_bound_note(void *pool) {(void)pool;abort();}
 VkCaps vk_caps;
-static void count_use(int cls,int use,uint64_t bytes) {(void)cls;CHECK(bytes==expected_count_bytes,"descriptor range retained");counts++;last_use=use;}
+int vk_spec_fail(int why) {(void)why;abort();}
+static void count_use(DrawCtx *dc,int cls,int use,uint64_t bytes) {(void)dc;(void)cls;CHECK(bytes==expected_count_bytes,"descriptor range retained");counts++;last_use=use;}
 static void *scratch(VkExec *ex,uint64_t n,VkBuffer *b,VkDeviceSize *o) {(void)ex;(void)n;(void)b;(void)o;abort();}
 static void limits_init(void) {abort();}
 static VkDescriptorBufferInfo c0_info(VkExec *ex,int st) {(void)ex;(void)st;abort();}
 // This ordinary-GS fixture must never construct a synthetic compute bank. The
 // actual guarded-storage selector below rejects GS before this provider.
-void vk_c0_fill(uint8_t bank[VK_C0_BYTES],int st,const p_bind_buf ssbo[16],const p_bind_buf ubo[16],
-                const uint32_t dispatch[3],uint32_t base_instance) {
-    (void)bank;(void)st;(void)ssbo;(void)ubo;(void)dispatch;(void)base_instance;abort();
+static void c0_fill(DrawCtx *dc,uint8_t bank[VK_C0_BYTES],int st,const p_bind_buf ssbo[16],const p_bind_buf ubo[16],
+                    const uint32_t dispatch[3],uint32_t base_instance) {
+    (void)dc;(void)bank;(void)st;(void)ssbo;(void)ubo;(void)dispatch;(void)base_instance;abort();
 }
 int vk_usnap_find(uint64_t a,uint64_t n,uint64_t align,VkDescriptorBufferInfo *out) {(void)a;(void)n;(void)align;(void)out;return 0;}
 void vk_exec_pass_end(VkExec *ex) {passes++;ex->in_pass=0;}
@@ -159,13 +153,17 @@ void rc_vkCmdPipelineBarrier2(VkCommandBuffer cb,const VkDependencyInfo *di) {
         'static VkDescriptorBufferInfo ssbo_info(', 'static VkDescriptorBufferInfo ubo_info('))
     barrier_helpers = '\n'.join(function(replay, prefix) for prefix in ('static int has_image(',
         'static VkImageMemoryBarrier2 layout_barrier(', 'static void barrier_to(', 'void vk_exec_barrier('))
+    # vk_exec.c FRAME names the replay thread's counters, or a helper translator's while one translates a part; this
+    # fixture records on the replay thread only.
+    if 'FRAME->' in barrier_helpers:
+        barrier_helpers = '#define FRAME (&vk_exec_frame)\n' + barrier_helpers
     cases = r'''
 static void put32(uint8_t *p,uint32_t v) {memcpy(p,&v,4);}
 int main(int argc,char **argv) {
     enabled=argc>1?atoi(argv[1]):0;
     CHECK(!descriptor_checks(),"previous descriptor-cache assertions remain active");
     uint8_t ctl[3][0x880]={{0}},code[3][0xa0]={{0}};
-    prog_t program={.nstage=2,.serial=111}; VkExec ex={.prog=&program,.prog_stages=NVN_SHADER_STAGE_ALL_GRAPHICS_BITS};
+    prog_t program={.nstage=2,.serial=111}; VkExec ex={.prog=&program,.prog_stages=NVN_SHADER_STAGE_ALL_GRAPHICS_BITS,.draw=&ctx};
     for(unsigned i=0;i<3;i++) {
         put32(ctl[i]+0x704,sizeof code[i]);put32(ctl[i]+0x714,i==0?NVN_STAGE_VS:NVN_STAGE_GS);
         put32(code[i]+0x30,1|(3<<5)|(4<<10));
@@ -173,15 +171,15 @@ int main(int argc,char **argv) {
     }
     if(!enabled) {
         native_code=code[1];fix_c0=1;put32(code[1]+0x30,1<<24);
-        CHECK(geometry_draw(&ex,NVN_DRAW_PRIMITIVE_PATCHES)==0 && !geometry_input,"default-off preserves legacy path without admitting GS");
+        CHECK(geometry_draw(&ex,NVN_DRAW_PRIMITIVE_PATCHES)==0 && !ctx.geometry_input,"default-off preserves legacy path without admitting GS");
         CHECK(!warnings && !translations,"default-off performs no GS translation or opt-in rejection");
         printf("ordinary geometry default-off: %u checks, %u failures\n",checks,failures);return failures!=0;
     }
-    CHECK(geometry_draw(&ex,NVN_DRAW_PRIMITIVE_POINTS)==1 && geometry_input==GFX_GEOMETRY_POINTS,"ordinary points accepted");
+    CHECK(geometry_draw(&ex,NVN_DRAW_PRIMITIVE_POINTS)==1 && ctx.geometry_input==GFX_GEOMETRY_POINTS,"ordinary points accepted");
     ex.prog_stages=NVN_SHADER_STAGE_VERTEX_BIT;
     CHECK(geometry_draw(&ex,NVN_DRAW_PRIMITIVE_POINTS)<0,"partial stage bind cannot execute an unrequested GS");
     ex.prog_stages=NVN_SHADER_STAGE_ALL_GRAPHICS_BITS;
-    CHECK(geometry_draw(&ex,NVN_DRAW_PRIMITIVE_TRIANGLES_ADJACENCY)==1 && geometry_input==GFX_GEOMETRY_TRIANGLES_ADJACENCY,"adjacency preserved");
+    CHECK(geometry_draw(&ex,NVN_DRAW_PRIMITIVE_TRIANGLES_ADJACENCY)==1 && ctx.geometry_input==GFX_GEOMETRY_TRIANGLES_ADJACENCY,"adjacency preserved");
     const int bad_prim[]={NVN_DRAW_PRIMITIVE_QUADS,NVN_DRAW_PRIMITIVE_QUAD_STRIP,NVN_DRAW_PRIMITIVE_LINE_LOOP,
                           NVN_DRAW_PRIMITIVE_POLYGON,NVN_DRAW_PRIMITIVE_PATCHES,999};
     for(unsigned i=0;i<sizeof bad_prim/sizeof *bad_prim;i++) CHECK(geometry_draw(&ex,bad_prim[i])<0,"unsupported primitives rejected");
@@ -197,7 +195,7 @@ int main(int argc,char **argv) {
     CHECK(nvn_geometry_control_pack_portable(ctl[1],sizeof ctl[1],code[1],sizeof code[1],skip),"owned portable metadata packed");
     CHECK(geometry_draw(&ex,NVN_DRAW_PRIMITIVE_TRIANGLES)<0,"portable draw requires the complete VS/GS/FS program");
     put32(ctl[2]+0x714,NVN_STAGE_FS);program.nstage=3;
-    CHECK(geometry_draw(&ex,NVN_DRAW_PRIMITIVE_TRIANGLES)==1 && geometry_input==GFX_GEOMETRY_TRIANGLES,"canonical portable triangles accepted");
+    CHECK(geometry_draw(&ex,NVN_DRAW_PRIMITIVE_TRIANGLES)==1 && ctx.geometry_input==GFX_GEOMETRY_TRIANGLES,"canonical portable triangles accepted");
     ex.prog_stages=7;
     CHECK(geometry_draw(&ex,NVN_DRAW_PRIMITIVE_TRIANGLES)<0,"portable binding follows the verified whole-program mask");
     ex.prog_stages=NVN_SHADER_STAGE_ALL_GRAPHICS_BITS;
@@ -220,7 +218,7 @@ int main(int argc,char **argv) {
           !last_answers.local[0],"GS maps explicitly and uses draw input instead of compute answers");
     int before=translations;CHECK(shader_for(&ex,NVN_STAGE_GS,&present,&pending,0)==s && translations==before,"shader table reuses identical GS answers");
     ex.tex_pool=table_a;ex.tex[NVN_STAGE_GS][0]=HANDLE;remapped=0;memory_generation++;
-    geometry_input=GFX_GEOMETRY_LINES;CHECK(shader_for(&ex,NVN_STAGE_GS,&present,&pending,0)==s && translations==before+1 &&
+    ctx.geometry_input=GFX_GEOMETRY_LINES;CHECK(shader_for(&ex,NVN_STAGE_GS,&present,&pending,0)==s && translations==before+1 &&
           last_answers.geometry_input==GFX_GEOMETRY_LINES && last_answers.tex_type[0]==GFX_TEX_1D,
           "new topology relearns queried texture slots instead of inheriting the points use mask");
     program.serial++;translate_fail=1;CHECK(!shader_for(&ex,NVN_STAGE_GS,&present,&pending,0) && present && !pending,"failed requested GS remains present, not absent");
@@ -229,11 +227,11 @@ int main(int argc,char **argv) {
     translate_pending=0;CHECK(shader_for(&ex,NVN_STAGE_GS,&present,NULL,1) && awaits==1,"await translates required GS");async_on=0;
     ex.tex_pool=table_a;ex.samp_pool=sampler_a;ex.tex[NVN_STAGE_GS][0]=HANDLE;ex.img[NVN_STAGE_GS][0]=HANDLE;
     remapped=0;memory_generation++;descriptor_state(&ex);
-    memo_key(&ex,7,&SM.k);SM.valid=1;CHECK(memo_match(&ex,7,&SM.k),"GS shader memo warms");
-    ex.tex[NVN_STAGE_GS][0]=0;ex.tex_serial++;CHECK(!memo_match(&ex,7,&SM.k),"GS texture handle invalidates memo");
-    ex.tex[NVN_STAGE_GS][0]=HANDLE;memo_key(&ex,7,&SM.k);SM.valid=1;geometry_input=GFX_GEOMETRY_TRIANGLES;
-    CHECK(!memo_match(&ex,7,&SM.k),"GS input topology invalidates shader memo");
-    geometry_input=GFX_GEOMETRY_POINTS;ex.pass_ncolor=1;ex.color[0]=(VkExecTarget){.image=images[0].image,.layers=1};
+    memo_key(&ex,7,&ctx.SM.k);ctx.SM.valid=1;CHECK(memo_match(&ex,7,&ctx.SM.k),"GS shader memo warms");
+    ex.tex[NVN_STAGE_GS][0]=0;ex.tex_serial++;CHECK(!memo_match(&ex,7,&ctx.SM.k),"GS texture handle invalidates memo");
+    ex.tex[NVN_STAGE_GS][0]=HANDLE;memo_key(&ex,7,&ctx.SM.k);ctx.SM.valid=1;ctx.geometry_input=GFX_GEOMETRY_TRIANGLES;
+    CHECK(!memo_match(&ex,7,&ctx.SM.k),"GS input topology invalidates shader memo");
+    ctx.geometry_input=GFX_GEOMETRY_POINTS;ex.pass_ncolor=1;ex.color[0]=(VkExecTarget){.image=images[0].image,.layers=1};
     CHECK(feedback_scan(&ex,(const GfxShader *)&gs_shader)==1,"GS samples its own stage handles when detecting unsafe attachment feedback");
     CHECK(!geometry_feedback_safe(&ex,(const GfxShader *)&vs_shader,(const GfxShader *)&gs_shader),"GS attachment feedback rejects the draw");
     ex.tex[NVN_STAGE_GS][0]=0;ex.tex_serial++;CHECK(!feedback_scan(&ex,(const GfxShader *)&gs_shader),"unbound GS stage cannot inherit FS attachment handles");
@@ -255,10 +253,10 @@ int main(int argc,char **argv) {
     CHECK(callback_resources.nwritten==1 && pending_writes==1 && pending_addr==(uintptr_t)output_words &&
           pending_size==sizeof output_words,"GS write range is retained for fence completion");
     note_written(&ex,(uintptr_t)output_words,sizeof output_words);CHECK(pending_writes==1,"same write range retained once");
-    Nvn2C0Layout compute_layout={0};c0_lay=&compute_layout;
+    Nvn2C0Layout compute_layout={0};ctx.c0_lay=&compute_layout;
     p_bind_buf guarded=guarded_storage_binding(&ex,NVN_STAGE_GS,&buffer);
     CHECK(!guarded.addr && !guarded.size,"guarded compute candidates cannot inherit an ordinary GS pointer block");
-    c0_lay=NULL;
+    ctx.c0_lay=NULL;
     ex.ubo[NVN_STAGE_GS][14]=(p_bind_buf){.addr=(uintptr_t)pointer_words,.size=sizeof pointer_words};
     expected_count_bytes=sizeof pointer_words;out=ubo_info(&ex,NVN_STAGE_GS,17);
     CHECK((uintptr_t)out.buffer==22 && out.range==sizeof pointer_words && uses==2 && counts==2 &&
@@ -270,7 +268,7 @@ int main(int argc,char **argv) {
     printf("ordinary geometry enabled: %u checks, %u failures\n",checks,failures);return failures!=0;
 }
 '''
-    return '\n'.join((base, *extra, write_types, '#define ZERO_BYTES 65536u', write_providers, lim, memory_helpers, barrier_helpers, cases))
+    return '\n'.join((base, *extra, '#define ZERO_BYTES 65536u', write_providers, lim, memory_helpers, barrier_helpers, cases))
 
 
 def main():

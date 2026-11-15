@@ -59,6 +59,7 @@ import ctypes.wintypes as wt   # the job-object structures below; importing it w
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -71,6 +72,7 @@ from build_shaders import stale as stale_shaders
 from check_content import GENERATED_MARKER
 
 WIN = os.name == 'nt'
+DARWIN = sys.platform == 'darwin'
 if not WIN:
     import resource
 ROOT = Path(__file__).resolve().parent.parent
@@ -90,11 +92,18 @@ def on_path(name):
 CLANG = UCRT / 'clang.exe' if WIN else on_path('clang')
 NINJA = UCRT / 'ninja.exe' if WIN else on_path('ninja')
 SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll'] if WIN else []
+# Homebrew's LLVM: Apple's clang does not carry llvm-ar, and the lifting was verified against clang 23.
+HOMEBREW_LLVM = Path('/opt/homebrew/opt/llvm/bin')
+if DARWIN and (HOMEBREW_LLVM / 'clang').is_file():
+    CLANG = HOMEBREW_LLVM / 'clang'
 
 # Flags for generated code as LAS Recomp builds it (Makefile GENFLAGS, Windows), plus -march for the FP/SIMD lowering.
-GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
-             '-march=x86-64-v3']
-RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
+# On AArch64 the lowering uses GCC vector extensions and fma, both baseline there, so no -mcpu is needed.
+GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden']
+RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing']
+if platform.machine().lower() in ('x86_64', 'amd64'):
+    GEN_FLAGS.append('-march=x86-64-v3')
+    RT_FLAGS.append('-march=x86-64-v3')
 if WIN:
     # _WIN32_WINNT: Windows 10, the port's minimum. MSYS2's headers default to it, llvm-mingw's (the release toolchain)
     # to Windows 7, which hides the per-monitor DPI functions gfx_window_win.c and dpi_probe_win.c call.
@@ -110,6 +119,15 @@ else:
                   '"-Wl,-Map=$builddir/totk.map"']
     LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-lzstd', '-l:libstdc++.a', '-lm', '-lpthread', '-ldl']
     VMA_INCLUDE = Path('/usr/include')   # vk_mem_alloc.h; Arch (AUR) vulkan-memory-allocator, Debian libvulkan-memory-allocator-dev
+if DARWIN:
+    # The main executable stays where dyld puts it (0x100000000 on arm64); the guest address space is what moves
+    # (memory.c LOW_SEARCH_FROM). Homebrew's libSDL3, libvulkan and libopus are found through their install names;
+    # @executable_path first lets a release ship its own MoltenVK.
+    LINK_FLAGS = ["'-Wl,-rpath,@executable_path'", "'-Wl,-rpath,/opt/homebrew/lib'", "'-L/opt/homebrew/lib'"]
+    # CoreFoundation: plat_ui_language and plat_user_locale read the system's preferred languages and locale from it.
+    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-lzstd', '-lc++', '-lm',
+                 '-framework', 'CoreFoundation']
+    VMA_INCLUDE = ROOT / 'toolchain' / 'vma'   # Homebrew ships no vk_mem_alloc.h; the pinned copy is fetched there
 # Without a system vk_mem_alloc.h, the header the Windows release pins (tools/make_release.py, VMA 3.4.0) is fetched once
 # into toolchain/vma: one MIT header (THIRD_PARTY_NOTICES.md), checked against its hash.
 VMA_FETCH = ('https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.4.0/include/vk_mem_alloc.h',
@@ -146,11 +164,25 @@ DEFAULT_DEPS = ROOT / 'toolchain' / 'deps-mingw'
 INSTALL_SIDE = {'romfs.c', 'patches.c', 'ov_zstd.c'}
 LIB_NAME = 'libtotkrt.a'
 AR = UCRT / 'llvm-ar.exe' if WIN else on_path('llvm-ar')
+if DARWIN and not AR.is_file() and (HOMEBREW_LLVM / 'llvm-ar').is_file():
+    AR = HOMEBREW_LLVM / 'llvm-ar'
 WINDRES = UCRT / 'windres.exe'   # runtime/totk.rc: the manifest of totk.exe
 TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
 DEPS = None            # the deps directory of an llvm-mingw build
 # tools/data/expected-<display version>.json for each build version name.
 DISPLAY_VERSIONS = {'v0': '1.0.0', 'v111': '1.1.1', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3'}
+
+
+def display_version(version, expected):
+    """The game version the settings menu and --version name, from the identity the build was validated against.
+
+    TotK versions carry their display name in DISPLAY_VERSIONS. Donkey Kong Bananza's come from the display_version
+    of tools/data/expected-<target>.json (1.0.0, and 3.2.0 for title version 458752). With no metadata at all the
+    target name is the only true thing left to say: never 0.0.0, which is what the TotK numeric version decays to for
+    this game."""
+    if version in DISPLAY_VERSIONS:
+        return DISPLAY_VERSIONS[version]
+    return (expected or {}).get('display_version') or version
 
 GiB = 1 << 30
 # Peak commit of one compile, 1.2.1 at -O1 (2026-10-20): 120-180 MiB per ~3 MiB chunk, 568 MiB for main_table.c
@@ -250,11 +282,14 @@ RUNTIME = ROOT / 'runtime'   # --runtime: a copy of runtime/ lets a task build w
 
 def other_os(name):
     """A runtime file for another OS: Win32 ones (*_win.*, platform/win32.c, totk.rc) off Windows, the SDL window's
-    (*_sdl.*) and platform/linux.c on Windows."""
+    (*_sdl.*), platform/linux.c and platform/darwin.c on Windows, platform/darwin.c on Linux. On Darwin
+    platform/darwin.c replaces both win32.c and linux.c."""
     stem = name.rsplit('.', 1)[0]
     if WIN:
-        return stem.endswith('_sdl') or name == 'linux.c'
-    return stem.endswith('_win') or name in ('win32.c', 'totk.rc')
+        return stem.endswith('_sdl') or name in ('linux.c', 'darwin.c')
+    if DARWIN:
+        return stem.endswith('_win') or name in ('win32.c', 'totk.rc', 'linux.c')
+    return stem.endswith('_win') or name in ('win32.c', 'totk.rc', 'darwin.c')
 
 
 def runtime_sources(skip=()):
@@ -272,9 +307,10 @@ def runtime_object(out, src):
     return out / 'obj' / 'runtime' / rel.with_suffix('.o')
 
 
-def module_glue(layout, linked, hashes, paths, version):
+def module_glue(layout, linked, hashes, paths, version, expected=None):
     """C for build/<version>/modules.c: the layout table, the linked modules' function tables (dispatch.h), the
-    expected ExeFS hashes, the game version and the default game paths (host.h)."""
+    expected ExeFS hashes, the game version and its display name, and the default game paths (host.h). expected is the
+    validated tools/data/expected-<version>.json, whose display_version names the build."""
     out = [f'// Module glue written by tools/build_game.py; do not edit. {GENERATED_MARKER}',
            '#include "dispatch.h"', '#include "host.h"', '#include "layout.h"', '']
     for name, base, size in layout:
@@ -299,7 +335,9 @@ def module_glue(layout, linked, hashes, paths, version):
     for name in ('exefs', 'romfs', 'profile'):
         out.append(f'const char rt_default_{name}[] = {c_string(paths[name].as_posix())};')
     number = int(DISPLAY_VERSIONS[version].replace('.', '')) if version in DISPLAY_VERSIONS else 0   # 1.4.3 -> 143
-    out += [f'const int rt_game_version = {number};', f'const char rt_port_version[] = {c_string(port_version())};', '']
+    out += [f'const int rt_game_version = {number};', f'const char rt_game_target[] = {c_string(version)};',
+            f'const char rt_game_display[] = {c_string(display_version(version, expected))};',
+            f'const char rt_port_version[] = {c_string(port_version())};', '']
     return '\n'.join(out)
 
 
@@ -324,6 +362,9 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     out/obj and are link inputs without a compile edge. runtime_lib: a prebuilt library replaces the runtime objects
     except INSTALL_SIDE. make_lib: build only that library, from the runtime objects except INSTALL_SIDE."""
     inc = f'-I {cmd_path(RUNTIME)} -I {cmd_path(gen)}'
+    if DARWIN:
+        # Homebrew's prefix is not in clang's default search list: SDL3's and Vulkan's headers live there.
+        inc += ' -I /opt/homebrew/include'
     vma = f'{cmd_path(DEPS / "include")} -I {cmd_path(DEPS / "include" / "vma")}' if DEPS else cmd_path(vma_include())
     imgui = cmd_path(RUNTIME / 'third_party' / 'imgui')
     rt_inc = f'{inc} -I {cmd_path(out)} -I {vma} -I {imgui}'   # romfs_config.h, vk_mem_alloc.h (+ deps headers), imgui.h
@@ -616,7 +657,9 @@ def run_measured(cmd, env):
     if not WIN:
         t0 = time.monotonic()
         code = subprocess.call(cmd, cwd=ROOT, env=env)
-        peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024   # KiB on Linux
+        # ru_maxrss is KiB on Linux and bytes on macOS
+        rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+        peak = rss if DARWIN else rss * 1024
         return code, time.monotonic() - t0, peak, 0
     k32 = ctypes.WinDLL('kernel32', use_last_error=True)
     k32.CreateJobObjectW.restype = wt.HANDLE
@@ -702,6 +745,32 @@ def elf_sections(path):
     return out, hi - (lo or 0)
 
 
+def macho_sections(path):
+    """{section name: size} of the mapped sections of a Mach-O 64-bit executable, and the extent they span in memory.
+    A fat binary never reaches here: the build links one arm64 slice."""
+    data = path.read_bytes()
+    if int.from_bytes(data[0:4], 'little') != 0xFEEDFACF:   # MH_MAGIC_64
+        return {}, 0
+    off, out, lo, hi = 32, {}, None, 0
+    for _ in range(int.from_bytes(data[16:20], 'little')):   # ncmds
+        cmd, cmdsize = (int.from_bytes(data[off + i:off + i + 4], 'little') for i in (0, 4))
+        if cmd == 0x19:   # LC_SEGMENT_64
+            keep = int.from_bytes(data[off + 60:off + 64], 'little')   # initprot: 0 for __PAGEZERO alone
+            vmaddr, vmsize = (int.from_bytes(data[off + i:off + i + 8], 'little') for i in (24, 32))
+            so = off + 72
+            for i in range(int.from_bytes(data[off + 64:off + 68], 'little')):   # nsects
+                s = data[so + 80 * i:so + 80 * (i + 1)]
+                size = int.from_bytes(s[40:48], 'little')
+                if size and keep:
+                    name = s[0:16].split(b'\0', 1)[0].decode(errors='replace')
+                    out[name] = out.get(name, 0) + size
+            if keep:
+                lo = vmaddr if lo is None else min(lo, vmaddr)
+                hi = max(hi, vmaddr + vmsize)
+        off += cmdsize
+    return out, hi - (lo or 0)
+
+
 def mib(n):
     return f'{n / (1 << 20):,.1f} MiB'
 
@@ -756,7 +825,8 @@ def main():
         if args.version not in DISPLAY_VERSIONS:
             sys.exit(f'no expected hashes known for {args.version}; pass --expected')
         expected = ROOT / 'tools' / 'data' / f'expected-v{DISPLAY_VERSIONS[args.version]}.json'
-    hashes = json.loads(Path(expected).read_text())['exefs_sha256']
+    expected_data = json.loads(Path(expected).read_text())
+    hashes = expected_data['exefs_sha256']
     global CLANG, AR, WINDRES, NINJA, TOOLCHAIN_BIN, DEPS
     if args.ninja:
         NINJA = args.ninja.resolve()
@@ -805,7 +875,7 @@ def main():
     missing = [n for n in names if n not in hashes]
     if missing:
         sys.exit(f'{expected}: no exefs_sha256 for {missing}')
-    write_if_changed(out / 'modules.c', module_glue(layout, linked, hashes, paths, args.version))
+    write_if_changed(out / 'modules.c', module_glue(layout, linked, hashes, paths, args.version, expected_data))
     if (paths['romfs'] / 'index.json').is_file():
         count, size, dt = romfs_index.write(paths['romfs'], out)
         print(f'romfs index: {count} files, {mib(size)}, {dt:.1f} s')
@@ -876,11 +946,15 @@ def main():
         return
     for dll in dlls:   # dynamic SDL3 (zlib) and its libiconv (LGPL, unmodified DLL), found next to totk.exe
         shutil.copy2(dll, exe.parent / dll.name)
-    sections, image = pe_sections(exe) if WIN else elf_sections(exe)
+    sections, image = pe_sections(exe) if WIN else macho_sections(exe) if DARWIN else elf_sections(exe)
+    shown = [(k, v) for k, v in sections.items() if v and (k.startswith('.') or k.startswith('__') and k != '__PAGEZERO')]
     print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}, '
-          f'image {mib(image)}; ' + ', '.join(f'{k} {mib(v)}' for k, v in sections.items() if k.startswith('.') and v))
-    if image > 3 * GiB // 2:
-        print('build_game: warning: image over 1.5 GiB; RIP-relative code reaches only 2 GiB', file=sys.stderr)
+          f'image {mib(image)}; ' + ', '.join(f'{k} {mib(v)}' for k, v in shown))
+    # x86-64 reaches 2 GiB with RIP-relative addressing; AArch64's adrp reaches 4 GiB from each instruction
+    if image > (4 * GiB if DARWIN else 3 * GiB // 2):
+        print(f'build_game: warning: image over {"4" if DARWIN else "1.5"} GiB; '
+              f'{"adrp (PC-relative)" if DARWIN else "RIP-relative"} code reaches only '
+              f'{"4" if DARWIN else "2"} GiB', file=sys.stderr)
 
 
 if __name__ == '__main__':

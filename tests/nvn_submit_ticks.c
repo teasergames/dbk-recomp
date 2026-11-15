@@ -34,6 +34,12 @@ typedef struct { int n; VkImageView v[]; } ViewList;
 static void state_reset(VkExec *ex) { memset(ex,0,sizeof *ex); }
 void vk_dump_init(void) {}
 void vk_exec_pass_end(VkExec *ex) { ex->in_pass=0; }
+static void par_flush(VkExec *ex) { (void)ex; }
+static int par_mode;
+static int par_threads(void) { return par_mode; }
+static int npiece __attribute__((unused));   // vk_exec.c only assigns it now
+static int par_collecting(void) { return 0; }
+static uint64_t par_end_op[OP_COUNT_ + 1];
 void vk_exec_barrier(VkExec *ex) { ex->recorded++; }
 void vk_mem_mirror_begin(void) {}
 int vk_mem_mirror_end(VkCommandBuffer cb,uint64_t f) { (void)cb;(void)f;return 0; }
@@ -87,6 +93,14 @@ static void walk(VkExec *ex,const op_hdr *h,int depth) {
     const Recording *r=(const Recording*)h;
     for (int i=0;i<r->count;i++) report_counter(ex,&r->reports[i]);
 }
+// The helper thread is off here (vk_spec.c, the par_* functions of vk_exec.c): a submission is recorded by its one
+// thread. A checkout from before the helper uses none of these.
+enum { PS_SCAN };
+static struct { const op_hdr *next; int state; uint64_t rec; } P __attribute__((unused));
+int vk_spec_on(void) { return 0; }
+int vk_mem_shadow_on(void) { return 0; }
+static void par_close(VkExec *ex) { (void)ex; }
+static void par_log(void) {}
 @RECORD@
 static void complete_one(void) {
     if (consumed==jobs) abort();unsigned i=consumed++;

@@ -17,15 +17,24 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--cc', default='clang')
     ap.add_argument('--out', type=Path, default=ROOT/'build/dkb-frame-rate-test')
+    ap.add_argument('--table', type=Path, default=Path('recomp/patches-dkb100.txt'), help='patch table (relative to the repo root)')
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     lifter = Lifter(0x7000000000, simd='c')
-    bodies = []
-    for line in (ROOT/'recomp/patches-dkb100.txt').read_text().splitlines():
+    bodies, offsets = [], []
+    for line in (ROOT/args.table).read_text().splitlines():
         fields = line.split('#', 1)[0].split()
         if fields[:3] != ['site', 'realtime', 'main']:
             continue
         pc = int(fields[3], 16)
+        words = fields[5:]
+        if len(words) == 1 and not words[0].startswith('@') and int(words[0], 16) >> 26 == 0x25:
+            # A host call (runtime/frame_rate.c blur_frames, 3.2.0): one BL to patch page +0x250, which recomp/layout.py
+            # puts at main+0x2810000. The host function itself is not exercised here.
+            imm = int(words[0], 16) & 0x3FFFFFF
+            assert pc + ((imm ^ 0x2000000) - 0x2000000) * 4 == 0x2810000 + 0x250, line
+            continue
+        offsets.append(pc)
         code = []
         for word in fields[5:]:
             if word.startswith('@page:x'):
@@ -34,10 +43,11 @@ def main():
                 ins = lifter.lift(int(word, 16), 0x7000000000+pc)
                 assert ins.kind == 'op'
                 code.append(ins.code)
-        bodies.append(f'void patch_{pc:x}(Cpu *c, void *page) {{\n'+ '\n'.join(code)+'\n}')
+        bodies.append(f'void patch_{"exit" if not bodies else len(bodies)}(Cpu *c, void *page) {{\n'+ '\n'.join(code)+'\n}')
     assert len(bodies) == 8
-    # The common exit must retain the controller-selected interval, not force 1.
-    assert all('patch_1ead2c' not in body for body in bodies)
+    # The common exit must retain the controller-selected interval, not force 1: no site may replace the
+    # interval load right after the first (common-exit) site.
+    assert offsets[0] + 8 not in offsets
     original = lifter.lift(0xb9404281, 0x70001ead2c)
     bodies.append('void original_interval(Cpu *c) {\n'+original.code+'\n}')
     source = '#include "cpu.h"\n#include <math.h>\n#include <stdio.h>\n'+'\n'.join(bodies)
@@ -58,7 +68,7 @@ int main(void) {
         Cpu want=c;
         want.x[0]=c.x[19]; want.x[1]=rounded; want.x[8]=(uintptr_t)page;
         memcpy(expected+0x50,&rounded,4); memcpy(expected+0x54,&rounded,4);
-        patch_1ead24(&c,page);
+        patch_exit(&c,page);
         errors+=memcmp(&c,&want,sizeof c)!=0;
         errors+=memcmp(state,expected,sizeof state)!=0;
         cases++;
@@ -67,7 +77,7 @@ int main(void) {
         errors+=memcmp(&c,&want,sizeof c)!=0;
         errors+=memcmp(state,expected,sizeof state)!=0;
         cases++;
-        void (*clocks[])(Cpu*,void*)={patch_1bc834,patch_2d9fc8,patch_2da120,patch_34e99c,patch_34ec1c,patch_34ec68,patch_69fc60};
+        void (*clocks[])(Cpu*,void*)={patch_1,patch_2,patch_3,patch_4,patch_5,patch_6,patch_7};
         for(unsigned clock=0;clock<7;clock++) {
             memset(stack,0xa5,sizeof stack);
             c.x[8]=(uintptr_t)state; want=c;

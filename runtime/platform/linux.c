@@ -746,6 +746,23 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n) {
     return 0;
 }
 
+// See platform.h: replace and write_atomic for re-derivable cache files, without the flush to the disk.
+int plat_file_replace_cache(const char *from, const char *to) { return rename(from, to) == 0; }
+
+int plat_file_write_cache(const char *path, const void *data, size_t n) {
+    if (access(path, W_OK) && errno != ENOENT) return 0;
+    char tmp[PATH_MAX + 48];
+    int len = snprintf(tmp, sizeof tmp, "%s.%u.%u.tmp", path, plat_process_id(), plat_thread_id());
+    if (len < 0 || len >= (int)sizeof tmp) return 0;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return 0;
+    int ok = write_all(fd, data, n);
+    ok = close(fd) == 0 && ok;
+    if (ok && !rename(tmp, path)) return 1;
+    unlink(tmp);
+    return 0;
+}
+
 int plat_file_flush(const char *path) {
     int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd < 0) return 0;
@@ -849,6 +866,20 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
     }
     plat_mutex_unlock(&vm_lock);
     return ok;
+}
+
+// A linear scan from lo: an address is free when the fixed reservation there succeeds, so a candidate the system or
+// another thread holds costs one failed mmap and the scan moves past it.
+int plat_mem_reserve_in(uint64_t lo, uint64_t hi, uint64_t n, uint64_t align, int watch, uint64_t *at) {
+    if (!n || hi <= lo || n > hi - lo) return 0;
+    if (!align) align = PG;
+    if (align & (align - 1)) return 0;
+    for (uint64_t a = (lo + align - 1) & ~(align - 1); a <= hi - n; a += align)
+        if (plat_mem_reserve(a, n, watch)) {
+            *at = a;
+            return 1;
+        }
+    return 0;
 }
 
 void *plat_mem_alloc(size_t n) {
@@ -1555,6 +1586,11 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
     if (f && fscanf(f, "%llu %llu", &size, &resident) == 2) *proc_mb = (float)(resident * (uint64_t)sysconf(_SC_PAGESIZE) >> 20);
     if (f) fclose(f);
 }
+
+// No walk of the address space on this host: mem_commit_report then sums nothing.
+void plat_mem_walk(void (*fn)(uint64_t, uint64_t, int, void *), void *arg) { (void)fn, (void)arg; }
+// Not implemented on this host (the commit report is Windows only): reports 0.
+uint64_t plat_mem_resident(uint64_t base, uint64_t size) { (void)base, (void)size; return 0; }
 
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     *resident = *private_bytes = 0;

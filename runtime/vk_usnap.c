@@ -20,8 +20,10 @@
 #include <string.h>
 
 #include "host.h"
+#include "msort.h"
 #include "nvn_api.h"
 #include "vk.h"
+#include "vk_spec.h"
 #include "platform/platform.h"
 
 #define ALIGN 256u
@@ -56,6 +58,12 @@ static struct {
     uint64_t subs, regions, bytes, copy_ns, hits, drops, inflight, refused, off_subs;
 } U;
 
+// The helper threads (vk_spec.h) look regions up in vk_usnap_find while the replay thread drops some of them
+// (vk_usnap_drop), so a region's dropped mark and U.gen are loaded and stored atomically. A helper part that read a
+// region before it was dropped is itself dropped, because the generation moved (vk_exec.c par_join). The rest of U
+// changes only in vk_usnap_begin and vk_usnap_end, where no helper part is out.
+static void gen_bump(void) { __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELEASE); }
+
 static Arena *free_arenas;
 static PlatMutex free_lock = PLAT_MUTEX_INIT;
 
@@ -66,6 +74,8 @@ static void *grow(void *p, int *cap, size_t elem) {
     *cap = n;
     return q;
 }
+
+static volatile uint64_t arena_total;   // bytes of every arena created; arenas are only freed at shutdown
 
 static Arena *arena_get(uint64_t need) {
     plat_mutex_lock(&free_lock);
@@ -95,6 +105,7 @@ static Arena *arena_get(uint64_t need) {
         return NULL;
     }
     a->map = info.pMappedData;
+    __atomic_fetch_add(&arena_total, a->size, __ATOMIC_RELAXED);
     rt_log("vk_usnap: new arena of %.1f MiB", a->size / 1048576.0);
     return a;
 }
@@ -133,10 +144,8 @@ static int by_lo(const void *a, const void *b) {
     uint64_t x = ((const Rng *)a)->lo, y = ((const Rng *)b)->lo;
     return x < y ? -1 : x > y;
 }
-static int wr_by_lo(const void *a, const void *b) {
-    uint64_t x = ((const Wrote *)a)->lo, y = ((const Wrote *)b)->lo;
-    return x < y ? -1 : x > y;
-}
+#define WROTE_LESS(x, y) ((x)->lo < (y)->lo)
+MSORT_DEFINE(sort_wrote, Wrote, WROTE_LESS)   // by lo, without a call per comparison (msort.h)
 
 // Sorts the collected ranges by lo. A town frame binds about 10,000 uniform ranges and qsort took half a millisecond
 // of the copy's 0.96 ms on the game thread, so they go through an LSD radix sort on (lo - lowest) / ALIGN, three
@@ -183,7 +192,9 @@ static void wr_prune(void) {
     int n = 0;
     for (int i = 0; i < U.nwr; i++)
         if (U.wr[i].fence > done) U.wr[n++] = U.wr[i];
-    qsort(U.wr, (size_t)n, sizeof *U.wr, wr_by_lo);
+    static Wrote *sbuf;   // the replaying thread's (vk_usnap_begin)
+    static size_t scap;
+    sort_wrote(U.wr, (size_t)n, &sbuf, &scap);
     int m = 0;
     for (int i = 0; i < n; i++) {
         if (m && U.wr[i].lo <= U.wr[m - 1].hi) {
@@ -218,7 +229,7 @@ static void summary(void) {
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
-    U.on = 0, U.fence = fence, U.gen++;
+    U.on = 0, U.fence = fence, gen_bump();
     summary();
     if (!RT_KNOB_ON(U.mode - 1)) {
         U.off_subs++;
@@ -262,7 +273,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
 
 void vk_usnap_end(uint64_t fence) {
     if (U.arena) vk_completion_add(fence, arena_done, U.arena), U.arena = NULL;
-    U.on = 0, U.gen++;
+    U.on = 0, gen_bump();
 }
 
 // First region whose end is above a.
@@ -276,34 +287,61 @@ static int first_above(uint64_t a) {
     return lo;
 }
 
+static _Thread_local int find_quiet;
+
+void vk_usnap_quiet(int on) { find_quiet = on; }
+
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
     if (!U.on || !n) return 0;
     int i = first_above(addr);
     if (i >= U.nreg) return 0;
     const Reg *r = &U.reg[i];
-    if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
+    if (__atomic_load_n(&r->dropped, __ATOMIC_ACQUIRE) || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
-    U.hits++;
+    if (!vk_spec_helper() && !find_quiet) U.hits++;   // the replay thread's count: helpers and slices only read the table
     return 1;
+}
+
+// Parallel passes (vk_exec.c par_flush) record slices on several threads: drops are made under drop_lock. A drop
+// that takes a copy away belongs to a place in the draw order, which slices recorded at once do not keep (a slice ahead
+// in the pass may be recorded after it and bind memory where the walk would have bound the copy), so a slice whose
+// stored range overlaps a copy (vk_usnap_covers) marks its pass's targets and they are not sliced again
+// (vk_exec_par_order_hazard). A stored range no copy overlaps changes no binding: only the list of writes grows.
+static PlatMutex drop_lock = PLAT_MUTEX_INIT;
+const void *vk_usnap_bytes(uint64_t addr, uint64_t n) {
+    VkDescriptorBufferInfo b;
+    return vk_usnap_find(addr, n, 1, &b) ? U.arena->map + b.offset : NULL;
+}
+
+// 1 when a copy made for this submission overlaps [addr, addr+n): only then does a drop of that range change what a
+// later binding gets, and with it depend on the draw order. Reads what vk_usnap_begin set up; any recording thread.
+int vk_usnap_covers(uint64_t addr, uint64_t n) {
+    if (!U.on || !n) return 0;
+    int i = first_above(addr);
+    return i < U.nreg && U.reg[i].lo < addr + n;
 }
 
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
+    plat_mutex_lock(&drop_lock);
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
     U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence};
-    if (!U.on) return;
-    for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
-        if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, U.gen++;
+    if (U.on)
+        for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
+            if (!U.reg[i].dropped) __atomic_store_n(&U.reg[i].dropped, 1, __ATOMIC_RELEASE), U.drops++, gen_bump();
+    plat_mutex_unlock(&drop_lock);
 }
 
-uint64_t vk_usnap_gen(void) { return U.gen; }
+uint64_t vk_usnap_gen(void) { return __atomic_load_n(&U.gen, __ATOMIC_ACQUIRE); }
+uint64_t vk_usnap_arena_bytes(void) { return __atomic_load_n(&arena_total, __ATOMIC_RELAXED); }
 
 // The arenas back on the free list (vk_exec_draw_shutdown: the device is idle, every completion ran).
 void vk_usnap_shutdown(void) {
     plat_mutex_lock(&free_lock);
     for (Arena *a = free_arenas, *next; a; a = next) next = a->next, vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a);
     free_arenas = NULL;
+    __atomic_store_n(&arena_total, 0, __ATOMIC_RELAXED);
     plat_mutex_unlock(&free_lock);
 }

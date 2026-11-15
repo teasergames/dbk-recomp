@@ -22,7 +22,14 @@ FIXTURE = r'''
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct VkExec VkExec;
+// The draw context of the replay thread (vk_exec_draw.c DrawCtx), whose copy of the translator is no helper's: the
+// helper check never fails.
+typedef struct DrawCtx { char none; } DrawCtx;
+#define DC_OF(ex) ((ex)->draw)
+#define IS_HELPER(dc) ((void)(dc), 0)
+typedef struct VkExec { DrawCtx *draw; } VkExec;
+static DrawCtx ctx;
+static VkExec exec = {&ctx};
 typedef struct { uint64_t addr, size; } Range;
 typedef struct {
     Range *written;
@@ -37,6 +44,8 @@ static int npending, cpending;
 static unsigned failures;
 
 static void rt_fatal(const char *fmt, ...) { (void)fmt; abort(); }
+enum { VK_SPEC_WRITE = 1 };
+static int vk_spec_fail(int why) { (void)why; abort(); }
 static CbRes *cb_res(VkExec *ex) { (void)ex; return &res; }
 @GROW@
 static void vk_mem_gpu_pending(uint64_t addr, uint64_t size) {
@@ -56,7 +65,7 @@ static void note_model(uint64_t addr, uint64_t size) {
 }
 
 static void note(uint64_t addr, uint64_t size) {
-    note_written(NULL, addr, size);
+    note_written(&exec, addr, size);
     note_model(addr, size);
 }
 

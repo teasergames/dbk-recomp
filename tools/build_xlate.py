@@ -1,12 +1,13 @@
 """Build the shader translator: build/xlate/totk_xlate.exe (Ryujinx 1.3.2 + patches, NativeAOT, SPIR-V for Vulkan).
 
 Copies tools/vendor/ryujinx to build/xlate/ryujinx, applies the selected tools/xlate/patches there (tools/vendor stays
-byte-identical), then runs `dotnet publish`. The default applies patches 0001-0013 and 0015-0020, preserving the fast floating
+byte-identical), then runs `dotnet publish`. The default applies patches 0001-0013 and 0015-0023, preserving the fast floating
 min/max/clamp operations. Patch 0015 makes runtime storage-candidate resolution available only to explicit version-1
 NVN 2 compute requests; missing/version-0 requests retain the legacy pass. --defined-float-minmax also applies 0014's integer selection and numeric constant folding;
 this adds shader ALU work and has no established game visual or frame-time benefit. Needs the .NET 10 SDK, the MSVC build
 tools and vswhere.exe (docs/building.md). Run with .venv. On Linux it builds build/xlate/totk_xlate for linux-x64, which
-NativeAOT links with the system's clang (no MSVC); NativeAOT builds for the OS it runs on only.
+NativeAOT links with the system's clang (no MSVC), and on macOS for osx-arm64 (osx-x64 on Intel), which needs
+the Xcode command line tools for the linker; NativeAOT builds for the OS it runs on only.
 
 Next to the exe it writes totk_xlate.id: the translator identity, a sha256 over everything the build reads (this script,
 Program.cs, the csproj, the selected patches, the vendor tree). runtime/gfx_shader.c puts it into every shader cache key, so a
@@ -21,6 +22,7 @@ translator change re-keys the cache without a hand-made KEY_VERSION bump. --id-o
 import argparse
 import hashlib
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -34,6 +36,10 @@ XLATE = ROOT / "tools" / "xlate"
 BUILD = ROOT / "build" / "xlate"
 WIN = os.name == "nt"
 EXE = "totk_xlate.exe" if WIN else "totk_xlate"
+# NativeAOT builds for the OS it runs on: the target RID is this host's.
+# .NET runtime ids name the architecture arm64 / x64, while platform.machine() says arm64 / x86_64 on macOS.
+RID = "win-x64" if WIN else ("osx-x64" if platform.machine() == "x86_64" else "osx-arm64") if sys.platform == "darwin" \
+    else "linux-x64"
 VSWHERE_DIR = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer"
 DEFINED_FLOAT_MINMAX_PATCH = "0014-numeric-float-minmax-and-saturation.patch"
 
@@ -97,8 +103,8 @@ def verify_vendor() -> None:
 
 def selected_patches(*, defined_float_minmax: bool = False) -> list[Path]:
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 20:
-        sys.exit(f"expected 20 patches, found {len(patches)}")
+    if len(patches) != 23:
+        sys.exit(f"expected 23 patches, found {len(patches)}")
     optional = XLATE / "patches" / DEFINED_FLOAT_MINMAX_PATCH
     if optional not in patches:
         sys.exit(f"missing optional patch: {DEFINED_FLOAT_MINMAX_PATCH}")
@@ -179,7 +185,7 @@ def main() -> None:
     out = BUILD / "publish"
     shutil.rmtree(out, ignore_errors=True)
     cmd = [
-        dotnet, "publish", str(work / "totk_xlate.csproj"), "-c", "Release", "-r", "win-x64" if WIN else "linux-x64",
+        dotnet, "publish", str(work / "totk_xlate.csproj"), "-c", "Release", "-r", RID,
         "-p:PublishAot=true", "-p:InvariantGlobalization=true", f"-p:RyuSrc={src}", "-o", str(out),
     ]
     if a.llvm:

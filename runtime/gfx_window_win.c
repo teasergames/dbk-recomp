@@ -1,6 +1,6 @@
 // The Win32 back end of the window (gfx_wsys.h): the window and its message loop on a thread of their own, F11
 // fullscreen, the settings TOTK_WINDOW_SIZE and TOTK_FULLSCREEN, the monitor's refresh rate, focus, the Vulkan surface.
-// The swapchain and the present are gfx_present.c's. The in-game menu's keyboard and mouse come from the window
+// The swapchain and the present are vk_present.c's. The in-game menu's keyboard and mouse come from the window
 // procedure (ui/menu_win.cpp), and so do the game's (input_win.c).
 //
 // The process is per-monitor DPI aware (totk.manifest): every size here is physical pixels, TOTK_WINDOW_SIZE included,
@@ -104,20 +104,35 @@ static void toggle_fullscreen(HWND h) {
     }
 }
 
-// The window size and fullscreen state last taken from the settings (window thread). apply_settings acts on a change of
-// either value only, so a window resized by hand keeps its size when another setting changes.
+// Window mode 0 windowed, 1 borderless (the popup over the monitor), 2 fullscreen. Windows has no mode switch worth
+// making under a Vulkan swapchain (the flip-model present already bypasses the compositor), so fullscreen is the popup
+// kept above every other window, taskbar included.
+static int last_fs = 1;   // the full-screen mode F11 returns to: the last one chosen anywhere
+
+static void set_mode(HWND h, int mode) {
+    if (mode) last_fs = mode;
+    input_cursor_suspend(1);
+    if ((mode != 0) != is_fullscreen(h)) toggle_fullscreen(h);
+    if (!g_background)
+        SetWindowPos(h, mode == 2 ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    input_cursor_suspend(0);
+}
+
+// The window size and mode last taken from the settings (window thread). apply_settings acts on a change of either
+// value only, so a window resized by hand keeps its size when another setting changes.
 static char g_applied_size[32];
-static int g_applied_fs;
+static int g_applied_mode;
 
 static void note_applied(void) {
     snprintf(g_applied_size, sizeof g_applied_size, "%s", cfg_value("TOTK_WINDOW_SIZE"));
-    g_applied_fs = cfg_fullscreen();
+    g_applied_mode = gfx_cfg_window_mode();
 }
 
 // Window thread: the window takes the size and fullscreen state of the settings when they changed. In fullscreen the
 // size goes into the placement restored when fullscreen ends.
 static void apply_settings(HWND h) {
-    int size_changed = strcmp(cfg_value("TOTK_WINDOW_SIZE"), g_applied_size) != 0, fs = cfg_fullscreen(), fs_changed = fs != g_applied_fs;
+    int size_changed = strcmp(cfg_value("TOTK_WINDOW_SIZE"), g_applied_size) != 0, mode = gfx_cfg_window_mode(),
+        mode_changed = mode != g_applied_mode;
     note_applied();
     if (size_changed) {
         int cw, ch, ow, oh;
@@ -135,11 +150,7 @@ static void apply_settings(HWND h) {
             }
         }
     }
-    if (fs_changed && fs != is_fullscreen(h)) {
-        input_cursor_suspend(1);
-        toggle_fullscreen(h);
-        input_cursor_suspend(0);
-    }
+    if (mode_changed) set_mode(h, mode);
 }
 
 void gfx_window_apply_settings(void) {
@@ -206,11 +217,14 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (menu_window_msg(h, m, w, l, &input_res)) return input_res;
     switch (m) {
     case WM_KEYDOWN:
+        if (w == VK_F9 && !(l & (1 << 30))) gfx_backend()->dump_request();   // TOTK_DUMP=key; F10 is the system menu key
         if (w == VK_F11 && !(l & (1 << 30))) {   // bit 30: auto-repeat
-            input_cursor_suspend(1);
-            toggle_fullscreen(h);
-            input_cursor_suspend(0);
-            cfg_set("TOTK_FULLSCREEN", is_fullscreen(h) ? "1" : "0");   // the menu shows it; the next start keeps it
+            // the real window decides, so a mode forced by the environment cannot stick F11
+            int cur = is_fullscreen(h) ? (g_applied_mode ? g_applied_mode : 1) : 0, mode = cur ? 0 : last_fs;
+            set_mode(h, mode);
+            // the menu shows these; the next start keeps them
+            cfg_set("TOTK_WINDOW_MODE", mode == 2 ? "fullscreen" : mode == 1 ? "borderless" : "windowed");
+            cfg_set("TOTK_FULLSCREEN", mode ? "1" : "0");
             cfg_save();
             note_applied();   // what cfg_get reads now (the environment may still override it)
         }
@@ -219,11 +233,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         apply_settings(h);
         return 0;
     case WM_APP_FULLSCREEN:
-        if (cfg_fullscreen() && !is_fullscreen(h)) {
-            input_cursor_suspend(1);
-            toggle_fullscreen(h);
-            input_cursor_suspend(0);
-        }
+        if (cfg_fullscreen() && !is_fullscreen(h)) set_mode(h, gfx_cfg_window_mode());
         return 0;
     case WM_SIZE:
         keep_awake(w != SIZE_MINIMIZED);
@@ -265,6 +275,8 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_ACTIVATEAPP: {
         int in = w != 0;
         gfx_window_focus_changed(in);
+        if (g_applied_mode == 2 && is_fullscreen(h))   // fullscreen is topmost only while the game has focus
+            SetWindowPos(h, in ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         if (in && g_fs_pending) {
             g_fs_pending = 0;
             PostMessageW(h, WM_APP_FULLSCREEN, 0, 0);
@@ -273,6 +285,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_CLOSE:
         gfx_window_closed();
+        return 0;
     case WM_ERASEBKGND:
         return 1;
     }

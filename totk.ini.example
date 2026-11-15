@@ -4,8 +4,9 @@
 # '#' and ';' start a comment; [sections] only group lines.
 
 [frame rate]
-# Frame rate limit: 30, 40, 45, 60, 90, 120, 144, any whole rate from 30 to 360, or display (the refresh rate of the
-# window's monitor). Above 60 is experimental and needs realtime = 1. Changes while the game runs take effect at once.
+# Frame rate limit: 30, 40, 45, 60, 90, 120, 144, any whole rate from 30 to 360, display (the refresh rate of the
+# window's monitor) or unlimited (no wait; with vk_present = fifo the monitor still caps it). Above 60 and unlimited
+# are experimental and need realtime = 1. Changes while the game runs take effect at once.
 # fps_limit = 60
 # Older key, read only while fps_limit is unset: fps60 = 0 means a limit of 30.
 # fps60 = 1
@@ -75,6 +76,9 @@
 # fix_vs_fault = 1
 # New GPU memory pools start zero-filled, as Switch memory does.
 # fix_zero = 1
+# Primitive restart on triangle-list draws, as the Switch does (needs primitiveTopologyListRestart). Without it the
+# restart indices are fetched as vertices and draw long stretched triangles (Bananza's map).
+# list_restart = 1
 # Optimisations, 0 turns each off: skip bindings that did not change, remember shader lookups, reuse the previous
 # draw's pipeline when its state repeats, remember texture descriptors between draws, update descriptors in bulk,
 # skip push constants that did not change.
@@ -113,6 +117,9 @@
 # not apply: at 150% scale, 1920x1080 covers the area 1280x720 covers at 100%. F11 switches fullscreen and saves it
 # here. Changes while the game runs take effect at once.
 # window_size = 1920x1080
+# windowed, borderless (over the screen) or fullscreen (the display's own mode with SDL windows; on Windows, borderless
+# kept above every other window). Wins over fullscreen below when both are set.
+# window_mode = windowed
 # fullscreen = 0
 # 1, the default: the game keeps running while you are in another window; the keyboard stays quiet until the window is
 # in front again. 0: it pauses when its window loses focus, as it does on the Switch when Home is pressed; a load
@@ -134,11 +141,25 @@
 # output_res = 1920x1080
 # 3D render scale: the scene's size relative to the game resolution, game (5/6, the game's own 1600x900 at 1080p) or
 # a percentage (25 to 400, at most 4096 pixels a side); above 100 supersamples the scene (anti-aliasing). Read at start.
+# TotK only: Bananza draws at the game's own size, and the HUD and dkb.log report its upscaler's input and output sizes.
 # render_scale = game
 # Scaling to the window when it is larger than the game resolution: fsr (AMD FSR 1) or bilinear, and FSR's sharpening
 # from 0 (off) to 100. Changes while the game runs take effect at once.
+# upscaler = dlss (experimental, NVIDIA RTX only, read at start) also replaces the game's own upscaler with NVIDIA DLSS
+# and keeps FSR for the window; it needs nvngx_dlss.dll next to dkb.exe (docs/dkb-dlss.md) and falls back to the
+# game's upscaler, with a "dlss:" line in the log, when anything is missing.
 # upscaler = fsr
 # sharpness = 80
+# SMAA 1x anti-aliasing of the final picture: off (the default), low, medium or high. It runs after the picture is scaled to
+# the window (FSR or bilinear) and before the menu is drawn, so the game's HUD is smoothed as well. Changes while the game
+# runs take effect at once.
+# smaa = off
+# Frame generation (experimental, Donkey Kong Bananza only): off (the default) or 2x. At 2x a frame is made between each two of the game's, from their
+# motion, and shown first, then the game's own frame half a frame later, so a game at 30 fps is shown at 60. The menu
+# overlay is drawn on every shown frame and is never interpolated. No frame is made after a gap of over 100 ms, when the
+# picture's size changes, for the game's own HDR picture, when the display's refresh is below the doubled rate, or unless
+# vk_present is mailbox or immediate. Changes while the game runs take effect at once.
+# frame_gen = off
 # Picture shape when the window's shape differs from the game resolution's (a 16:9 picture in a 21:9 fullscreen
 # window): fit, the default, keeps the shape, with black bars at the sides or above and below, so a 16:9 game in a wider
 # window is no longer stretched as it used to be; stretch fills the window. Changes while the game runs take effect at
@@ -157,6 +178,24 @@
 # color_saturation = 100
 # color_gamma = 1
 
+# HDR output (experimental): hdr = 1 sends the picture as HDR10 (needs HDR on in Windows, "Use HDR", or a Wayland
+# compositor with colour management; without it the picture stays SDR). The game's SDR picture is lifted in a last
+# pass: highlights above a knee are stretched towards hdr_peak_nits (your display's peak) with their hue kept;
+# hdr_game_nits is the picture's white (paper white, 203 is the HDR reference; the game's HUD follows it) and
+# hdr_ui_nits the in-game menu's white.
+# hdr is read at start, the nits at once.
+# hdr = 0
+# hdr_peak_nits = 1000
+# hdr_game_nits = 203
+# hdr_ui_nits = 203
+# Bananza 3.2.0 only (untested on 1.0.0, where it stays off), read at start: with hdr = 1,
+# hdr_native = 1 lets the game make its own HDR10 picture (the console's HDR mode) instead of lifting the SDR one, while
+# the swapchain is HDR10; hdr_peak_nits and hdr_game_nits are what it is told the display has. The game caps its peak
+# at 1400 nits, so a higher hdr_peak_nits changes nothing there; the display is told the game's peak. Its highlights
+# reach that peak (the game's own curve stops at about 1.36 times hdr_game_nits). FSR, SMAA and the colour adjustment
+# are off with hdr_native.
+# hdr_native = 0
+
 [language]
 # Language: a Windows locale such as de-DE, or a Switch code (en-US, ja, zh-Hant, ...). Default: the Windows locale.
 # locale = en-US
@@ -174,6 +213,10 @@
 # audio_prefill_ms = 20
 # Volume in percent (0 to 100), on top of the game's own. Changes while the game runs take effect at once.
 # volume = 100
+# Speakers: auto (5.1 when the default output device has six or more channels, stereo otherwise), stereo or 5.1. The
+# game is told the same channel count and mixes for it. Falls back to stereo if the device refuses 5.1. Takes effect
+# at the next start.
+# audio_channels = auto
 
 [input]
 # Gamepad motion controls (0 = off) and vibration (0 = off).

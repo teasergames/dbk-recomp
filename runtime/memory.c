@@ -23,14 +23,34 @@
 // Switch 2 sizes (Donkey Kong Bananza): the game sizes its heap from TotalMemorySize (GetInfo 6), so the pool and the
 // heap block are the Switch 2's, not the Switch 1's 0xCD500000 and 4 GiB. The heap is committed as the game asks
 // (SetHeapSize), and Windows commit charge only grows with it.
+#ifdef __APPLE__
+// macOS maps nothing between 63 GiB and 448 GiB (a kernel guard region), so the stack and heap block, the alias
+// region and the module window all share the 64 GiB from 448 GiB to 2^39, in whatever holes libmalloc has left. The
+// block still holds the 768 MiB of stack and heap offset plus the 12 GiB heap cap, so it is 13 GiB here; the alias
+// region is ALIAS_SIZE at most, since the 64 GiB of the other hosts fit in no hole of this window.
+#define LOW_SIZE (13 * GiB)
+// The alias region is where the game maps its pools, so it has to hold a pool-sized alias: ALIAS_MIN leaves room for
+// the offsets those aliases are mapped at, ALIAS_SIZE is what a window with room gives, and mem_init steps down to
+// the largest that fits, logging when it does.
+#define ALIAS_SIZE (16 * GiB)
+#define ALIAS_MIN (10 * GiB)
+#else
 #define LOW_SIZE (16 * GiB)
+#define ALIAS_SIZE (64 * GiB)
+#endif
 #define STACK_OFF 0x10000000ull
 #define STACK_SIZE 0x10000000ull
 #define HEAP_OFF (STACK_OFF + STACK_SIZE + 0x10000000ull)
 #define HEAP_CAP (12 * GiB)
-#define ALIAS_SIZE (64 * GiB)
+#ifdef __APPLE__
+// The window above the modules is fragmented by libmalloc's own reservations, and a 4 GiB alignment would give back
+// up to 4 GiB of every hole: the alias region needs only the 2 MiB of the module bases.
+#define ALIAS_ALIGN (2u << 20)
+#else
 #define ALIAS_ALIGN (4 * GiB)
+#endif
 #define ALIAS_PAGES (ALIAS_SIZE / PAGE)
+static uint64_t alias_page_count = ALIAS_PAGES;   // pages of the alias region actually reserved (macOS may take fewer)
 // Application pool: Switch 2 games are said to get about 9 GiB of the 12 (not measured on hardware; TOTK_APP_POOL
 // overrides). TotK's retail Switch 1 pool was 0xCD500000.
 #define DEFAULT_POOL (9 * GiB)
@@ -81,10 +101,12 @@ static volatile int32_t nfrz;
 static PlatMutex frz_lock = PLAT_MUTEX_INIT;
 static volatile int64_t frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
 
+static int heap_lazy(void);
+
 static int watched(uint64_t addr, uint64_t size) {
     const RtGuestLayout *g = &L;
     return (addr >= g->aslr.base && size <= LOW_SIZE && addr - g->aslr.base <= LOW_SIZE - size) ||
-           (addr >= g->alias.base && size <= ALIAS_SIZE && addr - g->alias.base <= ALIAS_SIZE - size);
+           (addr >= g->alias.base && size <= g->alias.size && addr - g->alias.base <= g->alias.size - size);
 }
 
 // frz_lock held exclusively. why: 1 a write fault, 2 mem_thaw (holds the region thawed), 3 a mapping change here.
@@ -126,7 +148,8 @@ static int freeze_locked(uint64_t r) {
         if (st >= PLAT_PROT_NONE) {
             if (st != PLAT_PROT_RW || n == 16) return 0;
             run[n][0] = x, run[n][1] = y, n++;
-        } else if (st != PLAT_MEM_RESERVED) return 0;
+        } else if (st != PLAT_MEM_RESERVED || (heap_lazy() && x >= L.heap.base && x < L.heap.base + heap_size)) return 0;
+        // (a lazy-heap hole may be committed by fault_veh at any moment, so such a region is never frozen)
     }
     for (int i = 0; i < n; i++)
         if (!plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_READ)) {
@@ -215,6 +238,9 @@ static void reexec_or_fail(const char *what) {
 
 void mem_init(void) {
     if (L.pool) return;
+    const char *ran = cfg_get("TOTK_REEXEC");
+    if (ran && *ran && atoi(ran)) rt_log("mem: re-ran the process %d time%s for a free address space", atoi(ran),
+                                          atoi(ran) == 1 ? "" : "s");
     // Fixed window: modules, kernel region, host-function addresses.
     mods_lo = MOD_MAIN_BASE;
     mods_hi = align_up(rt_layout[rt_layout_count - 1].base + rt_layout[rt_layout_count - 1].size, 0x10000);
@@ -225,16 +251,33 @@ void mem_init(void) {
     if (!reserve_at(RT_HOSTFN_BASE, RT_HOSTFN_SIZE, 0)) reexec_or_fail("the host-function window");
 
     // Stack and heap block, then the alias region above it, both searched below the module window.
-    uint64_t low = 0, alias = 0;
+    uint64_t low = 0, alias = 0, asize = ALIAS_SIZE;
+#ifdef __APPLE__
+    // Nothing below the module window is mappable on macOS, so both regions go into the holes above the host-function
+    // window: plat_mem_reserve_in walks the region list and skips whatever the system and libmalloc already hold
+    // there, and a fresh process (reexec_or_fail) gets a fresh layout when this one's holes are too small. The block
+    // goes first: it is the fixed size the heap cap needs, and the alias region fits above it more often than below.
+    if (!plat_mem_reserve_in(RT_HOSTFN_BASE + RT_HOSTFN_SIZE, RT_ADDRESS_LIMIT, LOW_SIZE, GiB, 1, &low))
+        reexec_or_fail("a 13 GiB stack and heap block above the modules");
+    asize = 0;
+    for (uint64_t s = ALIAS_SIZE; s >= ALIAS_MIN && !asize; s -= 2 * GiB)
+        if (plat_mem_reserve_in(RT_HOSTFN_BASE + RT_HOSTFN_SIZE, RT_ADDRESS_LIMIT, s, ALIAS_ALIGN, 1, &alias)) asize = s;
+    if (!asize) reexec_or_fail("a 10 GiB alias region above the modules");
+    if (asize != ALIAS_SIZE)
+        rt_log("mem: alias region %llu MiB: the holes above the modules hold no %llu MiB one",
+               (unsigned long long)(asize >> 20), (unsigned long long)(ALIAS_SIZE >> 20));
+    alias_page_count = asize / PAGE;
+#else
     for (uint64_t at = LOW_SEARCH_FROM; at + LOW_SIZE <= mods_lo && !low; at += GiB)
         if (reserve_at(at, LOW_SIZE, 1)) low = at;
     if (!low) reexec_or_fail("a 6 GiB stack and heap block below 2^39");
     for (uint64_t at = align_up(low + LOW_SIZE, ALIAS_ALIGN); at + ALIAS_SIZE <= mods_lo && !alias; at += ALIAS_ALIGN)
         if (reserve_at(at, ALIAS_SIZE, 1)) alias = at;
     if (!alias) reexec_or_fail("a 64 GiB alias region below 2^39");
+#endif
 
     plat_mem_fault_hook(thaw_fault);   // before the crash handler
-    alias_pages = calloc(ALIAS_PAGES, 1);
+    alias_pages = calloc(alias_page_count, 1);
     if (!alias_pages) rt_fatal("memory: cannot allocate the alias page map");
     // totk.ini is read here, once the address space is claimed and before the first setting: the pool size below
     // depends on TOTK_APP_POOL and on the resolution settings (resolution.c decides them once, on this first call).
@@ -244,7 +287,7 @@ void mem_init(void) {
         .aslr = {low, RT_ADDRESS_LIMIT - low},
         .stack = {low + STACK_OFF, STACK_SIZE},
         .heap = {low + HEAP_OFF, HEAP_CAP},
-        .alias = {alias, ALIAS_SIZE},
+        .alias = {alias, asize},
         .kernel = {RT_KERNEL_BASE, RT_KERNEL_SIZE},
         .hostfn = {RT_HOSTFN_BASE, RT_HOSTFN_SIZE},
         .pool = pool ? strtoull(pool, NULL, 0) : DEFAULT_POOL + res_heap_extra_bytes(),   // resolution.c
@@ -253,6 +296,43 @@ void mem_init(void) {
 }
 
 const RtGuestLayout *mem_layout(void) { return &L; }
+
+// ---- commit report (TOTK_MEM_REPORT=N, and once at exit from perf_summary_flush in perf.c)
+// Says where the process's commit goes: one plat_mem_walk, each committed run added to the bucket of the address range
+// it starts in. The bounds are the ones mem_init set (L, mods_lo, mods_hi never change afterwards), so no lock is
+// taken; the walk itself takes none either, so a game thread holding frz_lock or lock cannot block it.
+enum { B_LOW, B_ALIAS, B_MODS, B_KERNEL, B_PRIVATE, B_MAPPED, B_IMAGE, B_N };
+static void report_run(uint64_t base, uint64_t size, int kind, void *arg) {
+    uint64_t *sum = arg;
+    int b = kind == 2 ? B_IMAGE : kind == 1 ? B_MAPPED
+          : base >= L.aslr.base && base - L.aslr.base < LOW_SIZE ? B_LOW
+          : base >= L.alias.base && base - L.alias.base < L.alias.size ? B_ALIAS
+          : base >= mods_lo && base < mods_hi ? B_MODS
+          : base >= L.kernel.base && base - L.kernel.base < L.kernel.size ? B_KERNEL : B_PRIVATE;
+    sum[b] += size;
+}
+
+// The GPU side (vk_memory.c) overrides this; builds without the Vulkan back end add nothing.
+__attribute__((weak)) void vk_mem_gpu_summary(char *out, size_t n) { if (n) *out = 0; }
+
+void mem_commit_report(const char *when) {
+    if (!L.pool) return;
+    uint64_t s[B_N] = {0};
+    plat_mem_walk(report_run, s);
+    // How much of the committed heap+stack the game has touched: the same range the B_LOW bucket counts.
+    uint64_t resident = plat_mem_resident(L.aslr.base, LOW_SIZE);
+    double proc, used, limit, M = 1048576.0;
+    plat_commit_info(&proc, &used, &limit);
+    char gpu[256];
+    vk_mem_gpu_summary(gpu, sizeof gpu);
+#ifdef _WIN32
+    if (heap_lazy()) rt_log("mem: lazy heap: %llu commit faults so far", (unsigned long long)plat_mem_lazy_faults());
+#endif
+    rt_log("mem: commit %s: guest heap+stack %.0f MiB, alias %.0f, modules %.0f, kernel %.0f, other private %.0f, mapped "
+           "%.0f, image %.0f; process commit %.0f MiB (limit %.0f), guest heap+stack resident %.0f MiB%s", when, s[B_LOW] / M,
+           s[B_ALIAS] / M, s[B_MODS] / M, s[B_KERNEL] / M, s[B_PRIVATE] / M, s[B_MAPPED] / M, s[B_IMAGE] / M, proc, limit,
+           resident / M, gpu);
+}
 
 // A range inside one watched reservation (stack and heap block, or alias region) only.
 static uint64_t written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max, int reset) {
@@ -279,15 +359,57 @@ static int overlaps(uint64_t a, uint64_t n, uint64_t b, uint64_t m) { return a <
 static int inside(uint64_t a, uint64_t n, RtRange r) { return a >= r.base && n <= r.size && a - r.base <= r.size - n; }
 
 // ---- 0x01 SetHeapSize
+// TOTK_HEAP_LAZY=1 (Windows only, ignored elsewhere): the heap stays reserved and its pages are committed when touched,
+// so the commit charge follows what the game uses instead of what it asked for.
+static int heap_lazy(void) {
+#ifdef _WIN32
+    static int on = -1;
+    if (on < 0) on = cfg_bool("TOTK_HEAP_LAZY");
+    return on;
+#else
+    return 0;
+#endif
+}
+
+// Commits the reserved pages of [a, a+n) that lie in the guest heap, in 64 KiB chunks, before something other than the
+// CPU (a kernel file read, a driver importing host memory) accesses them: those accesses fail on a reserved page
+// instead of faulting into fault_veh. Committed pages are left alone. No-op without TOTK_HEAP_LAZY.
+void mem_touch(uint64_t a, uint64_t n) {
+    if (!n || !heap_lazy()) return;
+    uint64_t lo = L.heap.base, hi = lo + __atomic_load_n(&heap_size, __ATOMIC_RELAXED);
+    uint64_t s = a & ~0xffffull, e = (a + n + 0xffff) & ~0xffffull;
+    if (s < lo) s = lo;
+    if (e > hi) e = hi;
+    if (s >= e) return;
+    plat_mutex_lock(&frz_lock);   // freeze_locked refuses regions with holes, so a commit here never lands in a frozen one
+    for (uint64_t x = s, y; x < e; x = y) {
+        int st = plat_mem_state(x, e, &y);
+        if (st == PLAT_MEM_RESERVED && !plat_mem_commit(x, y - x)) {
+            plat_mutex_unlock(&frz_lock);
+            rt_fatal("memory: lazy heap commit %#llx+%#llx failed", (unsigned long long)x, (unsigned long long)(y - x));
+        }
+    }
+    plat_mutex_unlock(&frz_lock);
+}
+
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     plat_mutex_lock(&lock);
     if (size > HEAP_CAP || size % 0x200000 || size + image_bytes() > L.pool) {
         plat_mutex_unlock(&lock);
         return R_INVALID_STATE;
     }
-    if (size > heap_size) commit(L.heap.base + heap_size, size - heap_size, "heap");
+    // TOTK_HEAP_LAZY: growing leaves the new range reserved; platform/win32.c fault_veh commits it on first touch and
+    // mem_touch before a kernel or driver access. Shrinking decommits (a no-op on pages never committed).
+    if (size > heap_size && !heap_lazy()) commit(L.heap.base + heap_size, size - heap_size, "heap");
+#ifdef _WIN32
+    // On a shrink the handler's range drops first, so no fault recommits what decommit gives back.
+    if (heap_lazy() && size < heap_size) plat_mem_lazy(L.heap.base, size);
+#endif
     if (size < heap_size) decommit(L.heap.base + size, heap_size - size, "heap");
     heap_size = size;
+#ifdef _WIN32
+    if (heap_lazy()) plat_mem_lazy(L.heap.base, heap_size);
+#endif
     plat_mutex_unlock(&lock);
     if (addr) *addr = L.heap.base;
     return R_OK;
@@ -410,6 +532,7 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
                 goto out;
             }
         commit(dst, n, "moved stack");
+        if (in_heap) mem_touch(src, n);   // protect() below fails on a page the lazy heap never committed
         memcpy((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
         protect(src, n, PLAT_PROT_NONE, "moved stack source");
         stack_maps[nstack_maps++] = (StackMap){dst, src, n};
@@ -521,25 +644,6 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
         r.base = RT_ADDRESS_LIMIT;
         r.size = 0 - RT_ADDRESS_LIMIT;
         r.state = ST_INACCESSIBLE;
-    } else if (a < low) {
-        r.base = 0;
-        r.size = low;
-        r.state = ST_FREE;
-    } else if (a < low + LOW_SIZE) {
-        uint64_t heap = L.heap.base;
-        if (a >= heap && a < heap + heap_size) {
-            r = (RtMemoryInfo){.base = heap, .size = heap_size, .state = ST_NORMAL, .perm = PERM_RW};
-        } else if (a < heap) {
-            r = (RtMemoryInfo){.base = low, .size = heap - low, .state = ST_FREE};
-        } else {
-            r = (RtMemoryInfo){.base = heap + heap_size, .size = low + LOW_SIZE - heap - heap_size, .state = ST_FREE};
-        }
-    } else if (a - L.alias.base < L.alias.size) {
-        uint64_t p = (a - L.alias.base) / PAGE;
-        uint8_t v = alias_pages[p];
-        uint64_t s = run_start(alias_pages, p, v), e = run_end(alias_pages, p, ALIAS_PAGES, v);
-        r = (RtMemoryInfo){.base = L.alias.base + s * PAGE, .size = (e - s) * PAGE, .state = v ? ST_NORMAL : ST_FREE,
-                           .perm = v ? PERM_RW : PERM_NONE};
     } else if ((mi = module_index(a)) >= 0) {
         const RtLoaded *m = ldr_module(mi);
         uint64_t off = (a - m->base) & ~(PAGE - 1), lo = off, hi = off + PAGE;
@@ -554,6 +658,34 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
         r = (RtMemoryInfo){.base = L.kernel.base, .size = L.kernel.size, .state = ST_THREADLOCAL, .perm = PERM_RW};
     } else if (a - L.hostfn.base < L.hostfn.size) {
         r = (RtMemoryInfo){.base = L.hostfn.base, .size = L.hostfn.size, .state = ST_INACCESSIBLE};
+    } else if (a - L.alias.base < L.alias.size) {
+        // Before the block: macOS has no room below the modules and can put the alias region under it.
+        uint64_t p = (a - L.alias.base) / PAGE;
+        uint8_t v = alias_pages[p];
+        uint64_t s = run_start(alias_pages, p, v), e = run_end(alias_pages, p, alias_page_count, v);
+        r = (RtMemoryInfo){.base = L.alias.base + s * PAGE, .size = (e - s) * PAGE, .state = v ? ST_NORMAL : ST_FREE,
+                           .perm = v ? PERM_RW : PERM_NONE};
+    } else if (a < low) {
+        // Below the block. With none of our regions under a (always so on Windows, where the block is the lowest) this
+        // is the free space at the bottom, up to the first region above a. On macOS the block lies above the modules,
+        // the kernel and host-function areas and maybe the alias region; a gap between those is the host's, reported
+        // taken like any other gap below 2^39 (taken_gap).
+        taken_gap(a, &r.base, &r.size);
+        if (r.base == 0) {
+            r.state = ST_FREE;
+        } else {
+            r.state = ST_CODE;
+            r.perm = PERM_RX;
+        }
+    } else if (a < low + LOW_SIZE) {
+        uint64_t heap = L.heap.base;
+        if (a >= heap && a < heap + heap_size) {
+            r = (RtMemoryInfo){.base = heap, .size = heap_size, .state = ST_NORMAL, .perm = PERM_RW};
+        } else if (a < heap) {
+            r = (RtMemoryInfo){.base = low, .size = heap - low, .state = ST_FREE};
+        } else {
+            r = (RtMemoryInfo){.base = heap + heap_size, .size = low + LOW_SIZE - heap - heap_size, .state = ST_FREE};
+        }
     } else {
         taken_gap(a, &r.base, &r.size);
         r.state = ST_CODE;
@@ -605,7 +737,7 @@ int mem_info(uint32_t id, uint64_t *out) {
     case 14: v = L.stack.base; break;
     case 15: v = L.stack.size; break;
     case 16: v = SYSTEM_RESOURCE_BUDGET; break;
-    case 17: v = sizeof stack_maps + ALIAS_PAGES; break;   // system resource in use: our bookkeeping
+    case 17: v = sizeof stack_maps + alias_page_count; break;   // system resource in use: our bookkeeping
     case 28: v = 0; break;   // AliasRegionExtraSize: no kernel-owned extension
     default: return 0;
     }

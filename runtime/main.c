@@ -9,6 +9,8 @@
 //     --probe-nvn, --probe-nvn-tex, --probe-window, --probe-shader, --probe-vkmem, --probe-vkexec    graphics probes
 //     --probe-astc      the compute ASTC decoder against astc_decode_ldr; needs no game files
 //     --probe-movie     host VP9 movie::Decoder on one RomFS movie; skips without game data
+//     --probe-aoc       mount the add-on content next to the exe and read it back; DKB_AOC_SOURCE=<romfs folder> also
+//                       compares the bytes with the folder the pack was made from
 //     --boot            run the game to the first NVN call
 //     --seconds S       run the game (implies --boot's start-up) until the world clock (game time since the loaded
 //                       save's first frame) passed S seconds, then exit 0 at that present
@@ -23,7 +25,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "aoc_romfs.h"
 #include "cfg.h"
+#include "gfx.h"
 #include "host.h"
 #include "platform/platform.h"
 #include "sha256.h"
@@ -126,7 +130,7 @@ static void log_open(int game) {
     plat_append_write(g_log_file, g_log_early, n);
     g_log_bytes = n;
     __atomic_store_n(&g_log_state, LOG_FILE, __ATOMIC_RELEASE);
-    rt_log("version: %s (%s)", rt_port_version, rt_game_version ? "TotK" : "Bananza 1.0.0");
+    rt_log("version: %s (%s %s)", rt_port_version, rt_game_version ? "TotK" : "Bananza", rt_game_display);
     rt_log("log: %s", g_log_path);
 }
 
@@ -218,8 +222,6 @@ static uint64_t lifted_function(uintptr_t rip) {
     return lo ? fn_rev[lo - 1].guest : 0;
 }
 
-static int readable(uint64_t a, uint64_t n) { return plat_mem_readable(a, n); }
-
 static void crash_handler(const PlatCrash *x) {
     static volatile int32_t busy;
     if (plat_xchg32(&busy, 1)) plat_exit(71);
@@ -230,6 +232,12 @@ static void crash_handler(const PlatCrash *x) {
         rt_logf(", %s address %#llx", x->access == 1 ? "writing" : x->access == 8 ? "executing" : "reading",
                 (unsigned long long)x->addr);
     rt_log_raw("\n", 1);
+#ifdef _WIN32
+    uint64_t lazy_at;
+    uint32_t lazy_err = plat_mem_lazy_failure(&lazy_at);
+    if (lazy_err)
+        rt_logf("  lazy heap commit failed: error %u at %#llx, commit limit reached?\n", lazy_err, (unsigned long long)lazy_at);
+#endif
     uint64_t f = lifted_function(rip);
     if (f) rt_logf("  in lifted function f_%llx = %s\n", (unsigned long long)f, ldr_describe(f, d, sizeof d));
     for (int i = 0; i < x->nframes; i++) {   // abort and invalid parameter: where the host code called it
@@ -239,21 +247,8 @@ static void crash_handler(const PlatCrash *x) {
         rt_log_raw("\n", 1);
     }
     Cpu *c = kern_cpu();
-    if (c) {
-        for (int i = 0; i < 31; i++)
-            rt_logf("  x%-2d %016llx%s", i, (unsigned long long)c->x[i], i % 4 == 3 ? "\n" : "");
-        rt_logf("  sp  %016llx\n  pc  %016llx  lr %s\n", (unsigned long long)c->sp, (unsigned long long)c->pc,
-                ldr_describe(c->x[30], d, sizeof d));
-        uint64_t fp = c->x[29];
-        for (int n = 0; n < 32 && fp && !(fp & 7) && readable(fp, 16); n++) {
-            uint64_t next = LD64(fp), lr = LD64(fp + 8);
-            rt_logf("  guest frame %2d: %s\n", n, ldr_describe(lr, d, sizeof d));
-            if (next <= fp || next - fp > (64u << 20)) break;
-            fp = next;
-        }
-    } else {
-        rt_logf("  not on a guest thread\n");
-    }
+    if (c) rt_guest_dump(c);
+    else rt_logf("  not on a guest thread\n");
     fflush(stderr);
     plat_exit(71);
 }
@@ -268,10 +263,15 @@ static volatile int host_probe_hits;
 static void host_probe(Cpu *c) { host_probe_hits++; c->x[0] = 42; }
 
 static void check_cpu(void) {
+#ifdef __aarch64__
+    // The portable FP/SIMD lowering (simd.h) runs on every AArch64 CPU: NEON is part of the base architecture there.
+    printf("cpu: AArch64 (portable FP/SIMD lowering)\n");
+#else
     __builtin_cpu_init();
     int ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2");
     printf("cpu: x86-64-v3 (AVX2, FMA, BMI2) %s\n", ok ? "present" : "MISSING");
     CHECK(ok, "the lifted code is built for x86-64-v3");
+#endif
 }
 
 // Layout: ascending, no overlap, below 2^39, and inside the window mem_init reserved.
@@ -298,8 +298,23 @@ static void check_layout(void) {
            (unsigned long long)g->aslr.base, (unsigned long long)g->aslr.size, (unsigned long long)g->stack.base,
            (unsigned long long)g->heap.base, (unsigned long long)g->alias.base, (unsigned long long)g->alias.size,
            (unsigned long long)g->kernel.base, (unsigned long long)g->hostfn.base);
-    CHECK(g->alias.base + g->alias.size <= lay[0].base && g->heap.base + g->heap.size <= g->alias.base,
-          "guest regions overlap");
+    // No overlap whatever the order: Windows and Linux put the stack and heap block below the modules and the alias
+    // block above it, macOS has nothing mappable below the modules and puts both above the host functions.
+    struct { const char *name; uint64_t base, size; } r[] = {
+        {"stack", g->stack.base, g->stack.size},
+        {"heap", g->heap.base, g->heap.size},
+        {"alias", g->alias.base, g->alias.size},
+        {"kernel", g->kernel.base, g->kernel.size},
+        {"host functions", g->hostfn.base, g->hostfn.size},
+        {"modules", lay[0].base, lay[n - 1].base + lay[n - 1].size - lay[0].base},
+    };
+    for (int i = 0; i < (int)(sizeof r / sizeof *r); i++) {
+        CHECK(r[i].base < RT_ADDRESS_LIMIT && r[i].size <= RT_ADDRESS_LIMIT - r[i].base,
+              "%s is not below 2^39", r[i].name);
+        for (int j = i + 1; j < (int)(sizeof r / sizeof *r); j++)
+            if (r[i].base < r[j].base + r[j].size && r[j].base < r[i].base + r[i].size)
+                CHECK(0, "%s and %s overlap", r[i].name, r[j].name);
+    }
 }
 
 // Every function start dispatches to its own function. The word after a start (unless that is a start too), a
@@ -392,7 +407,10 @@ static void check_memory(void) {
     mem_query(RT_HOSTFN_BASE + 0x40, &q);
     CHECK(q.state == 0x10 && q.base == RT_HOSTFN_BASE, "QueryMemory on the host-function window");
     mem_query(g->alias.base + g->alias.size + 0x1000, &q);
-    CHECK(q.state == 3 && q.base == g->alias.base + g->alias.size, "QueryMemory on host memory");
+    // The alias region can end exactly at 2^39 (macOS has no room to put it lower), and then that address is past the
+    // guest address space: inaccessible rather than the host's, both of which mean the guest may not use it.
+    CHECK((q.state == 3 && q.base == g->alias.base + g->alias.size) ||
+          (q.state == 0x10 && q.base == RT_ADDRESS_LIMIT), "QueryMemory on host memory");
     CHECK(mem_set_heap_size(0, &heap) == 0, "SetHeapSize 0");
     printf("memory: heap, physical memory, stack move, QueryMemory, GetInfo: %s\n", failures > before ? "FAIL" : "ok");
 }
@@ -435,6 +453,7 @@ static int selftest(void) {
     float used, total, proc;
     plat_mem_info(&used, &total, &proc);
     if (proc >= 0) printf("process: working set %.0f MiB\n", proc);
+    mem_commit_report("selftest");
     printf("selftest: %s (%d failures)\n", failures ? "FAILED" : "passed", failures);
     return failures ? 1 : 0;
 }
@@ -443,7 +462,7 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-kernel | --probe-ipc | --probe-ipc-lifetime | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-shader-geometry | --probe-vkmem | "
-                    "--probe-vkexec | --probe-vkgeometry | --probe-vkgeometry-passthrough | --probe-vkgeometry-passthrough-ordering | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-movie | --prepare-shaders | --translate-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
+                    "--probe-vkexec | --probe-vkgeometry | --probe-vkgeometry-passthrough | --probe-vkgeometry-passthrough-ordering | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-movie | --probe-aoc | --prepare-shaders | --translate-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -512,8 +531,8 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--version")) {
             // The port version (VERSION, plus the commit of a checkout) and the game it was built for, so a report says
             // which build it came from.
-            printf("%s %s (%s)\n", rt_game_version ? "totk" : "dkb", rt_port_version,
-                   rt_game_version ? "Tears of the Kingdom" : "Donkey Kong Bananza 1.0.0");
+            printf("%s %s (%s %s)\n", rt_game_version ? "totk" : "dkb", rt_port_version,
+                   rt_game_version ? "Tears of the Kingdom" : "Donkey Kong Bananza", rt_game_display);
             return 0;
         } else if (!strcmp(argv[i], "--shot")) {
             if (++i == argc) return usage(argv[0]);
@@ -561,9 +580,10 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-astc")) return probe_astc();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
     if (!strcmp(mode, "--probe-movie")) return probe_movie();
-    if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
-    if (!strcmp(mode, "--translate-shaders")) return vk_pipeline_translate_shaders();
-    if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
+    if (!strcmp(mode, "--probe-aoc")) return probe_aoc();
+    if (!strcmp(mode, "--prepare-shaders")) return gfx_shader_tool(GFX_TOOL_PREPARE_SHADERS);
+    if (!strcmp(mode, "--translate-shaders")) return gfx_shader_tool(GFX_TOOL_TRANSLATE_SHADERS);
+    if (!strcmp(mode, "--warm-shaders")) return gfx_shader_tool(GFX_TOOL_WARM_SHADERS);
     if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
     return usage(argv[0]);
 }

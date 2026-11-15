@@ -6,6 +6,7 @@ the separate functional GPU check: descriptor resolution belongs to the host.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -23,6 +24,18 @@ def encoded(ops):
         batch = ops[i:i + 3]
         words += [original.SCHED] + batch + [0] * (3 - len(batch))
     return struct.pack('<' + 'Q' * len(words), *words)
+
+
+def suatom_1d_add(dst, addr, value):
+    # SUATOM (not the B form): Dest 0-7, SrcA 8-15, SrcB 20-27, pred PT, TidB 36-48 = 0 (handle 0), Dim 33-35 = 0 (_1d),
+    # Op 29-32 = 0 (Add), Size 51-53 = 0 (U32).
+    return 0xEA00000000000000 | dst | (addr << 8) | (value << 20) | original.PT
+
+
+def sust_1d(data, addr):
+    # SUST (immediate handle 0): Dest = first data register 0-7, SrcA 8-15, Rgba 20-23 = 0xF, Dim 33-35 = 0 (_1d),
+    # pred PT.
+    return 0xEB28000000000000 | data | (addr << 8) | (0xF << 20) | original.PT
 
 
 def packet(key, code, **changes):
@@ -275,15 +288,74 @@ class CandidateTest(unittest.TestCase):
 
     def test_unsupported_widths_fail_before_scalarization(self):
         jobs = []
+        # The 16-bit store is admitted by design (see test_halfword_store_u16_* below). Everything else of a width
+        # other than B32/B64/B128 (8-bit loads and stores, 16-bit loads, unaligned 128-bit) still fails closed.
         for key, store, size in (('load8', False, 0), ('store8', True, 0),
-                                 ('load16', False, 2), ('store16', True, 2), ('unaligned128', False, 7)):
+                                 ('load16', False, 2), ('unaligned128', False, 7)):
             ops = original.instructions(True)
             for i, op in enumerate(ops):
                 if op >> 51 == (0xEED8000000000000 if store else 0xEED0000000000000) >> 51:
                     ops[i] = (op & ~(7 << 48)) | (size << 48)
             jobs.append(packet(key, encoded(ops), storage_candidates_version=1))
         replies = self.translate(jobs, valid=False)
-        self.assertTrue(all('naturally aligned B32/B64/B128 global' in x for x in replies))
+        self.assertTrue(all('naturally aligned B32/B64/B128' in x for x in replies), replies)
+
+    def test_halfword_store_u16_is_admitted_with_a_guarded_compare_exchange(self):
+        ops = original.instructions(True)
+        for i, op in enumerate(ops):
+            if op >> 51 == 0xEED8000000000000 >> 51:
+                ops[i] = (op & ~(7 << 48)) | (2 << 48)   # size field 2: LsSize2.U16
+        jobs = [packet('store16-ok', encoded(ops), storage_candidates_version=1)]
+        self.translate(jobs)   # reply 'ok <key>' and spirv-val --target-env vulkan1.3 passes
+        disasm = args.spirv_val.with_name(args.spirv_val.name.replace('spirv-val', 'spirv-dis'))
+        self.assertTrue(disasm.is_file(), f'spirv-dis is missing next to spirv-val: {disasm}')
+        dis = subprocess.run([str(disasm), str(args.out / (jobs[0]['key'] + '.spv'))],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(dis.returncode, 0, dis.stderr)
+        self.assertIn('OpAtomicCompareExchange', dis.stdout, 'a guarded halfword store must use a compare-exchange')
+
+    def _compare_exchange_sites(self, key):
+        disasm = args.spirv_val.with_name(args.spirv_val.name.replace('spirv-val', 'spirv-dis'))
+        dis = subprocess.run([str(disasm), str(args.out / (key + '.spv'))], capture_output=True, text=True, timeout=30)
+        self.assertEqual(dis.returncode, 0, dis.stderr)
+        return dis.stdout.count('OpAtomicCompareExchange')
+
+    def test_packed_half_red_translates_as_a_guarded_compare_exchange(self):
+        # RED.E.ADD.F16x2.FTZ.RN [R0], R6: RedSize (bits 20-22) = 4 (F16x2FtzRn), RedOp (23-25) = 0 (Add), data R6 (0-7).
+        ops = original.instructions(True)
+        load = ops.index(original.global_memory(False, 2, 0))
+        red = 0xEBF8000000000000 | original.PT | 6 | (4 << 20)
+        ops[load:load + 1] = [original.movi(6, 0x3c00), red]
+        job = packet('packed_half_red', encoded(ops), storage_candidates_version=1)
+        self.translate([job])   # reply 'ok <key>' and spirv-val --target-env vulkan1.3 passes
+        res = self.reflection('packed_half_red')
+        self.assertTrue(all(x['flags'] == 0x81 for x in res['sbufs']))
+        self.assertGreaterEqual(self._compare_exchange_sites('packed_half_red'), 1)
+
+    def test_crossing_word_halfword_store_has_both_compare_exchange_paths(self):
+        # The 16-bit store is guarded: a single-word compare-exchange and a two-word one for halfwords starting at byte 3.
+        ops = original.instructions(True)
+        for i, op in enumerate(ops):
+            if op >> 51 == 0xEED8000000000000 >> 51:
+                ops[i] = (op & ~(7 << 48)) | (2 << 48)   # size field 2: LsSize2.U16
+        self.translate([packet('crossing_store16', encoded(ops), storage_candidates_version=1)])
+        # Exactly three compare-exchange sites on this build: the guarded word path plus the two compare-exchanges
+        # of the crossing path in patch 0022 (low byte to the first word, high byte to the next).
+        self.assertEqual(self._compare_exchange_sites('crossing_store16'), 3)
+
+    def test_1d_store_and_atomic_declare_one_image_dimension(self):
+        # A 1D image written by SUST and updated by SUATOM must be declared 1D in both places (patch 0021 covers the
+        # SUATOM path; EmitSust must not turn it into a 2D image).
+        ops = [original.movi(0, 3), original.movi(1, 0x3f800000), original.movi(2, 1),
+               sust_1d(1, 0), suatom_1d_add(3, 0, 2), original.EXIT]
+        self.translate([packet('image_1d', encoded(ops))])   # reply 'ok <key>' and spirv-val --target-env vulkan1.3 passes
+        disasm = args.spirv_val.with_name(args.spirv_val.name.replace('spirv-val', 'spirv-dis'))
+        dis = subprocess.run([str(disasm), str(args.out / 'image_1d.spv')], capture_output=True, text=True, timeout=30)
+        self.assertEqual(dis.returncode, 0, dis.stderr)
+        dims = re.findall(r'OpTypeImage %\S+ (\w+)', dis.stdout)
+        self.assertTrue(dims, 'the module must declare the image')
+        self.assertEqual(set(dims), {'1D'}, 'every declaration of the 1D image must be 1D:\n' + '\n'.join(
+            line for line in dis.stdout.splitlines() if 'OpTypeImage' in line))
 
     def test_original_wide_register_values_and_canaries(self):
         for bits in (64, 128):

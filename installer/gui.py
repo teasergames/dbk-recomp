@@ -12,7 +12,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -23,13 +25,91 @@ except ImportError:
 
 from . import ini
 from . import layout as layouts
+from . import update
 from .guilogic import (DKB_STEP_ORDER, DONE, FAILED, PENDING, RUNNING, SKIPPED, UI_LANGUAGES, Catalog, Form, Model, Process,
                        amount, default_game_language, describe_event, parse_line, windows_ui_language)
 
 POLL_MS = 100
 GLYPH = {PENDING: '\u25cb', RUNNING: '\u25b6', DONE: '\u2714', SKIPPED: '\u2013', FAILED: '\u2716'}
-COLOR = {PENDING: '#808080', RUNNING: '#1a5fb4', DONE: '#26a269', SKIPPED: '#808080', FAILED: '#c01c28'}
+# The in-game menu's Donkey Kong look (runtime/ui/menu.cpp style_dk), drawn here with our own colours only. The red and
+# green of the menu are accents and fills; the text variants (RED_TEXT, GREEN_TEXT) are their lighter tints, because the
+# originals reach only 3.0:1 and 4.2:1 on the window bark. Every text/background pair below is >= 4.5:1 (docs/installer.md).
+BARK, FRAME, BORDER, FIELD, HOVER = '#2a1a0e', '#3b2614', '#6b4a2a', '#1d1109', '#4d331b'
+BANANA, CREAM, MUTED = '#f6c52b', '#f3e9d2', '#b8a888'
+RED, RED_TEXT, GREEN, GREEN_TEXT = '#c8281e', '#ff8a7a', '#3f8f3a', '#6fcf68'
+BRAND = 'DONKEY KONG BANANZA  ·  PC RECOMP'
+COLOR = {PENDING: MUTED, RUNNING: BANANA, DONE: GREEN_TEXT, SKIPPED: MUTED, FAILED: RED_TEXT}
 PAD = 14
+
+
+def apply_theme(root, ui_font):
+    """A 'dk' ttk theme on top of clam (portable: clam ships with every Tk). Falls back to the platform theme if missing."""
+    style = ttk.Style(root)
+    try:
+        style.theme_create('dk', parent='clam')
+        style.theme_use('dk')
+    except tk.TclError:
+        pass
+    root.configure(background=BARK)
+    root.option_add('*TCombobox*Listbox.background', FIELD)
+    root.option_add('*TCombobox*Listbox.foreground', CREAM)
+    root.option_add('*TCombobox*Listbox.selectBackground', BANANA)
+    root.option_add('*TCombobox*Listbox.selectForeground', BARK)
+    font = (ui_font, 10)
+    style.configure('.', background=BARK, foreground=CREAM, font=font, bordercolor=BORDER, lightcolor=BORDER,
+                    darkcolor=BORDER, troughcolor=FIELD, focuscolor=BANANA, insertcolor=CREAM)
+    style.configure('TButton', background=FRAME, foreground=CREAM, relief='flat', borderwidth=2, padding=(14, 5),
+                    bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER)
+    style.map('TButton', background=[('disabled', BARK), ('pressed', BANANA), ('active', HOVER)],
+              foreground=[('disabled', '#9c8a70'), ('pressed', BARK)], bordercolor=[('focus', BANANA)])
+    style.configure('Accent.TButton', background=BANANA, foreground=BARK, font=(ui_font, 10, 'bold'),
+                    bordercolor=BANANA, lightcolor=BANANA, darkcolor=BANANA)
+    style.map('Accent.TButton', background=[('disabled', BARK), ('pressed', CREAM), ('active', '#ffd95a')],
+              foreground=[('disabled', '#9c8a70')])
+    style.configure('Toolbutton', background=FRAME, foreground=CREAM, relief='flat', borderwidth=2, padding=(8, 2),
+                    bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER)
+    style.map('Toolbutton', background=[('selected', BANANA), ('active', HOVER)], foreground=[('selected', BARK)])
+    for name in ('TEntry', 'TCombobox'):
+        style.configure(name, fieldbackground=FIELD, foreground=CREAM, insertcolor=CREAM, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER, arrowcolor=BANANA, padding=3)
+    style.map('TEntry', bordercolor=[('focus', BANANA)], lightcolor=[('focus', BANANA)], darkcolor=[('focus', BANANA)])
+    style.map('TCombobox', fieldbackground=[('readonly', FIELD)], foreground=[('readonly', CREAM)],
+              selectbackground=[('readonly', FIELD)], selectforeground=[('readonly', CREAM)],
+              bordercolor=[('focus', BANANA)], background=[('active', HOVER)])
+    style.configure('Horizontal.TProgressbar', background=BANANA, troughcolor=FIELD, bordercolor=BORDER,
+                    lightcolor=BANANA, darkcolor=BANANA, thickness=14)
+    style.configure('TScrollbar', background=FRAME, troughcolor=FIELD, arrowcolor=BANANA, bordercolor=BORDER)
+    style.configure('Header.TFrame', background=FRAME)
+    style.configure('Brand.TLabel', background=FRAME, foreground=BANANA, font=(ui_font, 14, 'bold'))
+    style.configure('Title.TLabel', foreground=BANANA, font=(ui_font, 15, 'bold'))
+    style.configure('Sub.TLabel', background=FRAME, foreground=CREAM, font=(ui_font, 10))
+    style.configure('Notice.TLabel', background=FRAME, foreground=CREAM, padding=8, borderwidth=2, relief='solid',
+                    bordercolor=BANANA)
+    style.configure('Err.TLabel', foreground=RED_TEXT)
+    style.configure('Warn.TLabel', foreground=BANANA)
+    style.configure('Version.TLabel', background=FRAME, foreground=MUTED)
+    return style
+
+
+def draw_bananas(canvas, x, y, s):
+    """A small banana bunch: three crescents (polygons between two arcs) fanning from a brown stem at (x, y)."""
+    import math
+    shades = (('#dea51e', -0.5), (BANANA, 0.5), ('#ffd650', 0.0))   # the middle one is drawn last, on top
+    for fill, rot in shades:
+        cr, sr = math.cos(rot), math.sin(rot)
+        outer, inner = [], []
+        for i in range(15):
+            t = i / 14
+            a = math.pi - t * 1.45
+            w = 0.34 * s * (0.2 + 0.8 * math.sin(math.pi * (0.1 + 0.8 * t)))
+            px, py = s * 0.95 * (1 + math.cos(a)), s * 0.95 * math.sin(a)
+            for pts, k in ((outer, 0.5), (inner, -0.5)):
+                ox, oy = px + math.cos(a) * w * k, py + math.sin(a) * w * k
+                pts.append((x + ox * cr - oy * sr, y + ox * sr + oy * cr))
+        canvas.create_polygon([c for p in outer + inner[::-1] for c in p], fill=fill, outline='#8a5a1a')
+        tx, ty = (outer[-1][0] + inner[-1][0]) / 2, (outer[-1][1] + inner[-1][1]) / 2
+        canvas.create_oval(tx - 2, ty - 2, tx + 2, ty + 2, fill='#4a2f18', outline='')
+    canvas.create_rectangle(x - 4, y - 6, x + 4, y + 2, fill='#5c3a1a', outline='')
 
 
 def fix_tcl_paths():
@@ -54,7 +134,7 @@ def fix_dpi_awareness():
 
 
 class App:
-    def __init__(self, root, ui_lang, layout, run_args=None, game='totk'):
+    def __init__(self, root, ui_lang, layout, run_args=None, game='totk', check_updates=False):
         self.root, self.layout = root, layout
         self.game = game
         self.cat = Catalog(ui_lang, game)
@@ -64,7 +144,7 @@ class App:
         self.run_args = run_args or {}   # extra CLI options for tests: temp, verify
         self.log_entries = []            # events and raw lines of the run, rendered by render_log
         self.bound = []                  # (widget, option, id, params) retranslated on a language switch
-        self.vars = {n: tk.StringVar() for n in ('base', 'update', 'keys', 'exefs', 'romfs', 'package', 'dest')}
+        self.vars = {n: tk.StringVar() for n in ('base', 'update', 'keys', 'nup', 'exefs', 'romfs', 'package', 'dest')}
         self.vars['lang'] = tk.StringVar()
         self.lang_code = default_game_language(ui_lang)
         self.screen = None
@@ -81,31 +161,52 @@ class App:
         root.protocol('WM_DELETE_WINDOW', self.on_close)
         self.ui_font = 'Segoe UI' if os.name == 'nt' else 'DejaVu Sans'
         self.mono_font = 'Consolas' if os.name == 'nt' else 'DejaVu Sans Mono'
-        style = ttk.Style(root)
-        style.configure('Title.TLabel', font=(self.ui_font, 15, 'bold'))
-        style.configure('Notice.TLabel', background='#fff3cd', foreground='#664d03', padding=8)
-        style.configure('Err.TLabel', foreground='#c01c28')
-        style.configure('Version.TLabel', foreground='#808080')
+        apply_theme(root, self.ui_font)
 
-        top = ttk.Frame(root, padding=(PAD, PAD, PAD, 0))
+        top = ttk.Frame(root, style='Header.TFrame', padding=(PAD, 10, PAD, 10))
         top.pack(fill='x')
-        self.title = self.label(top, 'ui.title', style='Title.TLabel')
-        self.title.pack(side='left')
+        art = tk.Canvas(top, width=46, height=42, bg=FRAME, highlightthickness=0)
+        draw_bananas(art, 12, 16, 17)
+        art.pack(side='left', padx=(0, 10))
+        names = ttk.Frame(top, style='Header.TFrame')
+        names.pack(side='left')
+        ttk.Label(names, text=BRAND, style='Brand.TLabel').pack(anchor='w')
+        self.title = self.label(names, 'ui.title', style='Sub.TLabel')
+        self.title.pack(anchor='w')
         version = ttk.Label(top, style='Version.TLabel')
         self.bind_text(version, 'text', 'ui.version', version=layout.release)
         version.pack(side='left', padx=(10, 0), pady=(6, 0))
-        sw = ttk.Frame(top)
+        sw = ttk.Frame(top, style='Header.TFrame')
         sw.pack(side='right')
         self.ui_var = tk.StringVar(value=self.cat.lang)
         for code in UI_LANGUAGES:
             ttk.Radiobutton(sw, text=code.upper(), value=code, variable=self.ui_var, style='Toolbutton',
                             command=self.switch_language).pack(side='left', padx=1)
+        tk.Frame(root, height=4, bg=RED).pack(fill='x')   # the DK tie's red under the strip
         self.body = ttk.Frame(root, padding=PAD)
         self.body.pack(fill='both', expand=True)
         self.frames = {'form': self.build_form(), 'run': self.build_run(), 'finish': self.build_finish()}
         self.vars['lang'].set(self.lang_label(self.lang_code))
         self.vars['dest'].trace_add('write', lambda *_: self.refresh_form())
         self.show('form')
+        if check_updates:
+            self.update_label = ttk.Label(self.body, style='Warn.TLabel', cursor='hand2')
+            threading.Thread(target=self.check_update, daemon=True).start()
+
+    def check_update(self):
+        """Background lookup of a newer release; the label appears only when there is one (never blocks the window)."""
+        found = update.newer_release(self.layout.release)
+        if found and not self.closing:
+            try:
+                self.root.after(0, self.show_update, *found)
+            except RuntimeError:   # Tk is already gone
+                pass
+
+    def show_update(self, tag, url):
+        self.bind_text(self.update_label, 'text', 'ui.update_available', tag=tag)
+        self.update_label.bind('<Button-1>', lambda _e: webbrowser.open(url))
+        self.update_label.pack(before=self.body.winfo_children()[0], anchor='w', pady=(0, 8))
+        self.fit()
 
     # ---- text -----------------------------------------------------------------------------------------------------
 
@@ -191,7 +292,7 @@ class App:
         f = ttk.Frame(self.body)
         bar = ttk.Frame(f)   # packed first so pack shrinks the text above it, never the buttons
         bar.pack(side='bottom', fill='x', pady=(12, 0))
-        self.start_button = self.button(bar, 'ui.start', self.start)
+        self.start_button = self.button(bar, 'ui.start', self.start, style='Accent.TButton')
         self.start_button.pack(side='right')
         self.form_intro = self.label(f, 'ui.intro', wraplength=620, justify='left')
         self.form_intro.pack(anchor='w', pady=(0, 8))
@@ -202,8 +303,8 @@ class App:
         rows = (('base', 'ui.base', 'ui.pick_game'), ('update', 'ui.update', 'ui.pick_update'),
                 ('keys', 'ui.keys', 'ui.pick_keys'))
         if self.game == 'bananza':
-            rows = (('exefs', 'dkb.ui.exefs', 'dkb.ui.pick_exefs'), ('romfs', 'dkb.ui.romfs', 'dkb.ui.pick_romfs'),
-                    ('package', 'dkb.ui.package', 'dkb.ui.pick_package'))
+            rows = (('nup', 'dkb.ui.nup', 'dkb.ui.pick_nup'), ('exefs', 'dkb.ui.exefs', 'dkb.ui.pick_exefs'),
+                    ('romfs', 'dkb.ui.romfs', 'dkb.ui.pick_romfs'), ('package', 'dkb.ui.package', 'dkb.ui.pick_package'))
         self.form_rows = {}
         for i, (name, label_id, pick_id) in enumerate(rows):
             lab = self.label(grid, label_id)
@@ -249,10 +350,11 @@ class App:
         self.bar.pack(fill='x', pady=(4, 6))
         self.space_label = ttk.Label(f, wraplength=620, justify='left')
         self.space_label.pack(anchor='w')
-        self.warn_label = ttk.Label(f, wraplength=620, justify='left', foreground='#9a6700')
+        self.warn_label = ttk.Label(f, wraplength=620, justify='left', style='Warn.TLabel')
         self.warn_label.pack(anchor='w')
         self.log_frame = ttk.Frame(f)
-        self.log = tk.Text(self.log_frame, height=10, wrap='word', state='disabled', font=(self.mono_font, 9))
+        self.log = tk.Text(self.log_frame, height=10, wrap='word', state='disabled', font=(self.mono_font, 9), bg=FIELD, fg=CREAM, insertbackground=CREAM,
+                            relief='flat', highlightthickness=2, highlightbackground=BORDER, highlightcolor=BORDER)
         scroll = ttk.Scrollbar(self.log_frame, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right', fill='y')
@@ -284,7 +386,8 @@ class App:
     def form(self):
         return Form(base=self.vars['base'].get(), update=self.vars['update'].get(), keys=self.vars['keys'].get(),
                     lang=self.selected_lang(), dest=self.vars['dest'].get(), game=self.game,
-                    exefs=self.vars['exefs'].get(), romfs=self.vars['romfs'].get(), package=self.vars['package'].get())
+                    exefs=self.vars['exefs'].get(), romfs=self.vars['romfs'].get(), package=self.vars['package'].get(),
+                    nup=self.vars['nup'].get())
 
     def refresh_form(self):
         form = self.form()
@@ -299,6 +402,12 @@ class App:
         self.fit()
 
     def pick_file(self, name, pick_id):
+        if self.game == 'bananza' and name == 'nup':
+            types = [(self.cat('dkb.ui.type_nup'), '*.nup'), (self.cat('ui.type_all'), '*.*')]
+            path = filedialog.askopenfilename(title=self.cat(pick_id), filetypes=types)
+            if path:
+                self.vars[name].set(os.path.normpath(path))
+            return
         if self.game == 'bananza':
             path = filedialog.askdirectory(title=self.cat(pick_id), mustexist=True)
             if path:
@@ -679,6 +788,7 @@ def main(argv=None):
     for name in ('package', 'toolchain', 'deps', 'ninja', 'dll-dir', 'translator', 'dotnet'):
         ap.add_argument('--' + name, type=Path)
     ap.add_argument('--jobs', type=int, default=6)
+    ap.add_argument('--no-update-check', action='store_true', help='do not look for a newer release (or DKB_NO_UPDATE_CHECK=1)')
     args = ap.parse_args(argv)
     layout = layouts.find(args.root)
     if args.selftest:
@@ -687,7 +797,8 @@ def main(argv=None):
     fix_dpi_awareness()
     root = tk.Tk()
     tools = {name: getattr(args, name) for name in ('toolchain', 'deps', 'ninja', 'dll_dir', 'translator', 'dotnet', 'jobs')}
-    app = App(root, args.lang or windows_ui_language(), layout, run_args={'tools': tools}, game=args.game)
+    app = App(root, args.lang or windows_ui_language(), layout, run_args={'tools': tools}, game=args.game,
+              check_updates=not update.disabled(args.no_update_check))
     if args.package:
         app.vars['package'].set(str(args.package))
     root.mainloop()

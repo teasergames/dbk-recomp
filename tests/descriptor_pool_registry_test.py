@@ -43,6 +43,10 @@ PRELUDE = r'''
 #define DEV_MAGIC MAGIC('D', 'E', 'V', 0)
 #define AGEN_N 4096
 unsigned rt_trace;
+const char rt_game_target[] = "dkb458752";
+// Every TOTK_* switch reads as off, its default.
+int rt_knob(const char *name, const char *def) { (void)name; (void)def; return 0; }
+int rt_ab(void) { return 0; }
 GfxStats gfx_counters;
 static unsigned checks, dependencies;
 void rt_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap); }
@@ -239,7 +243,7 @@ def source():
         parts += [statement(text, name) for name in names]
     parts += [r'''
 static Tex *entry_of(const tex_t *t) { (void)t; dependencies++; rt_fatal("unexpected image creation\n"); }
-static void make_fresh_snap(Tex *t) { (void)t; dependencies++; rt_fatal("unexpected upload\n"); }
+static int make_fresh_snap(Tex *t) { (void)t; dependencies++; rt_fatal("unexpected upload\n"); }
 ''']
     for text, starts in ((common, ('void plat_rmutex_lock(', 'void plat_rmutex_unlock(', 'void plat_once(')),
             (core, ('void nvn_called(',)),

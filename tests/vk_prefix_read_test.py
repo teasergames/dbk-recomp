@@ -31,6 +31,7 @@ def main():
     code = '\n'.join(function(sync, name) for name in (
         'static VkCommandBuffer split_impl(', 'VkCommandBuffer vk_sync_split(', 'VkCommandBuffer vk_sync_split_wait('))
     code += '\n' + function(execute, 'int vk_exec_read_buffer(')
+    code += '\n' + function(execute, 'static void views_to_fence(')
     code += '\n' + function(execute, 'static int record_impl(')
     code += '\n' + function(execute, 'int vk_exec_record(')
     code += '\n' + function(execute, 'int vk_exec_record_work(')

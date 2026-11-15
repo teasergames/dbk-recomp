@@ -5,7 +5,8 @@ Goal: *Donkey Kong Bananza* (Switch 2, base 1.0.0) playable on Windows as a stat
 own cartridge and the build runs on their machine.
 
 Known input: the base ExeFS has `main` (md5 f68752f5…, the binary GRAnimated/DKBananza's BinSync uses) and `sdk`, no
-`subsdk0`. Update 458752 has another layout and is not supported yet. The RomFS is about 19 GB.
+`subsdk0`. Update 3.2.0 (title version 458752) is a second target with its own ExeFS hashes and patch table
+(`dkb458752`). The RomFS is about 19 GB.
 
 Each phase ends in a milestone someone else can check. The order follows the critical path.
 
@@ -109,8 +110,19 @@ Issues: [#2] [#3] [#4] [#5] [#7] [#8] [#9]; the whole list is the
 - NVN 2 calls the host accepts and does not record yet (`runtime/nvn_api_nvn2.c`, `NVN2_NOT_RECORDED`): mesh shaders,
   variable-rate shading, DLSS, ray tracing, device command buffers. Each one is logged on its first call. None of
   them has mattered so far.
-- Game update 458752.
+- Play-testing of update 3.2.0 (`dkb458752`): the installer supports it and it boots, but nobody has played it as
+  far as the base has been played. Add-on content (`runtime/aoc_romfs.c`) is likewise untested in game.
 - Linux, which TotK Recomp's toolchain supports.
+- DLSS and temporal upscalers (checked 2026-11-09). The game does not use DLSS: with `nvnDlssNetworkInitialize`
+  answering success it still called no `nvnDlss*` proc in a 330 s run on 1.0.0, and a scan of the guest code finds
+  no reference to the DLSS slots of the NVN proc table in 1.0.0 or in 3.2.0 (the loader alone names them). Nor do the
+  frame dumps show a velocity target or a history texture, so the game has no temporal AA to borrow from.
+  `upscaler = dlss` (docs/dkb-dlss.md) therefore makes its own inputs, as TotK Recomp's `vk_dlaa.c` does: a sub-pixel
+  jitter on the scene's viewports, the scene depth, and camera-only motion vectors from depth and the camera block's
+  view-projection (vertex bank c3, 0x980 bytes, found with `DKB_DUMP_UBO=1`). Still missing: per-object motion
+  (animated characters can smear), DLSS where the game renders at the output size and skips its upscaler, and FSR 3.
+  Frame generation has the same input needs. The drivers' own frame generation (NVIDIA Smooth Motion, AMD AFMF) needs
+  nothing from this project.
 
 ## Alongside
 

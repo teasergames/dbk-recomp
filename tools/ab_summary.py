@@ -7,7 +7,8 @@ import argparse
 import re
 import sys
 
-LINE = re.compile(r'perf: frame (\d+): interval avg ([0-9.]+) ms .*replay avg ([0-9.]+) ms; ab (\d+)/(\d+); world (-?[0-9.]+) s')
+LINE = re.compile(r'perf: frame (\d+): interval avg ([0-9.]+) ms .*replay avg ([0-9.]+) ms[^;]*; '
+                  r'ab (\d+)/(\d+); world (-?[0-9.]+) s')
 
 
 def main():

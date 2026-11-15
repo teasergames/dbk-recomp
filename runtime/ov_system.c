@@ -19,14 +19,15 @@
 #include <string.h>
 #include <time.h>
 
+#include "aoc_romfs.h"
 #include "cfg.h"
-#include "fs.h"
 #include "host.h"
 #include "ov.h"
 #include "platform/platform.h"
 
 #define NFP_R_DEVICE_NOT_FOUND 0x8073u     // nfp: no NFC reader on the host
 #define ACCOUNT_R_INVALID 0x7c67u          // MacNativeGames' result for an unknown user handle or uid
+#define ACCOUNT_R_REGISTRATION_REQUIRED 0x1907cu
 #define TIME_R_INVALID 0x74u
 #define TIME_R_SOURCE_MISMATCH 0x18074u
 
@@ -122,6 +123,50 @@ static void ov_desired_language(Cpu *c) {
 }
 
 static void ov_oe_initialize(Cpu *c) { (void)c; rt_log("oe: application environment: a local host process"); }
+
+static void ov_nifm_initialize(Cpu *c) {
+    (void)c;
+    rt_log("nifm: offline host; network requests are unavailable");
+}
+
+static void ov_nifm_submit(Cpu *c) {
+    (void)c;
+    rt_log("nifm: network request refused (offline host)");
+}
+
+static void ov_nifm_unavailable(Cpu *c) {
+    // No request is accepted and no system network applet can resolve an error on this host.
+    ret_x(c, 0);
+}
+
+static void ov_bcat_initialize(Cpu *c) {
+    (void)c;
+    rt_log("bcat: offline host; no delivery cache is installed");
+}
+
+static void ov_streamplay_memory(Cpu *c) {
+    // No GameShare session or streaming buffers exist on the offline host.
+    rt_log("streamplay: GameShare unavailable; no streaming work memory required");
+    ret_x(c, 0);
+}
+
+static void ov_bcat_mount(Cpu *c) {
+    // BCAT's FailedOpenEntity (module 122, description 2), not a successful mount of nonexistent content.
+    ret_x(c, 0x47a);
+}
+
+static void ov_display_version(Cpu *c) {
+    // The validated loose dump has no control metadata; do not invent a release version from its title version.
+    char *out = arg_p(c, 0);
+    memset(out, 0, 16);
+    // Base 1.0.0 has a validated release name (expected-dkb100.json display_version); the update's is unverified.
+    if (!strcmp(rt_game_target, "dkb100") && strlen(rt_game_display) < 16) {
+        memcpy(out, rt_game_display, strlen(rt_game_display));
+        return;
+    }
+    memcpy(out, "unknown", sizeof "unknown");
+    rt_log("oe: display version unavailable (no control metadata)");
+}
 
 // void SetPerformanceConfiguration(PerformanceMode mode, int config)
 static void ov_performance_config(Cpu *c) {
@@ -300,13 +345,20 @@ static void ov_show_error(Cpu *c) {
 
 // ==== SDK-internal initialisation (services.c)
 static void ov_diag_startup(Cpu *c) { (void)c; rt_log("diag: host diagnostics"); }
-static void ov_aoc_initialize(Cpu *c) { (void)c; rt_log("aoc: no add-on content"); }
-// 1.4.3's main lists add-on content (MNG services.c host_aoc_list): there is none.
-// int ListAddOnContent(AddOnContentIndex *out, int offset, int count)
+static void ov_aoc_initialize(Cpu *c) { (void)c; rt_log("aoc: %u add-on content(s)", aoc_count()); }
+static void ov_aoc_count(Cpu *c) { ret_x(c, aoc_count()); }
+// int ListAddOnContent(int *out, int offset, int count): the add-on content indices this machine has, paged. The
+// argument layout and the count in the return value are the mangled signature's (EPiii); the buffer is checked to be
+// mapped (the host can only probe readability) before a single entry lands in it, because a wrong layout here would corrupt guest memory silently.
 static void ov_aoc_list(Cpu *c) {
-    int offset = (int)arg_x(c, 1), count = (int)arg_x(c, 2);
+    int32_t *out = arg_p(c, 0);
+    int offset = (int32_t)arg_x(c, 1), count = (int32_t)arg_x(c, 2);
     if (offset < 0 || count < 0) rt_fatal("aoc: ListAddOnContent range %d+%d", offset, count);
-    ret_x(c, 0);
+    uint32_t ids[AOC_MAX];
+    uint32_t n = aoc_list(ids, offset, count < AOC_MAX ? count : AOC_MAX);
+    if (n && !(out && plat_mem_readable((uintptr_t)out, n * sizeof *out))) n = 0;   // nothing written, nothing reported
+    for (uint32_t i = 0; i < n; i++) out[i] = (int32_t)ids[i];
+    ret_x(c, n);
 }
 static void ov_err_context(Cpu *c) { (void)c; rt_log("err: error contexts stay local"); }
 static void ov_pctl_initialize(Cpu *c) { (void)c; rt_log("pctl: no parental controls"); }
@@ -436,6 +488,14 @@ static void ov_user_id(Cpu *c) {
     if (ok) *out = local;
     plat_mutex_unlock_shared(&account_lock);
     ret_x(c, ok ? 0 : ACCOUNT_R_INVALID);
+}
+
+static void ov_cached_account(Cpu *c) {
+    plat_mutex_lock_shared(&account_lock);
+    int ok = valid_handle(arg_p(c, 1));
+    plat_mutex_unlock_shared(&account_lock);
+    // The local user has no linked Nintendo Account; the SDK leaves both outputs untouched on failure.
+    ret_x(c, ok ? ACCOUNT_R_REGISTRATION_REQUIRED : ACCOUNT_R_INVALID);
 }
 
 // Result GetLastOpenedUser(Uid *out): the local user, the only one the host ever opens (Bananza asks after
@@ -794,6 +854,7 @@ HOST_OVERRIDE("_ZN2nn2oe31EnterExitRequestHandlingSectionEv", ov_exit_section);
 HOST_OVERRIDE("_ZN2nn2oe31LeaveExitRequestHandlingSectionEv", ov_exit_section);
 
 HOST_OVERRIDE("_ZN2nn2oe10InitializeEv", ov_oe_initialize);
+HOST_OVERRIDE("_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE", ov_display_version);
 HOST_OVERRIDE("_ZN2nn2oe18GetDesiredLanguageEv", ov_desired_language);
 HOST_OVERRIDE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", ov_performance_config);
 HOST_OVERRIDE("_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", ov_cpu_boost);
@@ -818,6 +879,13 @@ HOST_OVERRIDE("_ZN2nn2oe17FinishStartupLogoEv", ov_finish_logo);
 HOST_OVERRIDE("_ZN2nn2oe25TryPopNotificationMessageEPj", ov_try_pop);
 HOST_OVERRIDE("_ZN2nn2oe22PopNotificationMessageEv", ov_pop);
 HOST_OVERRIDE("_ZN2nn5prepo10PlayReport4SaveEv", ov_report_save);
+HOST_OVERRIDE("_ZN2nn4nifm10InitializeEv", ov_nifm_initialize);
+HOST_OVERRIDE("_ZN2nn4nifm27SubmitNetworkRequestAndWaitEv", ov_nifm_submit);
+HOST_OVERRIDE("_ZN2nn4nifm18IsNetworkAvailableEv", ov_nifm_unavailable);
+HOST_OVERRIDE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", ov_nifm_unavailable);
+HOST_OVERRIDE("_ZN2nn4bcat10InitializeEv", ov_bcat_initialize);
+HOST_OVERRIDE("_ZN2nn4bcat25MountDeliveryCacheStorageEv", ov_bcat_mount);
+HOST_OVERRIDE("_ZN2nn10streamplay21GetRequiredMemorySizeENS0_14StreamPlayTypeENS0_13StreamingModeEi", ov_streamplay_memory);
 HOST_OVERRIDE("_ZN2nn5prepo10PlayReport4SaveERKNS_7account3UidE", ov_report_save);
 HOST_OVERRIDE("_ZN2nn5prepo28RequestImmediateTransmissionEv", ov_result_ok);
 HOST_OVERRIDE("_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_", ov_result_ok);
@@ -839,6 +907,7 @@ HOST_OVERRIDE("_ZN2nn3err9ShowErrorENS_6ResultE", ov_show_error);
 
 HOST_OVERRIDE("nndiagStartup", ov_diag_startup);
 HOST_OVERRIDE("_ZN2nn3aoc10InitializeEv", ov_aoc_initialize);
+HOST_OVERRIDE("_ZN2nn3aoc17CountAddOnContentEv", ov_aoc_count);
 HOST_OVERRIDE("_ZN2nn3aoc16ListAddOnContentEPiii", ov_aoc_list);
 HOST_OVERRIDE("_ZN2nn3err26InitializeContextWriterApiEv", ov_err_context);
 HOST_OVERRIDE("_ZN2nn4pctl10InitializeEv", ov_pctl_initialize);
@@ -855,6 +924,7 @@ HOST_OVERRIDE("_ZN2nn7account10InitializeEv", ov_account_initialize);
 HOST_OVERRIDE("_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE", ov_open_user);
 HOST_OVERRIDE("_ZN2nn7account9CloseUserERKNS0_10UserHandleE", ov_close_user);
 HOST_OVERRIDE("_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE", ov_user_id);
+HOST_OVERRIDE("_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm", ov_cached_account);
 HOST_OVERRIDE("_ZN2nn7account17GetLastOpenedUserEPNS0_3UidE", ov_last_opened_user);
 HOST_OVERRIDE("_ZN2nn7account16GetUserExistenceEPbRKNS0_3UidE", ov_user_existence);
 HOST_OVERRIDE("_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE", ov_nickname);

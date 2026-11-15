@@ -1,5 +1,5 @@
-// Between gfx_present.c (swapchain, present, vsync) and the window system's back end (gfx_window_win.c with Win32,
-// gfx_window_sdl.c with SDL). Host threads only.
+// Between the chosen back end's window side (vk_present.c on Vulkan: surface, swapchain, present) and the window
+// system's back end (gfx_window_win.c with Win32, gfx_window_sdl.c with SDL). Host threads only.
 #pragma once
 #include "vk.h"
 
@@ -16,10 +16,11 @@ void wsys_probe_escape(void);              // Esc pressed
 // 0 when the window system has no such event (then the caller skips that check).
 int wsys_probe_click(int where);
 
-// ---- what gfx_present.c provides the back end
+// ---- what the back end's window side provides the window system
 void gfx_window_mark_dirty(void);          // the window changed size: the next present rebuilds the swapchain
 void gfx_window_focus_changed(int in);     // the window gained (1) or lost (0) the focus
 void gfx_window_closed(void);              // the player closed the window: saves, then ends the process
 void gfx_window_set_refresh(double hz);    // the refresh rate of the window's monitor, 0 unknown
-int gfx_cfg_fullscreen(void);              // TOTK_FULLSCREEN
+int gfx_cfg_window_mode(void);             // TOTK_WINDOW_MODE: 0 windowed, 1 borderless, 2 fullscreen
+int gfx_cfg_fullscreen(void);              // the window covers the monitor: mode 1 or 2
 void gfx_cfg_window_size(int *w, int *h);  // TOTK_WINDOW_SIZE, the default when unparsable or out of range

@@ -31,6 +31,11 @@ static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
     return 0;
 }
 
+static int listed(const char *const *names, uint32_t n, const char *name) {
+    for (uint32_t i = 0; i < n; i++) if (!strcmp(names[i], name)) return 1;
+    return 0;
+}
+
 static int layer_present(const char *name) {
     uint32_t n = 0;
     vkEnumerateInstanceLayerProperties(&n, NULL);
@@ -39,6 +44,20 @@ static int layer_present(const char *name) {
     int found = 0;
     for (uint32_t i = 0; i < n; i++) if (!strcmp(l[i].layerName, name)) found = 1;
     free(l);
+    return found;
+}
+
+// An instance extension the loader offers. Enabling one it does not offer fails vkCreateInstance outright, so
+// create_instance asks first: for the HDR10 colour-space extension, for what DLSS wants, and on macOS for the
+// portability enumeration extension.
+static int instance_ext_present(const char *name) {
+    uint32_t n = 0;
+    vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
+    VkExtensionProperties *e = calloc(n ? n : 1, sizeof *e);
+    if (!e) return 0;
+    vkEnumerateInstanceExtensionProperties(NULL, &n, e);
+    int found = has_ext(e, n, name);
+    free(e);
     return found;
 }
 
@@ -57,8 +76,8 @@ static void mesa_cache_beside_exe(void) {
 
 static int create_instance(void) {
     mesa_cache_beside_exe();
-    const char *ext[8];
-    uint32_t n_ext = (uint32_t)gfx_window_vk_extensions(ext, 7);
+    const char *ext[28];
+    uint32_t n_ext = (uint32_t)gfx_window_vk_extensions(ext, 8);
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     int validate = cfg_bool("TOTK_VK_VALIDATION");
     if (validate && !layer_present(layers[0])) {
@@ -80,9 +99,31 @@ static int create_instance(void) {
     }
     if (utils) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     g_vk.debug_utils = utils;
+    if (vk_hdr_wanted() && instance_ext_present(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {   // HDR10 surface formats
+        g_vk.has_swapchain_colorspace = 1;
+        ext[n_ext++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
+    }
+    if (vk_dlss_wanted()) {   // upscaler = dlss: what NVIDIA NGX asks for (vk_dlss.c), where the loader offers it
+        const char *dx[16];
+        int nd = vk_dlss_instance_exts(dx, 16);
+        for (int i = 0; i < nd && n_ext < 26; i++)
+            if (!listed(ext, n_ext, dx[i]) && instance_ext_present(dx[i])) ext[n_ext++] = dx[i];
+    }
+    // MoltenVK is a portability implementation: the loader only lists it for an instance that asks for the portability
+    // enumeration extension, and the logical device then enables VK_KHR_portability_subset (create_device). Only on
+    // macOS: the Khronos loader offers the extension on Windows and Linux too, and asking there would let a portability
+    // device in, without the geometryShader requirement, where none was accepted before.
+    VkInstanceCreateFlags flags = 0;
+#ifdef __APPLE__
+    if (n_ext < 12 && instance_ext_present(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        ext[n_ext++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+        flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+#endif
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "TotK Recomp",
                              .pEngineName = "TotK Recomp", .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
+                               .flags = flags,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
     rdoc_init();
@@ -106,6 +147,10 @@ static int create_instance(void) {
 static const char *const k_required_ext[] = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
+
+// VK_KHR_portability_subset is in <vulkan/vulkan_beta.h>, which only the VK_ENABLE_BETA_EXTENSIONS define pulls in;
+// the subset itself is final and MoltenVK requires it on every device it exposes.
+#define VK_KHR_PORTABILITY_SUBSET_NAME "VK_KHR_portability_subset"
 
 // Name of the first missing required extension, or NULL.
 static const char *missing_required(VkPhysicalDevice pd) {
@@ -147,6 +192,7 @@ static int pick_device(void) {
     int want = e && *e ? atoi(e) : -1;
     const char *name = cfg_get("TOTK_GPU_NAME");
     int best = -1, best_score = -1;
+    VkPhysicalDeviceProperties best_p = {0};
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pd[i], &p);
@@ -166,7 +212,15 @@ static int pick_device(void) {
         if (fam == UINT32_MAX) { rt_log("vk: gpu %u skipped: no graphics+compute+present queue family", i); continue; }
         int score = (int)i == want ? 100 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
                   : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
-        if (score > best_score) { best_score = score; best = (int)i; }
+        // The loader lists the same GPU twice when an old driver's ICD json is left behind, and the old driver can come
+        // first. On a tie in score between entries with the same vendor and device ID, the newer driverVersion wins.
+        // Follows ocarina-recomp runtime/vk_device.c (Hookshot, ef4c2b0), at 14566bd, GPL-3.0.
+        int dup = best >= 0 && score == best_score && p.vendorID == best_p.vendorID && p.deviceID == best_p.deviceID;
+        if (dup) rt_log("vk: gpu %u and gpu %d are the same GPU (leftover driver); keeping the newer driver",
+                        i, best);
+        if (score > best_score || (dup && p.driverVersion > best_p.driverVersion)) {
+            best_score = score; best = (int)i; best_p = p;
+        }
     }
     if (best < 0) {
         if (want >= 0) rt_log("vk: TOTK_GPU_INDEX=%d is not usable (see above)", want);
@@ -219,6 +273,7 @@ typedef struct {
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
     VkPhysicalDeviceAddressBindingReportFeaturesEXT abr;
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pei;
+    VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT lrs;
 } FeatureChain;
 
 static int create_device(void) {
@@ -226,9 +281,13 @@ static int create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[28];
+    const char *ext[48];
     uint32_t n_ext = 0;
     for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext; i++) ext[n_ext++] = k_required_ext[i];
+    // A portability implementation (MoltenVK) requires this one on every device it exposes; no feature of it is needed
+    // here, so its feature struct is left out and both sides stay at the defaults.
+    int portable = has_ext(ep, ne, VK_KHR_PORTABILITY_SUBSET_NAME);
+    if (portable) ext[n_ext++] = VK_KHR_PORTABILITY_SUBSET_NAME;
 
     FeatureChain *c = calloc(1, sizeof *c);
     void **tail = &c->f2.pNext;
@@ -250,9 +309,12 @@ static int create_device(void) {
     OPTIONAL_EXT(has_provoking_vertex, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, pv, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT);
     OPTIONAL_EXT(has_robustness2, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, rob2, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
     OPTIONAL_EXT(has_device_fault, VK_EXT_DEVICE_FAULT_EXTENSION_NAME, fault, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT);
-    // Ryujinx's SPIR-V declares fragment shader interlock whenever the host reports it (vk_pipeline.c spirv_fixup).
+    // Ryujinx's SPIR-V declares fragment shader interlock whenever the host reports it (spirv_rewrite.c spirv_fixup_linked).
     OPTIONAL_EXT(has_fragment_shader_interlock, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, fsi,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT);
+    // Maxwell applies primitive restart to list draws too (docs/maxwell.md 5.2); core Vulkan only to strips and fans.
+    OPTIONAL_EXT(has_list_restart, VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME, lrs,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT);
     // Feedback loops (vk.h VkCtx.feedback): the layout, and barriers inside dynamic rendering
     int has_fbl = 0, has_lr = 0;
     if (has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
@@ -264,6 +326,10 @@ static int create_device(void) {
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
     }
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
+    if (vk_hdr_wanted() && has_ext(ep, ne, VK_EXT_HDR_METADATA_EXTENSION_NAME)) {   // the display's peak (vk_hdr_metadata)
+        g_vk.has_hdr_metadata = 1;
+        ext[n_ext++] = VK_EXT_HDR_METADATA_EXTENSION_NAME;
+    }
     // GPU breadcrumbs for a lost device (vk_crumbs.c): AMD's drivers and RADV report it.
     if (has_ext(ep, ne, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) { g_vk.has_buffer_marker = 1; ext[n_ext++] = VK_AMD_BUFFER_MARKER_EXTENSION_NAME; }
     // NVIDIA's counterpart, opt-in because every pipeline bind then carries a checkpoint command.
@@ -291,7 +357,6 @@ static int create_device(void) {
         gpl_link = tail;
         CHAIN(gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT);
     }
-    free(ep);
 
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
@@ -305,6 +370,18 @@ static int create_device(void) {
         vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
         if (!vk_caps_gpl(&c->gpl, &gp)) { *gpl_link = NULL; n_ext -= 2; }
     }
+    // upscaler = dlss on an NVIDIA GPU: the device extensions NVIDIA NGX asks for (vk_dlss.c), where the device has
+    // them, after the two above that n_ext -= 2 may take back. VK_EXT_buffer_device_address stays out when the core
+    // bufferDeviceAddress feature is on: both together are invalid (VUID-VkDeviceCreateInfo-pNext-04748).
+    if (vk_dlss_wanted() && g_vk.props.vendorID == 0x10de) {
+        const char *dx[16];
+        int nd = vk_dlss_device_exts(dx, 16);
+        for (int i = 0; i < nd && n_ext < 48; i++)
+            if (!listed(ext, n_ext, dx[i]) && has_ext(ep, ne, dx[i]) &&
+                !(c->f12.bufferDeviceAddress && !strcmp(dx[i], VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)))
+                ext[n_ext++] = dx[i];
+    }
+    free(ep);
     const VkPhysicalDeviceFeatures *h = &c->f2.features;
     const char *miss = NULL;
     if (!c->f12.timelineSemaphore) miss = "timelineSemaphore";
@@ -315,10 +392,17 @@ static int create_device(void) {
     else if (!h->shaderInt64) miss = "shaderInt64";
     else if (!h->samplerAnisotropy) miss = "samplerAnisotropy";
     else if (!h->independentBlend) miss = "independentBlend";
-    else if (!h->geometryShader) miss = "geometryShader";
+    // Metal has no geometry stage, so MoltenVK reports no geometryShader. Only the pipelines that use one are lost
+    // (with a log line when they are created), which is better than refusing every device on a portability driver.
+    else if (!h->geometryShader && !portable) miss = "geometryShader";
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
+    if (!h->geometryShader)   // vk_pipeline.c skips the pipelines that need it (P.f_geometry)
+        rt_log("vk: %s has no geometry stage (portability subset): draws that need one are skipped", g_vk.props.deviceName);
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
+    if (g_vk.has_list_restart && !c->lrs.primitiveTopologyListRestart) g_vk.has_list_restart = 0;
+    rt_log("vk: primitive restart on list draws: %s", g_vk.has_list_restart ? "yes (primitiveTopologyListRestart)"
+           : "no: a list draw's restart index is fetched as a vertex");
     if (g_vk.has_address_binding_report && !c->abr.reportAddressBinding) g_vk.has_address_binding_report = 0;
     if (g_vk.has_pipeline_exec_info && !c->pei.pipelineExecutableInfo) g_vk.has_pipeline_exec_info = 0;
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
@@ -326,8 +410,11 @@ static int create_device(void) {
     {
         const char *e = cfg_get("TOTK_FEEDBACK");
         int layout_ok = has_fbl && has_lr && c->fbl.attachmentFeedbackLoopLayout && c->lr.dynamicRenderingLocalRead;
+        // Under RADV the feedback layout is not the default: an RX 6600 hung (ring gfx timeout, no page fault) on the
+        // first frame that used it (issue #122, a guess until a tester confirms); TOTK_FEEDBACK=layout opts back in.
+        int layout_wanted = e && !strcmp(e, "layout") ? 1 : !vk_caps.radv;
         g_vk.feedback = e && !strcmp(e, "0") ? VK_FEEDBACK_OFF
-                      : layout_ok && !(e && !strcmp(e, "restart")) ? VK_FEEDBACK_LAYOUT : VK_FEEDBACK_RESTART;
+                      : layout_ok && layout_wanted && !(e && !strcmp(e, "restart")) ? VK_FEEDBACK_LAYOUT : VK_FEEDBACK_RESTART;
         rt_log("vk: feedback loops: %s (attachmentFeedbackLoopLayout %d, dynamicRenderingLocalRead %d)",
                g_vk.feedback == VK_FEEDBACK_LAYOUT ? "feedback layout + by-region barrier"
                : g_vk.feedback == VK_FEEDBACK_RESTART ? "pass restart + full barrier" : "off (TOTK_FEEDBACK=0)",
@@ -380,9 +467,10 @@ static int create_device(void) {
 static long g_errors_total;     // outlives the device so the probe can print it after vk_shutdown
 
 static void destroy_all(void) {
-    gfx_window_release_vk();
+    vk_present_release();
     if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
     if (g_vk.device) vk_clear_shutdown(g_vk.device);
+    if (g_vk.device) vk_dlss_release();
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);

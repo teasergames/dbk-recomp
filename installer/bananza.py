@@ -1,7 +1,11 @@
-"""Bananza base 1.0.0 folder installs. No container extraction, keys or Python 3.14 dependencies.
+"""Validated Bananza installs from ExeFS and RomFS folders or a .nup container. No NCA extraction or keys.
 
 The existing runner owns step events and atomic checkpoints. Game-derived temporary files stay in a separately
 marked task directory; only verified files enter the portable destination. No prebuilt TotK runtime is reused.
+
+A .nup (the container Eglantine and Eden load) is read with tools/extract_nup.py: preflight reads only its table of
+contents, which records every file's size and SHA-256, so the target is chosen and the ExeFS checked before anything
+is written; the Data step then extracts the ExeFS and packs the RomFS straight from the container.
 """
 import hashlib
 import copy
@@ -11,6 +15,7 @@ import os
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -25,8 +30,11 @@ STATE = 'dkb-install.json'
 OWNER = '.dkb-setup-owner.json'
 DEST_OWNER = '.dkb-install-owner.json'
 GAME = 'dkb100'
+TARGETS = (GAME, 'dkb458752')   # 1.0.0 and 3.2.0 (title version 458752); tools/data/expected-<target>.json
+NUP_SELECT = ('latest', 'base')
 EXE = '.exe' if os.name == 'nt' else ''
 CHUNK = 8 << 20
+COMMIT_WARN_GIB = 24   # the game commits about 14 GB; README asks for 16 GB of RAM plus a large page file
 
 
 def sha256(path):
@@ -135,8 +143,8 @@ def pack_manifest(folder):
         raise InstallError('dkb.pack_invalid', path=str(folder), detail=str(e)) from None
 
 
-def expected_exefs(layout, exefs):
-    expected = json.loads((layout.tools / 'data' / 'expected-dkb100.json').read_text(encoding='utf-8'))
+def expected_exefs(layout, exefs, game=GAME):
+    expected = json.loads((layout.tools / 'data' / f'expected-{game}.json').read_text(encoding='utf-8'))
     hashes = expected['exefs_sha256']
     for name, value in hashes.items():
         p = exefs / name
@@ -146,6 +154,20 @@ def expected_exefs(layout, exefs):
     if any(exefs.glob('subsdk*')):
         raise InstallError('dkb.update_unsupported')
     return hashes
+
+
+def select_target(layout, exefs):
+    main = exefs / 'main'
+    ensure_plain(main)
+    if main.is_file():
+        value = sha256(main)
+        for game in TARGETS:
+            path = layout.tools / 'data' / f'expected-{game}.json'
+            if path.is_file():
+                expected = json.loads(path.read_text(encoding='utf-8'))
+                if expected['exefs_sha256']['main'] == value:
+                    return game
+    raise InstallError('dkb.exefs_invalid', path=str(main))
 
 
 def tool_layout(layout, options):
@@ -177,11 +199,65 @@ def tree_key(base):
                    if p.is_file() and '__pycache__' not in p.parts])
 
 
-def translator_identity(layout):
-    spec = importlib.util.spec_from_file_location('_dkb_build_xlate', layout.tools / 'build_xlate.py')
+def tool_module(layout, name):
+    spec = importlib.util.spec_from_file_location('_dkb_' + name.removesuffix('.py'), layout.tools / name)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.identity()
+    return module
+
+
+def translator_identity(layout):
+    return tool_module(layout, 'build_xlate.py').identity()
+
+
+def nup_source(layout, path, select):
+    """What a .nup install takes from the container, from its table of contents alone: the target (by the recorded
+    SHA-256 of main), the ExeFS hashes checked against the target's, and the RomFS file list (path, size, SHA-256) in
+    the format and order inventory() gives for a loose folder. Nothing is decompressed or written."""
+    tool = tool_module(layout, 'extract_nup.py')
+    try:
+        container = tool.Nup(path)
+    except (tool.NupError, OSError, ValueError, UnicodeDecodeError) as e:
+        raise InstallError('dkb.nup_invalid', path=str(path), detail=str(e)) from None
+    try:
+        plan = tool.install_plan(container, select)
+        exefs = {'/'.join(parts): idx for parts, idx in tool.merged_entries(container, [plan['exefs']], 'exefs')}
+        romfs = tool.packed_entries(tool.merged_entries(container, plan['romfs'], 'romfs'))
+        package = plan['exefs']
+        version = package.display_version or str(package.version)
+        recorded = lambda name: container.files[exefs[name]][4].hex() if name in exefs else None
+        game = next((g for g in TARGETS if (layout.tools / 'data' / f'expected-{g}.json').is_file() and
+                     json.loads((layout.tools / 'data' / f'expected-{g}.json').read_text(encoding='utf-8'))
+                     ['exefs_sha256']['main'] == recorded('main')), None)
+        if game is None:
+            raise InstallError('dkb.nup_version', path=str(path), version=version, title_version=package.version)
+        hashes = json.loads((layout.tools / 'data' / f'expected-{game}.json').read_text(encoding='utf-8'))['exefs_sha256']
+        for name, value in hashes.items():
+            if recorded(name) != value:
+                raise InstallError('dkb.exefs_invalid', path=f'{path} (exefs/{name})')
+        if any(name.startswith('subsdk') for name in exefs):
+            raise InstallError('dkb.update_unsupported')
+        files = [{'path': '/'.join(parts), 'size': container.files[idx][1], 'sha256': container.files[idx][4].hex()}
+                 for parts, idx in romfs]
+        if not files:
+            raise InstallError('dkb.romfs_empty', path=f'{path} (romfs)')
+        compressed = any(container.files[i][5] for i in (*exefs.values(), *(idx for _, idx in romfs)))
+    except tool.NupError as e:
+        raise InstallError('dkb.nup_invalid', path=str(path), detail=str(e)) from None
+    finally:
+        container.close()
+    if compressed:
+        # The Data step decompresses in layout.python, which can differ from the Python running this check.
+        probe = subprocess.run([str(layout.python), str(layout.tools / 'extract_nup.py'), '--check-zstd'],
+                               capture_output=True, text=True)
+        if probe.returncode:
+            raise InstallError('dkb.nup_zstd', path=str(path))
+    return game, hashes, files
+
+
+def unsafe_temp_chars(path):
+    # NativeAOT's generated link script puts the work path on a shell command line unquoted (issue 189).
+    return ''.join(sorted({ch for ch in str(path) if ch in "()&;|<>$`'\"!*?[]{}#~"}))
 
 
 def preflight(layout, options, dest, temp, rep):
@@ -193,33 +269,59 @@ def preflight(layout, options, dest, temp, rep):
         raise InstallError('ui.need_lang')
     ensure_plain(dest / STATE)
     old = statefile.load(dest, STATE)
-    if old is not None and (old.get('game') != GAME or old.get('destination') != str(dest)):
+    if old is not None and (old.get('game') not in TARGETS or old.get('destination') != str(dest)):
         raise InstallError('dkb.dest_unrelated', path=str(dest))
-    exefs_arg = options.exefs or (Path(old['sources']['exefs']) if old else None)
-    romfs_arg = options.romfs or (Path(old['sources']['romfs']) if old else None)
-    if not exefs_arg or not romfs_arg:
-        raise InstallError('dkb.need_folders')
-    for p in (exefs_arg, romfs_arg, dest, temp):
-        ensure_plain(p.absolute())
-    exefs, romfs = exefs_arg.resolve(), romfs_arg.resolve()
-    if not exefs.is_dir() or not romfs.is_dir():
-        raise InstallError('dkb.need_folders')
+    nup_arg = getattr(options, 'nup', None)
+    # A package choice only means something for a .nup, so it counts as asking for one next to folders too.
+    if (nup_arg or getattr(options, 'nup_package', None)) and (options.exefs or options.romfs):
+        raise InstallError('dkb.nup_and_folders')
+    recorded = old['sources'] if old else {}
+    if not nup_arg and not options.exefs and not options.romfs and recorded.get('nup'):
+        nup_arg = Path(recorded['nup'])
+    select = getattr(options, 'nup_package', None) or (recorded.get('nup_package') if nup_arg else None) or 'latest'
+    if select not in NUP_SELECT:
+        raise InstallError('dkb.nup_invalid', path=str(nup_arg), detail=f'unknown package choice {select}')
+    if nup_arg:
+        for p in (nup_arg, dest, temp):
+            ensure_plain(p.absolute())
+        nup = nup_arg.resolve()
+        if not nup.is_file():
+            raise InstallError('dkb.need_nup')
+        rep.progress('check', 'dkb_base')
+        game, hashes, files = nup_source(layout, nup, select)
+        inputs, sources = (nup,), {'nup': str(nup), 'nup_package': select}
+    else:
+        exefs_arg = options.exefs or (Path(recorded['exefs']) if recorded.get('exefs') else None)
+        romfs_arg = options.romfs or (Path(recorded['romfs']) if recorded.get('romfs') else None)
+        if not exefs_arg or not romfs_arg:
+            raise InstallError('dkb.need_folders')
+        for p in (exefs_arg, romfs_arg, dest, temp):
+            ensure_plain(p.absolute())
+        exefs, romfs = exefs_arg.resolve(), romfs_arg.resolve()
+        if not exefs.is_dir() or not romfs.is_dir():
+            raise InstallError('dkb.need_folders')
+        game = select_target(layout, exefs)
+        inputs, sources = (exefs, romfs), {'exefs': str(exefs), 'romfs': str(romfs)}
+    if old is not None and old['game'] != game:
+        raise InstallError('dkb.dest_unrelated', path=str(dest))
     if dest.exists() and not dest.is_dir():
         raise InstallError('dkb.dest_unrelated', path=str(dest))
-    for a, b in ((dest, temp), (dest, exefs), (dest, romfs), (temp, exefs), (temp, romfs)):
+    for a, b in ((dest, temp), *((out, source) for out in (dest, temp) for source in inputs)):
         if contains(a, b) or contains(b, a):
             raise InstallError('dkb.path_overlap', path=str(a), other=str(b))
     if dest.exists() and old is None and any(dest.iterdir()):
         try:
             ensure_plain(dest / DEST_OWNER)
             partial = json.loads((dest / DEST_OWNER).read_text(encoding='utf-8'))
-            ours = partial == {'game': GAME, 'destination': str(dest)}
+            ours = partial == {'game': game, 'destination': str(dest)}
             ours &= {p.name for p in dest.iterdir()} <= {DEST_OWNER, '.dkb-setup.lock'}
         except (OSError, ValueError):
             ours = False
         if not ours:
             raise InstallError('dkb.dest_unrelated', path=str(dest))
-    owner = {'game': GAME, 'destination': str(dest), 'temporary': str(temp)}
+    if nuget_needs_fallback(temp) and any(c.isspace() for c in tempfile.gettempdir()):
+        raise InstallError('dkb.temp_space', path=str(temp))
+    owner = {'game': game, 'destination': str(dest), 'temporary': str(temp)}
     for p in (temp / OWNER, dest / STATE, dest / (STATE + '.tmp'), dest / DEST_OWNER):
         ensure_plain(p)
     if temp.exists() and any(temp.iterdir()):
@@ -231,10 +333,14 @@ def preflight(layout, options, dest, temp, rep):
             raise InstallError('dkb.temp_unrelated', path=str(temp))
     plain_tree(temp)
     plain_destination(dest, layout.dlls)
-    # Hash the supported base before creating logs, state, destination or temporary directories.
-    rep.progress('check', 'dkb_base')
-    hashes = expected_exefs(layout, exefs)
-    packed = (romfs / 'index.json').is_file() and (romfs / 'romfs.bin').is_file()
+    # Reject mixed-version inputs before any writer can replace a checkpoint or installed file.
+    # A .nup's ExeFS was checked against its table of contents above, and its file list has the identity of a loose
+    # folder holding the same files.
+    packed = False
+    if not nup_arg:
+        rep.progress('check', 'dkb_base')
+        hashes = expected_exefs(layout, exefs, game)
+        packed = (romfs / 'index.json').is_file() and (romfs / 'romfs.bin').is_file()
     if packed:
         ensure_plain(romfs / 'index.json')
         ensure_plain(romfs / 'romfs.bin')
@@ -243,13 +349,14 @@ def preflight(layout, options, dest, temp, rep):
         romfs_id = digest(manifest)
         romfs_size = manifest['romfs_size']
     else:
-        files = inventory(romfs, rep)
+        files = files if nup_arg else inventory(romfs, rep)
         romfs_id = digest(files)
         romfs_size = sum(e['size'] + 15 for e in files)
     missing = [p for p in (layout.clang, layout.ninja, layout.recomp / 'gen.py',
-                           layout.recomp / 'patches-dkb100.txt', layout.tools / 'dkb_pack_romfs.py',
+                           layout.recomp / f'patches-{game}.txt', layout.tools / 'dkb_pack_romfs.py',
+                           *([layout.tools / 'extract_nup.py'] if nup_arg else []),
                            layout.tools / 'dkb_shader_census.py',
-                           layout.runtime / 'nvn2_lower.cpp', layout.tools / 'data' / 'expected-dkb100.json')
+                           layout.runtime / 'nvn2_lower.cpp', layout.tools / 'data' / f'expected-{game}.json')
                if not p.is_file()]
     if layout.deps:
         missing += [p for p in (layout.deps / 'include', layout.deps / 'lib') if not p.is_dir()]
@@ -276,7 +383,7 @@ def preflight(layout, options, dest, temp, rep):
         proc = subprocess.run([str(dotnet), '--list-sdks'], capture_output=True, text=True) if dotnet.is_file() else None
         if proc is None or proc.returncode or not any(line.startswith('10.') for line in proc.stdout.splitlines()):
             raise InstallError('dkb.dotnet_missing')
-    return dict(old=old, sources={'exefs': str(exefs), 'romfs': str(romfs)}, hashes=hashes, files=files,
+    return dict(old=old, game=game, sources=sources, hashes=hashes, files=files,
                 romfs_id=romfs_id, romfs_size=romfs_size, owner=owner, translator=translator, identity=identity,
                 dotnet=dotnet, packed=packed,
                 pipeline=digest(*(sha256(Path(__file__).with_name(n)) for n in ('bananza.py', 'runner.py', 'state.py'))))
@@ -310,9 +417,18 @@ def copy_file(src, dst):
     ensure_plain(temporary)
     try:
         shutil.copyfile(src, temporary)
+        try:
+            shutil.copymode(src, temporary)  # keeps the executable bit
+        except OSError:
+            pass
         os.replace(temporary, dst)
     except PermissionError:
         raise InstallError('compile.exe_in_use', path=str(dst)) from None
+
+
+def nuget_needs_fallback(temp):
+    """NativeAOT hands its native libraries to clang unquoted on POSIX, so NuGet must live where no path has a space."""
+    return os.name != 'nt' and any(c.isspace() for c in str(temp / 'nuget'))
 
 
 def lock_temp(temp):
@@ -344,10 +460,16 @@ def run_tool(ctx, step, command, env=None, cwd=None, name=None):
     log.parent.mkdir(parents=True, exist_ok=True)
     ctx.reporter.progress(step, 'dkb_run', force=True)
     with log.open('w', encoding='utf-8') as out:
-        proc = subprocess.Popen(list(map(str, command)), cwd=cwd or ctx.layout.root, stdin=subprocess.DEVNULL,
-                                stdout=out, stderr=subprocess.STDOUT,
-                                env=dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8', **(env or {})),
-                                start_new_session=os.name != 'nt')
+        try:
+            proc = subprocess.Popen(list(map(str, command)), cwd=cwd or ctx.layout.root, stdin=subprocess.DEVNULL,
+                                    stdout=out, stderr=subprocess.STDOUT,
+                                    env=dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8', **(env or {})),
+                                    start_new_session=os.name != 'nt')
+        except OSError as e:
+            if getattr(e, 'winerror', None) != 740:   # ERROR_ELEVATION_REQUIRED
+                raise
+            ctx.reporter.log(f'{step}: Windows requires elevation to start {command[0]}')
+            raise InstallError('dkb.elevation_required', exe=Path(str(command[0])).name) from None
         try:
             code = proc.wait()
         except BaseException:
@@ -400,18 +522,24 @@ class Check(Step):
             raise InstallError('check.vulkan_missing')
         if not any(tuple(d['api'][:2]) >= (1, 3) for d in host['devices']):
             raise InstallError('check.vulkan_no_device')
+        commit = host.get('commit_limit_gib')   # Windows only; the game commits about 14 GB, so leave room for the system
+        if commit is not None and commit < COMMIT_WARN_GIB:
+            ctx.reporter.warning('warn.low_commit_limit', commit=f'{commit:.0f}', need=COMMIT_WARN_GIB)
 
 
 class Data(Step):
     id = 'dkb_data'
 
     def key(self, ctx):
-        return digest(ctx.info['hashes'], ctx.info['romfs_id'], ctx.info['pipeline'],
-                      sha256(ctx.layout.tools / 'dkb_pack_romfs.py'))
+        parts = [ctx.info['hashes'], ctx.info['romfs_id'], ctx.info['pipeline'],
+                 sha256(ctx.layout.tools / 'dkb_pack_romfs.py')]
+        if 'nup' in ctx.info['sources']:   # folder installs keep the key they had before .nup input existed
+            parts += [sha256(ctx.layout.tools / 'extract_nup.py'), ctx.info['sources']['nup_package']]
+        return digest(*parts)
 
     def current(self, ctx, record):
         try:
-            expected_exefs(ctx.layout, ctx.dest / 'exefs')
+            expected_exefs(ctx.layout, ctx.dest / 'exefs', ctx.info['game'])
             image = ctx.dest / 'romfs' / 'romfs.bin'
             return (image.stat().st_size == record['size'] and image.stat().st_mtime_ns == record['mtime_ns'] and
                     sha256(ctx.dest / 'romfs' / 'index.json') == record['index_sha256'])
@@ -427,15 +555,23 @@ class Data(Step):
     def run(self, ctx):
         stage = ctx.temp / 'data'
         owned_dir(ctx, stage)
-        exefs = Path(ctx.info['sources']['exefs'])
-        for name in ctx.info['hashes']:
-            copy_file(exefs / name, stage / 'exefs' / name)
-        expected_exefs(ctx.layout, stage / 'exefs')
-        romfs = Path(ctx.info['sources']['romfs'])
+        sources = ctx.info['sources']
+        if 'nup' in sources:
+            # Every extracted file is checked against the container's SHA-256 record; the packed image is read back
+            # below against the preflight list taken from the same records.
+            romfs = Path(sources['nup'])
+            run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'extract_nup.py', romfs,
+                                     '--select', sources['nup_package'], '--pack', '--out', stage])
+        else:
+            exefs = Path(sources['exefs'])
+            for name in ctx.info['hashes']:
+                copy_file(exefs / name, stage / 'exefs' / name)
+            romfs = Path(sources['romfs'])
+        expected_exefs(ctx.layout, stage / 'exefs', ctx.info['game'])
         if ctx.info['packed']:
             for name in ('romfs.bin', 'index.json'):
                 copy_file(romfs / name, stage / 'romfs' / name)
-        else:
+        elif 'nup' not in sources:
             run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'dkb_pack_romfs.py', '--dir', romfs,
                                      '--out', stage / 'romfs'])
         manifest = pack_manifest(stage / 'romfs')
@@ -483,9 +619,10 @@ class Translator(Step):
         source = ctx.info['translator']
         if source is None:
             out = ctx.temp / 'xlate'
+            nuget = Path(tempfile.mkdtemp(prefix='dkb-nuget-')) if nuget_needs_fallback(ctx.temp) else ctx.temp / 'nuget'
             env = {'PATH': str(ctx.info['dotnet'].parent) + os.pathsep + os.environ.get('PATH', ''),
                    'DOTNET_ROOT': str(ctx.info['dotnet'].parent), 'DOTNET_CLI_HOME': str(ctx.temp / 'dotnet-home'),
-                   'NUGET_PACKAGES': str(ctx.temp / 'nuget'),
+                   'NUGET_PACKAGES': str(nuget),
                    'DOTNET_PROCESSOR_COUNT': str(ctx.options.jobs),
                    # Reusable MSBuild nodes retain NuGet task DLLs after publish and block Windows cleanup.
                    # These settings affect only this build, not the owner's other .NET work.
@@ -496,7 +633,11 @@ class Translator(Step):
                 command += ['--llvm', ctx.layout.llvm]
                 if ctx.layout.sysroot:
                     command += ['--sysroot', ctx.layout.sysroot]
-            run_tool(ctx, self.id, command, env)
+            try:
+                run_tool(ctx, self.id, command, env)
+            finally:
+                if nuget.parent != ctx.temp:
+                    shutil.rmtree(nuget, ignore_errors=True)
             source = out / ('totk_xlate' + EXE)
         if source.with_suffix('.id').read_text(encoding='ascii').strip() != ctx.info['identity']:
             raise InstallError('dkb.translator_mismatch')
@@ -519,7 +660,8 @@ class Lift(Step):
                 m = json.loads((gen / name / 'manifest.json').read_text(encoding='utf-8'))
                 if not m['chunks'] or not all((gen / name / chunk).is_file() for chunk in m['chunks']):
                     return False
-            return (gen / 'layout.json').is_file() and (gen / 'patches.h').is_file()
+            return ((gen / 'layout.json').is_file() and (gen / 'patches.h').is_file() and
+                    record.get('outputs') == tree_key(gen))
         except (OSError, KeyError, ValueError):
             return False
 
@@ -529,10 +671,11 @@ class Lift(Step):
         gen.mkdir(parents=True, exist_ok=True)
         run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.recomp / 'gen.py', '--exefs', ctx.dest / 'exefs',
                                  '--out', gen, '--modules', 'main,sdk', '--jobs', ctx.options.jobs,
-                                 '--patches', ctx.layout.recomp / 'patches-dkb100.txt'])
+                                 '--patches', ctx.layout.recomp / f"patches-{ctx.info['game']}.txt"])
         manifest = json.loads((gen / 'main' / 'manifest.json').read_text(encoding='utf-8'))
-        if manifest.get('stats', {}).get('patched_sites', 0) < 1:
+        if ctx.info['game'] == GAME and manifest.get('stats', {}).get('patched_sites', 0) < 1:
             raise InstallError('dkb.patches_missing')
+        return {'outputs': tree_key(gen)}
 
 
 class Compile(Step):
@@ -556,8 +699,9 @@ class Compile(Step):
 
     def run(self, ctx):
         out = ctx.temp / 'build'
-        args = [ctx.layout.python, ctx.layout.tools / 'build_game.py', '--version', GAME, '--expected',
-                ctx.layout.tools / 'data' / 'expected-dkb100.json', '--gen', ctx.temp / 'gen', '--out', out,
+        game = ctx.info['game']
+        args = [ctx.layout.python, ctx.layout.tools / 'build_game.py', '--version', game, '--expected',
+                ctx.layout.tools / 'data' / f'expected-{game}.json', '--gen', ctx.temp / 'gen', '--out', out,
                 '--modules', 'main,sdk', '--exefs', ctx.dest / 'exefs', '--romfs', ctx.dest / 'romfs',
                 '--profile', ctx.dest / 'profile', '--runtime', ctx.layout.runtime, '--toolchain', ctx.layout.llvm,
                 '--ninja', ctx.layout.ninja, '--jobs', ctx.options.jobs, '--full-build']
@@ -587,7 +731,7 @@ class Shaders(Step):
 
     def run(self, ctx):
         pack = ctx.dest / 'seed-nvn2.bin'
-        run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'dkb_shader_census.py', '--version', GAME,
+        run_tool(ctx, self.id, [ctx.layout.python, ctx.layout.tools / 'dkb_shader_census.py', '--version', ctx.info['game'],
                                 '--romfs', ctx.dest / 'romfs', '--out', ctx.dest], name=f'{self.id}-census')
         try:
             run_tool(ctx, self.id, [ctx.dest / ('dkb' + EXE), '--translate-shaders'], cwd=ctx.dest)
@@ -633,7 +777,9 @@ class Cleanup(Step):
     id, always = 'cleanup', True
 
     def run(self, ctx):
-        for name in ('data', 'gen', 'build', 'xlate', 'dotnet-home', 'nuget'):
+        # Update 458752 keeps generated C and objects so a second install does not relift or recompile.
+        keep = ctx.info['game'] != GAME
+        for name in ('data', 'xlate', 'dotnet-home', 'nuget') if keep else ('data', 'gen', 'build', 'xlate', 'dotnet-home', 'nuget'):
             p = ctx.temp / name
             if p.exists():
                 owned_dir(ctx, p)
@@ -671,23 +817,36 @@ def main(options, reporter=None):
         ensure_plain(dest / STATE)
         previous = statefile.load(dest, STATE)
         options = copy.copy(options)
-        if previous and previous.get('game') == GAME and previous.get('destination') == str(dest):
+        found = layouts.find(options.root)
+        # A resume reuses the tool paths the last run recorded, for a checkout run with its own --toolchain or --deps.
+        # A release carries its tools, and the folder of the release that made the install may be gone or older (a new
+        # release unpacked elsewhere): its own tools win there, and so does an explicit --package. A recorded path
+        # that no longer exists is never reused.
+        if (previous and previous.get('game') in TARGETS and previous.get('destination') == str(dest) and found.dev and
+                options.package is None):
             for name, value in previous.get('build_tools', {}).items():
-                if name in ('toolchain', 'deps', 'ninja', 'dll_dir', 'dotnet') and getattr(options, name) is None and value:
+                if (name in ('toolchain', 'deps', 'ninja', 'dll_dir', 'dotnet') and getattr(options, name) is None and
+                        value and Path(value).exists()):
                     setattr(options, name, Path(value))
-        layout = tool_layout(layouts.find(options.root), options)
+        layout = tool_layout(found, options)
         raw_base = (options.temp or layout.temp or dest.parent / '.dkb-setup').absolute()
         ensure_plain(raw_base)
         base = raw_base.resolve()
+        if os.name != 'nt' and unsafe_temp_chars(base):
+            raise InstallError('dkb.temp_unsafe_path', path=str(base))
         tag = hashlib.sha256(str(dest).lower().encode()).hexdigest()[:12]
-        temp = base / f'dkb-{dest.name}-{tag}'
+        # The work folder's name goes onto compiler and MSBuild command lines that split on spaces (issue 134): keep
+        # only characters that need no quoting. The tag already tells two destinations apart; a name that was safe
+        # keeps its folder, so an interrupted setup still resumes.
+        safe = ''.join(ch if ch.isascii() and (ch.isalnum() or ch in '._-') else '_' for ch in dest.name)
+        temp = base / f'dkb-{safe}-{tag}'
         info = preflight(layout, options, dest, temp, rep)
         # All read-only validation succeeded. Logs and owned output may now be created.
         temp.mkdir(parents=True, exist_ok=True)
         write_owner(temp / OWNER, info['owner'])
         locks.append(lock_temp(temp))
         dest.mkdir(parents=True, exist_ok=True)
-        write_owner(dest / DEST_OWNER, {'game': GAME, 'destination': str(dest)})
+        write_owner(dest / DEST_OWNER, {'game': info['game'], 'destination': str(dest)})
         locks.append(lock_temp(dest))
         plain_tree(temp)
         plain_destination(dest, layout.dlls)
@@ -698,7 +857,7 @@ def main(options, reporter=None):
         rep.log_path = log
         ctx = BananzaContext(layout, dest, temp, rep, options, state=info['old'], verify=options.verify)
         ctx.info = info
-        ctx.state.update(game=GAME, destination=str(dest), sources=info['sources'])
+        ctx.state.update(game=info['game'], destination=str(dest), sources=info['sources'])
         ctx.state['build_tools'] = {'toolchain': str(layout.llvm), 'deps': str(layout.deps) if layout.deps else None,
                                     'ninja': str(layout.ninja),
                                     'dll_dir': str(layout.dlls[0].parent) if layout.dlls else None,
@@ -706,7 +865,7 @@ def main(options, reporter=None):
         ctx.state['lang'] = ini.canonical_language(options.lang or ctx.state.get('lang') or 'en-US')
         steps = all_steps()
         rep.emit('start', release=layout.release, mode=ctx.mode, dev=layout.dev, dest=str(dest), log=str(log),
-                 game=GAME, game_exe='dkb' + EXE, steps=[s.id for s in steps])
+                 game=info['game'], game_exe='dkb' + EXE, steps=[s.id for s in steps])
         result = run_steps(steps, ctx)
     except InstallError as e:
         rep.error(e.id, e.params)

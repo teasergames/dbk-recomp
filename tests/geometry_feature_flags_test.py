@@ -30,6 +30,9 @@ def fixture(draw):
     warning = draw.index('enum { W_PROGRAM')
     cache = draw.index('#define STAGEM_N ')
     declarations = draw[warning:draw.index(';', warning) + 1]
+    # The per-serial stage cache, after the scan it falls back to and the switch of its origin memo.
+    declarations += '\n' + function(draw, 'static int find_stage_scan(')
+    declarations += '\n' + function(draw, 'static int knob_on(') + '\n' + function(draw, 'static int stage_origin_on(')
     declarations += '\n' + draw[cache:draw.index('static int find_stage(', cache)] + '\n'
     providers = r'''
 #include <stdio.h>
@@ -44,6 +47,9 @@ def fixture(draw):
 static uint8_t geometry_input;
 static int ordinary_enabled, fix_c0, warnings;
 static const uint8_t *original_native_code;
+static int geometry_supported = 1;
+GfxStats gfx_counters;
+int vk_geometry_supported(void) { return geometry_supported; }
 int cfg_bool(const char *name) {
     if(!strcmp(name,"TOTK_NATIVE_GS")){const char *e=getenv("DKB_NATIVE_GS");return e&&*e=='1';}
     if(strcmp(name,"TOTK_EXPERIMENTAL_GEOMETRY"))abort();
@@ -52,11 +58,12 @@ int cfg_bool(const char *name) {
 static int c0_on(void) { return fix_c0; }
 uint64_t nvn2_origin(const uint8_t *code) { return code==original_native_code?17:0; }
 static void warn_once(int kind,const char *format,...) { (void)kind;(void)format;warnings++; }
+int rt_knob(const char *name,const char *def) { (void)name; return atoi(def); }   // every switch at its default
+int rt_ab(void) { return 0; }
 '''
     functions = '\n'.join([
         function(shader, 'int gfx_shader_is_nvn2('),
         function(pipeline, 'uint8_t vk_geometry_input('),
-        function(draw, 'static int find_stage_scan('),
         function(draw, 'static int find_stage('),
         function(draw, 'static int native_gs_on('),
         function(draw, 'static int experimental_geometry_on('),
@@ -134,6 +141,10 @@ int main(int argc,char **argv) {
     expect(NVN_DRAW_PRIMITIVE_TRIANGLES,native?0:ordinary_enabled?-1:0,"existing native missing-FS fallback");
     setup();original_native_code=codes[1];passthrough();put(controls[1]+0x704,0x80);
     expect(NVN_DRAW_PRIMITIVE_TRIANGLES,native?0:ordinary_enabled?-1:0,"existing native short-code fallback");
+    setup();original_native_code=codes[1];passthrough();geometry_supported=0;
+    expect(NVN_DRAW_PRIMITIVE_TRIANGLES,native?-1:ordinary_enabled?-1:0,"native GS without a device geometry stage");
+    label="geometry stage skip counter";CHECK(gfx_counters.draws_skipped==(native?1u:0u));
+    geometry_supported=1;
     printf("ordinary=%d native=%d: %u checks, %u failures, %d warnings (actual admission only)\n",ordinary_enabled,native,checks,failures,warnings);
     return failures?1:0;
 }

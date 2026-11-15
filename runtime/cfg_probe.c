@@ -15,7 +15,23 @@ static int fails;
 #define CHECK(c, what) do { if (!(c)) { fails++; fprintf(stderr, "FAIL cfg: %s\n", what); } } while (0)
 #define EQ(a, b) ((a) && !strcmp((a), (b)))
 
+// DKB_PROBE_CFG_INI=<file>: load that ini and print "key = value" for every settings row (tests/cfg_settings_test.py).
+// A range row prints cfg_double, so a value that does not parse shows the default it falls back to.
+static int dump_cfg(const char *ini) {
+    cfg_load(ini);
+    for (int i = 0; cfg_meta_at(i); i++) {
+        const CfgMeta *m = cfg_meta_at(i);
+        char name[96];
+        snprintf(name, sizeof name, "TOTK_%s", m->key);
+        if (m->values && strstr(m->values, "..")) printf("%s = %.10g\n", m->key, cfg_double(name));
+        else printf("%s = %s\n", m->key, cfg_get(name) ? cfg_get(name) : cfg_value(name));
+    }
+    return 0;
+}
+
 int probe_cfg(void) {
+    const char *dump = getenv("DKB_PROBE_CFG_INI");
+    if (dump && *dump) return dump_cfg(dump);
     char path[1024];
     if (!plat_exe_path(path, sizeof path)) return 1;
     char *cut = plat_last_sep(path);
@@ -144,6 +160,8 @@ int probe_cfg(void) {
     m = cfg_meta("totk_vk_present");
     CHECK(m && EQ(m->key, "VK_PRESENT") && EQ(m->values, "mailbox|fifo|immediate") && m->live,
           "meta: prefix and case are accepted");
+    m = cfg_meta("FPS_LIMIT");
+    CHECK(m && strstr(m->values, "|display|unlimited") && !strstr(m->values, "garbage"), "meta: fps_limit accepts unlimited");
     m = cfg_meta("RUMBLE_STRENGTH");
     CHECK(m && EQ(m->def, "130") && EQ(m->values, "0..300"), "meta: rumble strength 130 in 0..300");
     m = cfg_meta("PERF_OVERLAY");

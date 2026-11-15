@@ -172,6 +172,7 @@ def main():
     inspect = function(memory, 'int vk_mem_inspect(')
     pieces = [PRELUDE, statement(memory, 'enum { POOL_IMPORT'), statement(memory, 'enum { MS_NONE'),
               typedef(memory, 'VPage'), typedef(memory, 'PoolRec'),
+              function(memory, 'static inline int ms_get('),   # the mirror state's atomic load
               statement(memory, 'static PlatMutex pool_lock'), statement(memory, 'static pidx pool_index'),
               function(memory, 'static int rec_class('), inspect, FIXTURE]
     out = ROOT / 'build/tests/vk-memory-inspect'

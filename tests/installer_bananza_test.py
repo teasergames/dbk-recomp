@@ -19,6 +19,14 @@ from installer.events import Reporter
 from installer.guilogic import Catalog, Form
 from installer.layout import Layout
 
+sys.path.insert(0, str(ROOT / 'tests'))
+from nup_extract_check import build as build_nup  # noqa: E402  synthetic NUP containers
+
+
+def tree(folder):
+    """A folder as the {name: bytes | tree} that build_nup takes."""
+    return {p.name: tree(p) if p.is_dir() else p.read_bytes() for p in sorted(folder.iterdir())}
+
 
 class InstallerTest(unittest.TestCase):
     def setUp(self):
@@ -44,6 +52,7 @@ class InstallerTest(unittest.TestCase):
         (self.root / 'tools/build_xlate.py').write_text("def identity(): return 'synthetic-translator-id'\n")
         shutil.copyfile(ROOT / 'tools/dkb_pack_romfs.py', self.root / 'tools/dkb_pack_romfs.py')
         shutil.copyfile(ROOT / 'tools/dkb_shader_census.py', self.root / 'tools/dkb_shader_census.py')
+        shutil.copyfile(ROOT / 'tools/extract_nup.py', self.root / 'tools/extract_nup.py')
         (self.root / 'tools/romfs_index.py').write_text('# synthetic fixture')
         (self.root / 'recomp/gen.py').write_text('''
 import json, pathlib, sys
@@ -64,6 +73,8 @@ assert a[a.index('--version')+1]=='dkb100' and '--runtime-lib' not in a
 assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='expected-dkb100.json'
 (out/('dkb.exe' if sys.platform=='win32' else 'dkb')).write_bytes(b'synthetic executable')
 (out/'romfs-index.bin').write_bytes(b'synthetic index')
+(out/'obj').mkdir(exist_ok=True)
+(out/'obj/guest.o').write_bytes(b'synthetic object')
 ''')
         for name in ('clang' + b.EXE, 'ninja' + b.EXE):
             (self.root / ('llvm/bin' if name.startswith('clang') else 'bin') / name).write_bytes(b'synthetic tool')
@@ -105,6 +116,26 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
             code = b.main(self.options, reporter=reporter)
         return code, [json.loads(line) for line in output.getvalue().splitlines()]
 
+    def host_warnings(self, **extra):
+        host = dict(x86_64_v3=True, loader=True, devices=[{'name': 'gpu', 'api': [1, 3, 0]}], **extra)
+        out = io.StringIO()
+        ctx = SimpleNamespace(temp=self.temp, layout=self.layout, reporter=Reporter(out=out))
+        with patch.object(b, 'run_tool'), patch.object(b.subprocess, 'run',
+                                                       return_value=SimpleNamespace(stdout=json.dumps(host), returncode=0)):
+            b.Check().host(ctx)   # a warning must not raise
+        return [json.loads(line)['id'] for line in out.getvalue().splitlines() if json.loads(line)['type'] == 'warning']
+
+    def test_low_commit_limit_warns_and_continues(self):
+        self.assertEqual(self.host_warnings(commit_limit_gib=17.9), ['warn.low_commit_limit'])
+
+    def test_enough_or_unknown_commit_limit_does_not_warn(self):
+        self.assertEqual(self.host_warnings(commit_limit_gib=30.0), [])
+        self.assertEqual(self.host_warnings(), [])
+
+    def test_shell_special_temp_path_is_flagged(self):
+        self.assertEqual(b.unsafe_temp_chars('/home/u/DKB (2)/build'), '()')
+        self.assertEqual(b.unsafe_temp_chars('/home/u/DKB Recomp/build-1_x.y'), '')
+
     def test_invalid_base_writes_nothing(self):
         (self.exefs / 'main').write_bytes(b'unsupported update')
         code, events = self.run_install()
@@ -131,7 +162,8 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
 
     def test_unowned_temp_is_preserved(self):
         tag = b.hashlib.sha256(str(self.dest).lower().encode()).hexdigest()[:12]
-        target = self.temp / f'dkb-{self.dest.name}-{tag}'
+        safe = ''.join(c if c.isascii() and (c.isalnum() or c in '._-') else '_' for c in self.dest.name)
+        target = self.temp / f'dkb-{safe}-{tag}'
         target.mkdir(parents=True)
         (target / 'keep.txt').write_text('untouched')
         self.assertEqual(self.run_install()[0], 1)
@@ -353,6 +385,16 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
             child.assert_not_called()
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_elevation_required_is_a_friendly_error(self):
+        ctx = SimpleNamespace(temp=Path(self.work.name)/'elev', dest=self.dest, layout=self.layout, reporter=Reporter(out=io.StringIO()))
+        ctx.temp.mkdir()
+        denied = OSError(0, 'The requested operation requires elevation')
+        denied.winerror = 740
+        with patch.object(b.subprocess, 'Popen', side_effect=denied):
+            with self.assertRaises(b.InstallError) as error:
+                b.run_tool(ctx, 'compile', [str(Path('x')/'dkb.exe'), '--selftest'])
+        self.assertEqual((error.exception.id, error.exception.params), ('dkb.elevation_required', {'exe': 'dkb.exe'}))
+
     def test_native_directory_junction_is_rejected_without_following_it(self):
         workspace = self.cancelled_workspace()
         outside = Path(self.work.name)/'outside-junction'
@@ -415,6 +457,104 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.assertEqual(self.run_install()[0], 0)
         self.assertEqual((self.dest/'profile/save.bin').read_bytes(), b'synthetic user save')
 
+    def test_success_retains_generated_code_and_objects(self):
+        self.update_fixture()   # only the update keeps generated code and objects
+        self.assertEqual(self.run_install()[0], 0)
+        workspace = next(self.temp.glob('dkb-*'))
+        self.assertTrue((workspace/'gen/main/main_0000.c').is_file())
+        self.assertEqual((workspace/'build/obj/guest.o').read_bytes(), b'synthetic object')
+        self.assertFalse((workspace/'data').exists())
+
+    def test_base_install_removes_generated_code_and_objects(self):
+        self.assertEqual(self.run_install()[0], 0)
+        workspace = next(self.temp.glob('dkb-*'))
+        self.assertFalse((workspace/'gen').exists() or (workspace/'build').exists())
+
+    def test_runtime_change_reuses_generated_code_and_assets(self):
+        self.update_fixture()   # only the update keeps generated code and objects
+        self.assertEqual(self.run_install()[0], 0)
+        workspace = next(self.temp.glob('dkb-*'))
+        generated = workspace/'gen/main/main_0000.c'
+        timestamp = generated.stat().st_mtime_ns
+        (self.root/'runtime/nvn2_lower.cpp').write_text('// changed synthetic runtime')
+        self.calls.clear()
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        self.assertEqual([step for step, _ in self.calls],
+                         ['compile', 'dkb_shaders', 'dkb_shaders', 'dkb_shaders', 'dkb_verify'])
+        self.assertEqual(generated.stat().st_mtime_ns, timestamp)
+
+    def update_fixture(self):
+        hashes = {}
+        for p in self.exefs.iterdir():
+            p.write_bytes(b'updated ' + p.read_bytes())
+            hashes[p.name] = b.sha256(p)
+        (self.root / 'tools/data/expected-dkb458752.json').write_text(json.dumps({'exefs_sha256': hashes}))
+        (self.root / 'recomp/patches-dkb458752.txt').write_text('# no controller proxy in this version')
+        for relative in ('recomp/gen.py', 'tools/build_game.py'):
+            p = self.root / relative
+            text = p.read_text().replace('dkb100', 'dkb458752')
+            if relative == 'recomp/gen.py':
+                text = text.replace("'patched_sites':1", "'patched_sites':0")
+            p.write_text(text)
+
+    def test_update_has_separate_identity_and_no_base_patch_requirement(self):
+        self.update_fixture()
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        self.assertEqual(b.statefile.load(self.dest, b.STATE)['game'], 'dkb458752')
+        self.assertEqual(json.loads((self.dest / b.DEST_OWNER).read_text())['game'], 'dkb458752')
+        self.calls.clear()
+        self.options.exefs = self.options.romfs = None
+        self.assertEqual(self.run_install()[0], 0)
+        self.assertEqual(self.calls, [])
+
+    def test_target_switch_cannot_overwrite_existing_base_install(self):
+        self.assertEqual(self.run_install()[0], 0)
+        receipt = (self.dest / b.STATE).read_bytes()
+        self.update_fixture()
+        self.calls.clear()
+        self.assertEqual(self.run_install()[0], 1)
+        self.assertEqual(self.calls, [])
+        self.assertEqual((self.dest / b.STATE).read_bytes(), receipt)
+
+    def test_base_still_requires_controller_patch(self):
+        p = self.root / 'recomp/gen.py'
+        p.write_text(p.read_text().replace("'patched_sites':1", "'patched_sites':0"))
+        code, events = self.run_install()
+        self.assertEqual(code, 1)
+        self.assertEqual(next(e['id'] for e in events if e['type'] == 'error'), 'dkb.patches_missing')
+
+    def test_mixed_update_exefs_is_rejected_before_writers(self):
+        original_sdk = (self.exefs / 'sdk').read_bytes()
+        self.update_fixture()
+        (self.exefs / 'sdk').write_bytes(original_sdk)
+        self.assertEqual(self.run_install()[0], 1)
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.temp.exists())
+
+    def test_missing_generated_output_is_regenerated_when_rebuilding(self):
+        self.update_fixture()   # only the update keeps generated code and objects
+        self.assertEqual(self.run_install()[0], 0)
+        workspace = next(self.temp.glob('dkb-*'))
+        (workspace/'gen/main/main_0000.c').unlink()
+        (self.root/'runtime/nvn2_lower.cpp').write_text('// changed synthetic runtime')
+        self.calls.clear()
+        self.assertEqual(self.run_install()[0], 0)
+        self.assertEqual([step for step, _ in self.calls],
+                         ['lift', 'compile', 'dkb_shaders', 'dkb_shaders', 'dkb_shaders', 'dkb_verify'])
+
+    def test_corrupt_generated_output_is_regenerated_when_rebuilding(self):
+        self.update_fixture()   # only the update keeps generated code and objects
+        self.assertEqual(self.run_install()[0], 0)
+        workspace = next(self.temp.glob('dkb-*'))
+        (workspace/'gen/main/main_0000.c').write_bytes(b'corrupt')
+        (self.root/'runtime/nvn2_lower.cpp').write_text('// changed synthetic runtime')
+        self.calls.clear()
+        self.assertEqual(self.run_install()[0], 0)
+        self.assertEqual([step for step, _ in self.calls],
+                         ['lift', 'compile', 'dkb_shaders', 'dkb_shaders', 'dkb_shaders', 'dkb_verify'])
+
     def test_already_packed_input_is_verified_and_copied(self):
         packed = self.root / 'packed input'
         subprocess.run([sys.executable, str(ROOT/'tools/dkb_pack_romfs.py'), '--dir', str(self.romfs),
@@ -451,6 +591,175 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.assertEqual(self.run_install()[0], 1)
         self.assertFalse(self.dest.exists())
         self.assertFalse(self.temp.exists())
+
+    TITLE = 0x040074A01BF12000
+
+    def write_nup(self, update=None, name='game.nup'):
+        """A container of the fixture's base folders and, optionally, an update package {'exefs': ..., 'romfs': ...}."""
+        packages = [(0, self.TITLE, 0, {'exefs': tree(self.exefs), 'romfs': tree(self.romfs)})]
+        if update is not None:
+            packages.append((1, self.TITLE | 0x800, 458752, update))
+        path = Path(self.work.name) / name
+        path.write_bytes(build_nup(packages))
+        self.options.exefs = self.options.romfs = None
+        self.options.nup = path
+        return path
+
+    def loose_pack(self, folder):
+        out = Path(self.work.name) / 'reference pack'
+        shutil.rmtree(out, ignore_errors=True)
+        subprocess.run([sys.executable, str(ROOT/'tools/dkb_pack_romfs.py'), '--dir', str(folder), '--out', str(out)],
+                       check=True, capture_output=True)
+        return out
+
+    def test_nup_base_installs_the_same_data_as_its_folders(self):
+        path = self.write_nup()
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        state = b.statefile.load(self.dest, b.STATE)
+        self.assertEqual((state['game'], state['sources']), ('dkb100', {'nup': str(path.resolve()), 'nup_package': 'latest'}))
+        reference = self.loose_pack(self.romfs)
+        self.assertEqual(b.sha256(self.dest/'romfs/romfs.bin'), b.sha256(reference/'romfs.bin'))
+        self.assertEqual(json.loads((self.dest/'romfs/index.json').read_text())['files'],
+                         json.loads((reference/'index.json').read_text())['files'])
+        for name in ('main', 'sdk', 'rtld', 'main.npdm'):
+            self.assertEqual((self.dest/'exefs'/name).read_bytes(), (self.exefs/name).read_bytes())
+        extract = next(c for step, c in self.calls if step == 'dkb_data')
+        self.assertIn('--pack', extract)
+        self.assertEqual(extract[extract.index('--select') + 1], 'latest')
+        # Resume with the destination alone reuses the recorded container.
+        self.calls.clear()
+        self.options.nup = None
+        self.assertEqual(self.run_install()[0], 0)
+        self.assertEqual(self.calls, [])
+
+    def test_nup_with_update_builds_the_update_with_merged_romfs(self):
+        base_romfs = tree(self.romfs)
+        base_exefs = tree(self.exefs)
+        self.update_fixture()   # the fixture's ExeFS folder now holds the update's files and hashes
+        update = {'exefs': tree(self.exefs), 'romfs': {'other.bin': b'patched by the update', 'added.bin': b'new'}}
+        for name, data in base_exefs.items():
+            (self.exefs / name).write_bytes(data)
+        self.write_nup(update)
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        self.assertEqual(b.statefile.load(self.dest, b.STATE)['game'], 'dkb458752')
+        self.assertEqual((self.dest/'exefs/main').read_bytes(), update['exefs']['main'])
+        merged = Path(self.work.name) / 'merged romfs'
+        (merged / 'folder').mkdir(parents=True)
+        (merged / 'folder' / 'café.bin').write_bytes(base_romfs['folder']['café.bin'])
+        (merged / 'other.bin').write_bytes(b'patched by the update')
+        (merged / 'added.bin').write_bytes(b'new')
+        self.assertEqual(b.sha256(self.dest/'romfs/romfs.bin'), b.sha256(self.loose_pack(merged)/'romfs.bin'))
+
+    def test_nup_unsupported_update_is_refused_and_base_can_be_chosen(self):
+        update = {'exefs': {'main': b'a future update', 'main.npdm': b'npdm'}, 'romfs': {'other.bin': b'changed'}}
+        self.write_nup(update)
+        code, events = self.run_install()
+        self.assertEqual(code, 1)
+        error = next(e for e in events if e['type'] == 'error')
+        self.assertEqual((error['id'], error['params']['title_version']), ('dkb.nup_version', 458752))
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.temp.exists())
+        self.options.nup_package = 'base'
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        self.assertEqual(b.sha256(self.dest/'romfs/romfs.bin'), b.sha256(self.loose_pack(self.romfs)/'romfs.bin'))
+
+    def test_nup_with_mismatched_exefs_writes_nothing(self):
+        (self.exefs / 'sdk').write_bytes(b'another build')
+        self.write_nup()
+        code, events = self.run_install()
+        self.assertEqual(code, 1)
+        self.assertEqual(next(e['id'] for e in events if e['type'] == 'error'), 'dkb.exefs_invalid')
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.temp.exists())
+
+    def test_nup_and_folders_together_and_bad_container_are_refused(self):
+        path = self.write_nup()
+        self.options.exefs = self.exefs
+        code, events = self.run_install()
+        self.assertEqual(next(e['id'] for e in events if e['type'] == 'error'), 'dkb.nup_and_folders')
+        self.options.exefs = None
+        # A package choice with folders and no .nup is refused too, not ignored.
+        self.options.nup, self.options.nup_package, self.options.exefs = None, 'base', self.exefs
+        code, events = self.run_install()
+        self.assertEqual(next(e['id'] for e in events if e['type'] == 'error'), 'dkb.nup_and_folders')
+        self.options.nup, self.options.nup_package, self.options.exefs = path, None, None
+        path.write_bytes(b'PFS0' + bytes(0x200))
+        code, events = self.run_install()
+        self.assertEqual(next(e['id'] for e in events if e['type'] == 'error'), 'dkb.nup_invalid')
+        self.options.nup = path.with_name('missing.nup')
+        code, events = self.run_install()
+        self.assertEqual(next(e['id'] for e in events if e['type'] == 'error'), 'dkb.need_nup')
+        self.assertFalse(self.dest.exists())
+
+    def test_nup_inside_destination_is_refused(self):
+        self.dest.mkdir()
+        self.write_nup()
+        moved = self.dest / 'game.nup'
+        shutil.move(self.options.nup, moved)
+        self.options.nup = moved
+        code, events = self.run_install()
+        self.assertEqual(code, 1)
+        self.assertIn(next(e['id'] for e in events if e['type'] == 'error'), ('dkb.path_overlap', 'dkb.dest_unrelated'))
+
+    def test_corrupt_nup_file_stops_before_installing_data(self):
+        path = self.write_nup()
+        data = bytearray(path.read_bytes())
+        data[-20] ^= 0xFF   # inside a RomFS extent: the table of contents still checks out
+        path.write_bytes(bytes(data))
+        code, events = self.run_install()
+        self.assertEqual(code, 1)
+        error = next(e for e in events if e['type'] == 'error')
+        self.assertEqual((error['id'], error.get('step')), ('dkb.tool_failed', 'dkb_data'))
+        self.assertFalse((self.dest/'romfs/romfs.bin').exists())
+        self.assertFalse((self.dest/'exefs').exists())
+
+    def test_form_takes_a_nup_instead_of_folders(self):
+        path = self.write_nup()
+        form = Form(game='bananza', dest=str(self.dest), nup=str(path))
+        self.assertEqual(form.problems(), [])
+        command = form.command('python')
+        self.assertEqual(command[command.index('--nup') + 1], str(path))
+        self.assertNotIn('--exefs', command)
+        self.assertEqual(Form(game='bananza', dest=str(self.dest), nup=str(path), exefs=str(self.exefs)).problems(),
+                         ['dkb.nup_and_folders'])
+        self.assertEqual(Form(game='bananza', dest=str(self.dest), nup=str(path) + '.missing').problems(),
+                         ['dkb.need_nup'])
+        self.assertEqual(Form(game='bananza', dest=str(self.dest)).problems(), ['dkb.need_exefs', 'dkb.need_romfs'])
+
+    def stale_tools(self):
+        """The receipt of a finished install, with tool paths of a release folder that was deleted since."""
+        self.assertEqual(self.run_install()[0], 0)
+        state = b.statefile.load(self.dest, b.STATE)
+        gone = Path(self.work.name) / 'deleted release'
+        state['build_tools'] = {'toolchain': str(gone / 'llvm'), 'deps': str(gone / 'runtime/deps'),
+                                'ninja': str(gone / 'bin' / ('ninja' + b.EXE)), 'dll_dir': str(gone / 'bin'),
+                                'dotnet': str(gone / 'dotnet')}
+        b.statefile.save(self.dest, state, b.STATE)
+        self.calls.clear()
+        self.options.exefs = self.options.romfs = None
+
+    def test_tool_paths_of_a_deleted_release_are_not_reused(self):
+        self.stale_tools()
+        self.options.package = None
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        self.assertEqual(b.statefile.load(self.dest, b.STATE)['build_tools']['ninja'], str(self.layout.ninja.resolve()))
+
+    def test_a_release_uses_its_own_tools_over_recorded_ones(self):
+        self.stale_tools()
+        other = Path(self.work.name) / 'older release'
+        shutil.copytree(self.root / 'bin', other / 'bin')
+        state = b.statefile.load(self.dest, b.STATE)
+        state['build_tools']['ninja'] = str(other / 'bin' / ('ninja' + b.EXE))
+        b.statefile.save(self.dest, state, b.STATE)
+        self.options.package = None
+        self.layout = b.replace(self.layout, dev=False)
+        code, events = self.run_install()
+        self.assertEqual(code, 0, events)
+        self.assertEqual(b.statefile.load(self.dest, b.STATE)['build_tools']['ninja'], str(self.layout.ninja.resolve()))
 
     def test_renamed_translator_is_installed_under_runtime_name(self):
         renamed = self.root/'bin/custom-translator.exe'
