@@ -7,12 +7,16 @@
 
 > [!NOTE]
 > **Esta é uma cópia não oficial** do [DKB Recomp](https://github.com/Lucas-blip-png/dkb-pc-recomp), de
-> **Lucas-blip-png** e colaboradores, no commit
-> [`db77cdf`](https://github.com/Lucas-blip-png/dkb-pc-recomp/commit/db77cdf). Todo o crédito pelo projeto é deles.
-> Aqui você encontra o **instalador pronto (DKB-Setup)** na aba
-> [Releases](https://github.com/teasergames/dbk-recomp/releases). Bugs do jogo, sugestões e contribuições vão para o
-> [repositório original](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues). Os documentos da pasta `docs/`
-> continuam em inglês.
+> **Lucas-blip-png** e colaboradores, baseada na release oficial
+> [`v0.3.0`](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/tag/v0.3.0) e com a integração com o
+> **RecompLauncher**. Todo o crédito pelo projeto é deles. Os documentos da pasta `docs/` continuam em inglês.
+
+> [!TIP]
+> **O projeto original agora publica releases oficiais**, com pacotes para **Windows, Linux e macOS**:
+> [github.com/Lucas-blip-png/dkb-pc-recomp/releases](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases).
+> Prefira essas releases se não usa o RecompLauncher. **Bugs do jogo** (travamentos, erros de GPU, gráficos) devem ser
+> relatados no [repositório original](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues), que é onde podem ser
+> corrigidos. Aqui ficam só os problemas deste pacote e da integração com o RecompLauncher.
 
 **DKB Recomp** é uma recompilação estática de *Donkey Kong Bananza* (Nintendo Switch 2, 2025) para um aplicativo nativo
 de Windows x86-64 com renderizador Vulkan. Não há emulador rodando: o código ARM64 do jogo é traduzido para C
@@ -32,12 +36,26 @@ Até onde se sabe, não existe outra recompilação estática pública de um jog
 1. Baixe o `DKB-Setup-<versão>-windows.zip` em [Releases](https://github.com/teasergames/dbk-recomp/releases) e
    extraia em qualquer pasta. O zip tem **só ferramentas e código-fonte**, nada do jogo.
 2. Abra o **`DKB-Setup.exe`**.
-3. Escolha as pastas `exefs` e `romfs` do **seu** dump (versão **base 1.0.0**), o idioma e uma pasta de destino vazia.
+3. Escolha o seu dump: um arquivo **`.nup`** ou as pastas `exefs` e `romfs`. Versões aceitas: **base 1.0.0** ou a
+   atualização **3.2.0** (dentro do `.nup`). Depois escolha o idioma e uma pasta de destino vazia.
 4. Aguarde de 20 a 30 minutos (verificação do dump, compilação e tradução dos shaders).
 5. Jogue pelo `dkb.exe` na pasta de destino.
 
+**Já instalou uma versão anterior?** Abra o `DKB-Setup.exe` novo e aponte para a **mesma pasta de destino**: o
+instalador refaz só o que mudou e mantém seus saves.
+
+**RecompLauncher:** o pacote traz o perfil `recomplauncher.json`, então o launcher instala, configura e abre o jogo
+sozinho ([docs/recomplauncher.md](docs/recomplauncher.md)).
+
 **Requisitos:** Windows 10 ou 11, CPU com AVX2, GPU com Vulkan 1.3, 16 GB de RAM (32 GB recomendado) e cerca de 45 GB
-livres durante a instalação.
+livres **no disco de destino e no da pasta temporária** durante a instalação. O erro `Not enough space` quase sempre é
+falta de espaço em disco ou de memória.
+
+**Idiomas:** os do próprio jogo: japonês, inglês, francês, alemão, espanhol, italiano, holandês, russo, português,
+coreano e chinês. O jogo não tem polonês nem outros idiomas, então não há como adicioná-los aqui.
+
+**Linux e macOS:** use os pacotes `linux-x86_64.tar.gz` e `macos-arm64.zip` da
+[release oficial](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases) (ainda em fase de prévia).
 
 ## Estado
 
@@ -151,9 +169,9 @@ Como rodar e testar: [docs/dkb-testing.md](docs/dkb-testing.md).
 **Vai ter download do jogo pronto?** Não. O executável é feito a partir do próprio código do jogo, então não pode ser
 compartilhado. Cada um gera o seu a partir do próprio dump; o DKB-Setup faz isso por você.
 
-**Qual versão do jogo?** Base 1.0.0. A atualização 458752 tem outro layout e ainda não é suportada.
+**Qual versão do jogo?** Base 1.0.0 e a atualização 3.2.0 (versão de título 458752, a mais recente), por arquivo `.nup` ou por pastas ExeFS e RomFS. Outras atualizações são recusadas pelo hash. A 3.2.0 instala e inicia, mas ainda foi pouco jogada.
 
-**Linux?** O toolchain do TotK Recomp suporta Linux, então é possível; ninguém testou com o Bananza ainda.
+**Linux e macOS?** Em prévia, só nas [releases oficiais](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases): `DKB-Setup-<versão>-linux-x86_64.tar.gz` e `DKB-Setup-<versão>-macos-arm64.zip`, com um script de instalação. Este repositório publica só o pacote de Windows.
 
 **Por que GPL?** A conversão de shaders vem do Eglantine (Eden Emulator Project), que é GPL. Os arquivos que vieram do
 TotK Recomp mantêm a licença MIT.
